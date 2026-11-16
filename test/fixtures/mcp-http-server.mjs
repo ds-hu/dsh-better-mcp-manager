@@ -6,7 +6,8 @@
  * for `@modelcontextprotocol/client`'s `StreamableHTTPClientTransport`
  * (version 2.2.0, protocol 2025-11-25 / 2025-06-18):
  *
- *   POST /mcp  initialize                -> JSON-RPC result + `mcp-session-id`
+ *   GET  /icon.png                       -> the declared 16x16 PNG icon
+ *   POST /mcp  initialize                -> JSON-RPC result + `mcp-session-id` + icons[]
  *   POST /mcp  notifications/initialized -> 202, no body
  *   POST /mcp  tools/list                -> three tools: echo, add, fail
  *   POST /mcp  tools/call                -> fixture text / isError result
@@ -22,12 +23,17 @@
  *   --label <name>         serverInfo.name suffix (default "http")
  *   MCP_FIXTURE_DEBUG=1    log every request line to stderr
  *
+ * The `initialize` result advertises `serverInfo.icons` with an absolute
+ * `http://127.0.0.1:<actual port>/icon.png` URL, which exercises the Host-side
+ * icon proxy (fetch with the server's headers, cache, serve to the page).
+ *
  * On start it prints one line of JSON to stdout:
  *   {"port":123,"url":"http://127.0.0.1:123/mcp"}
  * and keeps running until SIGTERM/SIGINT.
  */
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { HTTP_ICON_PNG_BASE64, iconBytes } from './tiny-icons.mjs';
 
 const args = process.argv.slice(2);
 function argOf(flag, fallback) {
@@ -40,6 +46,9 @@ const DEBUG = process.env.MCP_FIXTURE_DEBUG === '1';
 const SERVER_NAME = `mcp-e2e-${LABEL}`;
 const PROTOCOL_VERSIONS = new Set(['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07']);
 const INSTRUCTIONS = `Fixture MCP server "${SERVER_NAME}" over Streamable HTTP. echo/add/fail are for e2e assertions.`;
+const ICON_BYTES = iconBytes(HTTP_ICON_PNG_BASE64);
+/** Set in the listen callback; `initialize` runs after listen, so it is final by then. */
+let boundPort = PORT;
 
 const TOOLS = [
   {
@@ -118,7 +127,17 @@ function handleRpc(message, _session) {
         payload: jsonRpcResult(id, {
           protocolVersion: negotiated,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: SERVER_NAME, version: '1.0.0' },
+          serverInfo: {
+            name: SERVER_NAME,
+            version: '1.0.0',
+            icons: [
+              {
+                src: `http://127.0.0.1:${boundPort}/icon.png`,
+                mimeType: 'image/png',
+                sizes: ['16x16'],
+              },
+            ],
+          },
           instructions: INSTRUCTIONS,
         }),
       };
@@ -169,6 +188,20 @@ function sendJson(res, status, payload, extraHeaders = {}) {
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://fixture.invalid');
+  if (url.pathname === '/icon.png') {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { allow: 'GET, HEAD' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': 'image/png',
+      'content-length': String(ICON_BYTES.length),
+      'cache-control': 'public, max-age=60',
+    });
+    res.end(req.method === 'HEAD' ? undefined : ICON_BYTES);
+    return;
+  }
   if (url.pathname !== '/mcp') {
     sendJson(res, 404, { error: 'not found' });
     return;
@@ -249,9 +282,10 @@ server.on('error', (error) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   const address = server.address();
-  const port = typeof address === 'object' && address !== null ? address.port : PORT;
+  boundPort = typeof address === 'object' && address !== null ? address.port : PORT;
+  const port = boundPort;
   process.stdout.write(`${JSON.stringify({ port, url: `http://127.0.0.1:${port}/mcp` })}\n`);
-  log('listening', String(port));
+  log('listening', String(port), 'icon', `http://127.0.0.1:${port}/icon.png`);
 });
 
 for (const signal of ['SIGTERM', 'SIGINT']) {

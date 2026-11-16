@@ -8,7 +8,7 @@
  * nothing registered.
  */
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -40,6 +40,52 @@ function makeGet(path, headers = {}) {
   req.url = `${API_PREFIX}${path}`;
   req.headers = { host: '127.0.0.1:3080', ...headers };
   return req;
+}
+
+/**
+ * Point the plugin's data directory at `dir` for one test, restoring the
+ * environment afterwards; the plugin resolves it from process.env on apply.
+ * @param {object} t - node:test context.
+ * @param {string} dir - Absolute data directory.
+ * @returns {void}
+ */
+function setDataDirEnv(t, dir) {
+  const previous = {
+    DSH_MCP_MANAGER_DATA_DIR: process.env.DSH_MCP_MANAGER_DATA_DIR,
+    DSH_HOME: process.env.DSH_HOME,
+  };
+  t.after(() => {
+    if (previous.DSH_MCP_MANAGER_DATA_DIR === undefined) delete process.env.DSH_MCP_MANAGER_DATA_DIR;
+    else process.env.DSH_MCP_MANAGER_DATA_DIR = previous.DSH_MCP_MANAGER_DATA_DIR;
+    if (previous.DSH_HOME === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous.DSH_HOME;
+  });
+  process.env.DSH_MCP_MANAGER_DATA_DIR = dir;
+}
+
+/** One 0.1.0-era stored record (emoji icon string). */
+function legacyRecord() {
+  return {
+    id: 'srv_1f3c9a2b70',
+    key: 'legacy',
+    name: 'Legacy MCP',
+    enabled: false,
+    transport: 'http',
+    url: 'http://127.0.0.1:1/mcp',
+    command: '',
+    args: [],
+    env: {},
+    cwd: '',
+    headers: [],
+    oauth: { mode: 'none' },
+    icon: '🔌',
+    color: 'blue',
+    group: '',
+    presets: 'all',
+    timeoutMs: 60000,
+    createdAt: '2026-11-16T10:00:00.000Z',
+    updatedAt: '2026-11-16T10:00:00.000Z',
+  };
 }
 
 /** One mock Cordis host context. */
@@ -90,20 +136,9 @@ function mockContext() {
 test('index: mount registers the prefix route, agent listeners and disposal', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-index-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const previous = {
-    DSH_MCP_MANAGER_DATA_DIR: process.env.DSH_MCP_MANAGER_DATA_DIR,
-    DSH_HOME: process.env.DSH_HOME,
-  };
-  t.after(() => {
-    if (previous.DSH_MCP_MANAGER_DATA_DIR === undefined) delete process.env.DSH_MCP_MANAGER_DATA_DIR;
-    else process.env.DSH_MCP_MANAGER_DATA_DIR = previous.DSH_MCP_MANAGER_DATA_DIR;
-    if (previous.DSH_HOME === undefined) delete process.env.DSH_HOME;
-    else process.env.DSH_HOME = previous.DSH_HOME;
-  });
-
   // apply() resolves the data directory from the process environment; force it
   // into the temp directory so this test can never touch a real DSH home.
-  process.env.DSH_MCP_MANAGER_DATA_DIR = dir;
+  setDataDirEnv(t, dir);
   const { apply, name, inject } = await import('../lib/index.js');
   assert.equal(name, 'dsh-better-mcp-manager');
   assert.deepEqual(inject, ['webServer']);
@@ -150,4 +185,35 @@ test('index: mount registers the prefix route, agent listeners and disposal', as
   }
   assert.equal(unregistered.length, 1, 'the prefix route is unregistered on dispose');
   assert.deepEqual([...events.keys()], [], 'the agent listeners are removed on dispose');
+});
+
+test('index: mounting a 0.1.0 store migrates the emoji icons and logs it', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-index-migrate-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  setDataDirEnv(t, dir);
+  await writeFile(join(dir, 'servers.json'), JSON.stringify({ version: 1, servers: [legacyRecord()] }), { mode: 0o600 });
+
+  const { apply } = await import('../lib/index.js');
+  const { ctx, effects, routes, logs, unregistered } = mockContext();
+  apply(ctx);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.ok(
+    logs.some(([level, message]) => level === 'warn' && message.includes('migrated the store to schema version 2')),
+    `the mount must log the store migration, got ${JSON.stringify(logs)}`,
+  );
+  assert.equal(routes.length, 1);
+  const res = makeResponse();
+  await routes[0].handler(makeGet('/servers'), res);
+  assert.equal(res.status, 200);
+  const payload = JSON.parse(res.body);
+  assert.equal(payload.servers.length, 1);
+  assert.deepEqual(payload.servers[0].icon, { kind: 'auto' }, 'the 0.1.0 emoji icon is migrated to auto');
+  assert.equal(payload.servers[0].name, 'Legacy MCP');
+  assert.equal(payload.servers[0].iconUrl, `${API_PREFIX}/servers/srv_1f3c9a2b70/icon?v=auto`);
+
+  for (const { dispose } of effects.slice().reverse()) {
+    if (typeof dispose === 'function') await dispose();
+  }
+  assert.equal(unregistered.length, 1);
 });

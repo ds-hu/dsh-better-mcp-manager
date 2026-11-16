@@ -34,4 +34,4 @@ No right-sidebar tab, no header button, no settings sub-page, no keyboard shortc
   editing servers is not a conversational task — but it also means the page cannot be shown
   side-by-side with a chat by design.
 - If a future plugin also picks `order: 20`, the sidebar's sort is stable but the visual position
-  of the two entries is not guaranteed. Panel order is not user-configurable in 0.1.0.
+  of the two entries is not guaranteed. Panel order is not user-configurable in 0.2.0.

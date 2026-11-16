@@ -36,7 +36,7 @@ no profile patch entry for a server.
 - We reimplement what `dsh-mcp-client` already does — connect, initialize, list tools, project
   results, reconnect with backoff. That is deliberate duplication, bounded by adapting the
   established projection/connection behavior and keeping the surface smaller (one connection per
-  server, no resources, no prompt templates in 0.1.0).
+  server, no resources, no prompt templates in 0.2.0).
 - The manager and the shipped `dsh-mcp-client` rows are independent. This plugin does not read,
   migrate or manage YAML-configured MCP servers; both can be installed at once.
 - Tests must cover the protocol edges ourselves: tool-list changes, dropped connections, auth

@@ -12,7 +12,45 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createConnection, createManager, __mcpTest } from '../lib/mcp.js';
 
-const { createTokenSource, buildHeaders, classifyFailure, describeFailure, errorChain, truncateUtf8 } = __mcpTest;
+const {
+  createTokenSource,
+  buildHeaders,
+  readServerIcons,
+  pickServerIcon,
+  parseDataIcon,
+  fetchIconBytes,
+  classifyFailure,
+  describeFailure,
+  errorChain,
+  truncateUtf8,
+} = __mcpTest;
+
+/** Minimal bytes that pass the raster magic-number checks (contract §2.6). */
+const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('png')]);
+const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from('jpeg')]);
+const WEBP = Buffer.concat([Buffer.from('RIFF'), Buffer.from([0, 0, 0, 0]), Buffer.from('WEBP'), Buffer.from('webp')]);
+const GIF = Buffer.concat([Buffer.from('GIF89a'), Buffer.from('gif')]);
+
+/** One fetch Response stand-in carrying binary bytes. */
+function binaryResponse({ bytes = PNG, mimeType = 'image/png', contentLength, ok = true, status = 200, arrayBufferError } = {}) {
+  const headers = new Map();
+  if (mimeType !== undefined) headers.set('content-type', mimeType);
+  if (contentLength !== undefined) headers.set('content-length', String(contentLength));
+  return {
+    ok,
+    status,
+    headers: { get: (name) => headers.get(String(name).toLowerCase()) ?? null },
+    async arrayBuffer() {
+      if (arrayBufferError !== undefined) throw new Error(arrayBufferError);
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    },
+  };
+}
+
+/** Encode bytes as a data URL. */
+function dataUrl(mimeType, bytes) {
+  return `data:${mimeType};base64,${bytes.toString('base64')}`;
+}
 
 /** One normalized client_credentials OAuth config. */
 function oauth(overrides = {}) {
@@ -431,4 +469,135 @@ test('mcp connection: a disabled stdio server reports the contract snapshot', as
   assert.equal(connection.snapshot().state, 'disabled', 'start on a disabled server does nothing');
   await connection.dispose();
   await connection.dispose();
+});
+
+/* ---------------------------------------------------------------- */
+/* 0.2.0 server icons (contract §2.6)                                */
+/* ---------------------------------------------------------------- */
+
+test('mcp icons: readServerIcons narrows what the server reported', () => {
+  assert.deepEqual(readServerIcons(undefined), []);
+  assert.deepEqual(readServerIcons(null), []);
+  assert.deepEqual(readServerIcons({}), []);
+  assert.deepEqual(readServerIcons('nope'), []);
+  assert.deepEqual(readServerIcons([]), []);
+
+  const accepted = readServerIcons([
+    { src: 'data:image/png;base64,AAAA', mimeType: 'image/png', sizes: ['16x16'], theme: 'light', extra: 'dropped' },
+    { src: 'https://example.com/icon.png', theme: 'dark' },
+    null,
+    'nope',
+    {},
+    { src: '' },
+    { src: 42 },
+    { src: 'x'.repeat(700_000) },
+  ]);
+  assert.deepEqual(accepted, [
+    { src: 'data:image/png;base64,AAAA', mimeType: 'image/png', sizes: ['16x16'], theme: 'light' },
+    { src: 'https://example.com/icon.png', theme: 'dark' },
+  ], 'malformed entries are skipped, unknown fields dropped');
+
+  assert.deepEqual(readServerIcons([{ src: 's', mimeType: 42, sizes: ['a', 1], theme: 'blue' }]), [{ src: 's' }]);
+  assert.deepEqual(
+    readServerIcons([{ src: 's', sizes: Array.from({ length: 12 }, (_, index) => `${index}`) }])[0].sizes.length,
+    8,
+    'sizes are capped at eight entries',
+  );
+  const many = readServerIcons(Array.from({ length: 12 }, (_, index) => ({ src: `icon-${index}` })));
+  assert.equal(many.length, 8, 'at most eight icons are kept per server');
+});
+
+test('mcp icons: pickServerIcon prefers a light or theme-less icon', () => {
+  assert.equal(pickServerIcon(undefined), null);
+  assert.equal(pickServerIcon([]), null);
+  assert.equal(pickServerIcon([{ src: 'dark', theme: 'dark' }]).src, 'dark', 'a dark-only icon is still used');
+  assert.equal(pickServerIcon([{ src: 'dark', theme: 'dark' }, { src: 'light', theme: 'light' }]).src, 'light');
+  assert.equal(pickServerIcon([{ src: 'dark', theme: 'dark' }, { src: 'plain' }]).src, 'plain');
+  assert.equal(pickServerIcon([{ src: 'plain' }, { src: 'light', theme: 'light' }]).src, 'plain', 'first match wins');
+  assert.equal(pickServerIcon([{ src: 'dark1', theme: 'dark' }, { src: 'light1', theme: 'light' }, { src: 'light2', theme: 'light' }]).src, 'light1');
+});
+
+test('mcp icons: parseDataIcon decodes only bounded canonical raster data URLs', () => {
+  assert.deepEqual(parseDataIcon(dataUrl('image/png', PNG)), { bytes: PNG, mimeType: 'image/png' });
+  assert.deepEqual(parseDataIcon(dataUrl('image/jpeg', JPEG)), { bytes: JPEG, mimeType: 'image/jpeg' });
+  assert.deepEqual(parseDataIcon(dataUrl('image/webp', WEBP)), { bytes: WEBP, mimeType: 'image/webp' });
+  assert.deepEqual(parseDataIcon(dataUrl('image/gif', GIF)), { bytes: GIF, mimeType: 'image/gif' });
+  assert.deepEqual(
+    parseDataIcon(`DATA:IMAGE/PNG;BASE64,${PNG.toString('base64')}`),
+    { bytes: PNG, mimeType: 'image/png' },
+    'the MIME token is case-insensitive and normalized',
+  );
+
+  const rejected = [
+    'https://example.com/icon.png',
+    'data:image/svg+xml;base64,PHN2Zy8+',
+    'data:text/plain;base64,aGVsbG8=',
+    'data:image/png;base64,',
+    'data:image/png;base64,iVBORw0KGgo==', // non-canonical base64
+    `${dataUrl('image/png', PNG).replace(',', ',\n')}`, // whitespace is not canonical base64
+    dataUrl('image/png', Buffer.from('not a png')),
+    dataUrl('image/png', Buffer.concat([PNG, Buffer.alloc(512 * 1024)])), // above the decoded cap
+    'data:image/png;base64,%%%%',
+  ];
+  for (const source of rejected) assert.equal(parseDataIcon(source), null, `${source.slice(0, 40)} must be rejected`);
+});
+
+test('mcp icons: fetchIconBytes sends the server headers and bounds the fetch', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    return binaryResponse({ bytes: PNG, mimeType: 'image/png; charset=binary' });
+  };
+  const image = await fetchIconBytes('https://mcp.example.com/icon.png', { Authorization: 'Bearer tok', accept: 'image/png' }, fetchImpl);
+  assert.deepEqual(image, { bytes: PNG, mimeType: 'image/png' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://mcp.example.com/icon.png');
+  assert.equal(calls[0].init.redirect, 'follow');
+  assert.equal(calls[0].init.headers.Authorization, 'Bearer tok', 'the server headers are forwarded');
+  assert.equal(calls[0].init.headers.accept, 'image/png', 'an explicit accept header wins');
+  assert.ok(calls[0].init.signal instanceof AbortSignal, 'the fetch is bounded by a timeout signal');
+
+  const defaults = [];
+  await fetchIconBytes('https://x/icon', {}, async (url, init) => {
+    defaults.push(init);
+    return binaryResponse({ bytes: GIF, mimeType: 'image/gif' });
+  });
+  assert.match(defaults[0].headers.accept, /image\/png/u, 'the default accept header asks for raster images');
+
+  assert.equal(await fetchIconBytes('https://x', {}, async () => binaryResponse({ ok: false, status: 404 })), null);
+  assert.equal(await fetchIconBytes('https://x', {}, async () => binaryResponse({ mimeType: 'image/svg+xml' })), null);
+  assert.equal(await fetchIconBytes('https://x', {}, async () => binaryResponse({ contentLength: 513 * 1024 })), null, 'declared oversize is refused before the body is read');
+  assert.equal(await fetchIconBytes('https://x', {}, async () => binaryResponse({ bytes: Buffer.concat([PNG, Buffer.alloc(512 * 1024)]) })), null);
+  assert.equal(await fetchIconBytes('https://x', {}, async () => binaryResponse({ bytes: Buffer.from('not an image') })), null);
+  assert.equal(await fetchIconBytes('https://x', {}, async () => binaryResponse({ bytes: Buffer.alloc(0) })), null);
+  assert.equal(await fetchIconBytes('https://x', {}, async () => { throw new Error('network down'); }), null);
+  assert.equal(await fetchIconBytes('https://x', {}, async () => binaryResponse({ arrayBufferError: 'stream broke' })), null);
+});
+
+test('mcp icons: manager.icon resolves through the supervisor and unknown ids answer null', async () => {
+  const manager = createManager({ logger: () => {} });
+  try {
+    assert.equal(await manager.icon('srv_missing'), null, 'an unknown id has no icon');
+    const record = {
+      id: 'srv_disabled',
+      key: 'disabled',
+      name: 'Disabled',
+      enabled: false,
+      transport: 'http',
+      url: 'http://127.0.0.1:1/mcp',
+      command: '',
+      args: [],
+      env: {},
+      cwd: '',
+      headers: [],
+      oauth: { mode: 'none' },
+      timeoutMs: 5_000,
+    };
+    await manager.sync([record]);
+    const connection = manager.get('srv_disabled');
+    assert.deepEqual(connection.icons(), [], 'a disabled server reports no icons');
+    assert.equal(await manager.icon('srv_disabled'), null, 'an automatic icon is null until the server declares one');
+  } finally {
+    await manager.dispose();
+  }
 });

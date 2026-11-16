@@ -82,6 +82,7 @@ test('store: create, update, delete round-trip survives a reload', async (t) => 
   const summary = await reopened.load();
   assert.equal(summary.loaded, 1);
   assert.equal(summary.dropped, 0);
+  assert.equal(summary.migrated, false, 'a current-version store needs no migration');
   assert.deepEqual(reopened.list(), [renamed]);
   await reopened.close();
 });
@@ -116,9 +117,11 @@ test('store: the write is atomic, mode 0600, and leaves no temporary file', asyn
   assert.equal(dirMode, 0o700, `data directory mode must be 0700, got 0${dirMode.toString(8)}`);
 
   const raw = JSON.parse(await readFile(join(dir, STORE_FILE), 'utf8'));
+  assert.equal(STORE_VERSION, 2, '0.2.0 stores icon objects, so the schema moved to version 2');
   assert.equal(raw.version, STORE_VERSION);
   assert.equal(raw.servers.length, 1);
   assert.equal(raw.servers[0].name, 'Atomic');
+  assert.deepEqual(raw.servers[0].icon, { kind: 'auto' }, '0.2.0 writes the icon object even for a fresh record');
 });
 
 test('store: concurrent writes are serialized and all land', async (t) => {
@@ -130,6 +133,84 @@ test('store: concurrent writes are serialized and all land', async (t) => {
   await store.close();
   const raw = JSON.parse(await readFile(join(dir, STORE_FILE), 'utf8'));
   assert.deepEqual(raw.servers.map((server) => server.id), records.map((record) => record.id));
+});
+
+test('store: a 0.1.0 (version 1) store migrates every emoji icon to auto', async (t) => {
+  const dir = await tempDir(t);
+  const legacy = [draft('Legacy A'), draft('Legacy B')];
+  for (const record of legacy) record.icon = '🔌';
+  await writeFile(join(dir, STORE_FILE), JSON.stringify({ version: 1, servers: legacy }), { mode: 0o600 });
+
+  const warnings = [];
+  const store = createStore({ dir, logger: (level, message) => warnings.push([level, message]) });
+  const summary = await store.load();
+  assert.equal(summary.loaded, 2);
+  assert.equal(summary.dropped, 0);
+  assert.equal(summary.migrated, true, 'a version 1 file is migrated on load');
+  assert.equal(summary.quarantined, undefined, 'a readable old version must not be quarantined');
+  assert.deepEqual(store.list().map((server) => server.icon), [{ kind: 'auto' }, { kind: 'auto' }]);
+  assert.deepEqual(store.list().map((server) => server.name), ['Legacy A', 'Legacy B']);
+  assert.ok(warnings.some(([level, message]) => level === 'warn' && message.includes('migrated') && message.includes('schema version 1')));
+
+  // The in-memory migration is persisted by the next mutation; the file is
+  // rewritten as version 2 with the icon object.
+  await store.put({ ...store.get(legacy[0].id), name: 'Legacy A renamed' });
+  await store.close();
+  const raw = JSON.parse(await readFile(join(dir, STORE_FILE), 'utf8'));
+  assert.equal(raw.version, STORE_VERSION);
+  assert.deepEqual(raw.servers.map((server) => server.icon), [{ kind: 'auto' }, { kind: 'auto' }]);
+});
+
+test('store: invalid or missing icons in a version 2 store reset to auto', async (t) => {
+  const dir = await tempDir(t);
+  const withEmoji = { ...draft('Emoji'), icon: '🔌' };
+  const missing = { ...draft('Missing') };
+  delete missing.icon;
+  const garbage = { ...draft('Garbage'), icon: { kind: 'upload', file: '../escape.png', mimeType: 'image/png', updatedAt: 'x' } };
+  const upload = {
+    ...draft('Upload'),
+    icon: {
+      kind: 'upload',
+      file: 'srv_1f3c9a2b70.png',
+      mimeType: 'image/png',
+      updatedAt: '2026-11-16T10:00:00.000Z',
+    },
+  };
+  await writeFile(join(dir, STORE_FILE), JSON.stringify({ version: STORE_VERSION, servers: [withEmoji, missing, garbage, upload] }), { mode: 0o600 });
+
+  const store = createStore({ dir });
+  const summary = await store.load();
+  assert.equal(summary.loaded, 4, 'a damaged icon must not drop the record itself');
+  assert.equal(summary.migrated, false);
+  assert.deepEqual(store.list().map((server) => server.icon), [
+    { kind: 'auto' },
+    { kind: 'auto' },
+    { kind: 'auto' },
+    { ...upload.icon },
+  ]);
+  await store.close();
+});
+
+test('store: an uploaded-icon object round-trips through the file', async (t) => {
+  const dir = await tempDir(t);
+  const store = createStore({ dir });
+  await store.load();
+  const record = draft('Uploaded');
+  record.icon = {
+    kind: 'upload',
+    file: 'srv_1f3c9a2b70.webp',
+    mimeType: 'image/webp',
+    updatedAt: '2026-11-16T10:00:00.000Z',
+  };
+  await store.put(record);
+  await store.close();
+
+  const raw = JSON.parse(await readFile(join(dir, STORE_FILE), 'utf8'));
+  assert.deepEqual(raw.servers[0].icon, record.icon);
+  const reopened = createStore({ dir });
+  await reopened.load();
+  assert.deepEqual(reopened.get(record.id).icon, record.icon, 'the upload metadata survives a reload unchanged');
+  await reopened.close();
 });
 
 test('store: a corrupt file is quarantined and the plugin starts empty', async (t) => {

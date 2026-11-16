@@ -74,6 +74,24 @@ if (source !== '') {
     assert.deepEqual(foreign, [], `unexpected API path literal(s): ${foreign.join(', ')}`);
   });
 
+  check('the browser half has no emoji icon palette', () => {
+    assert.doesNotMatch(source, /EMOJIS/u, 'the 0.1.0 EMOJIS palette must be gone (contract §2.6: no emoji palette)');
+    assert.doesNotMatch(source, /iconGlyph/u, 'the 0.1.0 iconGlyph helper was replaced by iconLetter/iconUrlOf');
+    const emoji = source.match(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu);
+    assert.equal(emoji, null, `lib/client.js still contains emoji glyph(s): ${emoji === null ? '' : emoji.join(' ')}`);
+  });
+
+  check('the icon UI carries the agreed test hooks', () => {
+    for (const testId of ['server-icon', 'form-icon', 'icon-preview', 'icon-upload', 'icon-file', 'icon-remove']) {
+      assert.ok(source.includes(`"data-testid": "${testId}"`), `lib/client.js is missing data-testid="${testId}"`);
+    }
+    assert.match(source, /FileReader/u, 'the client must read the picked file with FileReader');
+    assert.match(source, /readAsDataURL/u, 'the upload must become a data URL before POST');
+    assert.match(source, /image\/png,image\/jpeg,image\/webp,image\/gif/u, 'the file input must accept the four raster types');
+    assert.match(source, /accept:\s*ICON_ACCEPT/u, 'the file input accept filter must use ICON_ACCEPT');
+    assert.match(source, /\/icon"/u, 'the client must call the icon endpoint');
+  });
+
   check('the browser half never imports a Harness package', () => {
     assert.doesNotMatch(source, /import\s[^;]*?from\s+['"]@deepseek-ai\//u, 'lib/client.js imports an @deepseek-ai/ package');
     assert.doesNotMatch(source, /require\(\s*['"]@deepseek-ai\//u, 'lib/client.js requires an @deepseek-ai/ package');
@@ -456,6 +474,15 @@ check('the dictionaries carry every label the panel needs', () => {
     { topic: 'address (URL or address)', pattern: /(^|\.)(?:url|address)$/u },
     { topic: 'headers', pattern: /(^|\.)headers(?:\.|$)/u },
     { topic: 'oauth', pattern: /(^|\.)oauth(?:\.|$)/u },
+    { topic: 'server icon field', exact: 'field.icon' },
+    { topic: 'icon upload', exact: 'icon.upload' },
+    { topic: 'icon auto reset', exact: 'icon.auto' },
+    { topic: 'icon hint', exact: 'icon.hint' },
+    { topic: 'icon invalid type', exact: 'icon.invalidType' },
+    { topic: 'icon too large', exact: 'icon.tooLarge' },
+    { topic: 'icon upload failure', exact: 'icon.uploadFailed' },
+    { topic: 'icon removed', exact: 'icon.removed' },
+    { topic: 'icon automatic label', exact: 'icon.autoLabel' },
     { topic: 'presets', pattern: /(^|\.)presets(?:\.|$)/u },
     { topic: 'status.connected', exact: 'status.connected' },
     { topic: 'status.error', exact: 'status.error' },
@@ -479,6 +506,47 @@ check('the dictionaries carry every label the panel needs', () => {
       assert.ok(dictionary[match].trim().length > 0, `${locale}["${match}"] is empty`);
     }
   }
+});
+
+check('the obsolete emoji-icon dictionary keys are gone', () => {
+  const loaded = bundleOrFail();
+  const { zh, en } = loaded.log.locale[0].dictionary;
+  for (const key of ['field.iconHint', 'field.iconPlaceholder', 'field.iconClear']) {
+    assert.equal(Object.hasOwn(zh, key), false, `the zh dictionary still carries ${key}`);
+    assert.equal(Object.hasOwn(en, key), false, `the en dictionary still carries ${key}`);
+  }
+});
+
+check('the client exposes the icon helpers, not an emoji glyph helper', () => {
+  const loaded = bundleOrFail();
+  const api = loaded.exports.__mcpTest;
+  assert.ok(api !== undefined && api !== null, 'the module must expose __mcpTest for the offline suite');
+  assert.equal(Object.hasOwn(api, 'iconGlyph'), false, 'iconGlyph must be gone');
+  assert.equal(typeof api.letterOf, 'function');
+  assert.equal(typeof api.iconLetter, 'function');
+  assert.equal(typeof api.iconUrlOf, 'function');
+  assert.deepEqual([...api.ICON_TYPES], ['image/png', 'image/jpeg', 'image/webp', 'image/gif'], 'the client accepts the four raster types');
+  assert.equal(api.MAX_ICON_BYTES, 524288);
+  assert.equal(api.letterOf('  alpha  '), 'A');
+  assert.equal(api.letterOf(''), '?');
+  assert.equal(api.letterOf(undefined), '?');
+  assert.equal(api.letterOf('中文名字'), '中');
+  assert.equal(api.iconLetter({ name: 'beta' }), 'B');
+  assert.equal(api.iconLetter(null), '?');
+  assert.equal(api.iconLetter({}), '?');
+  assert.equal(api.iconUrlOf({ iconUrl: '/better-mcp-manager/api/servers/srv_1/icon?v=auto' }), '/better-mcp-manager/api/servers/srv_1/icon?v=auto');
+  assert.equal(api.iconUrlOf({}), '');
+  assert.equal(api.iconUrlOf({ iconUrl: '' }), '');
+  assert.equal(api.iconUrlOf(null), '');
+  assert.equal(api.iconUrlOf({ iconUrl: 42 }), '');
+});
+
+check('save drafts never carry an icon field', () => {
+  const loaded = bundleOrFail();
+  const api = loaded.exports.__mcpTest;
+  const body = api.bodyFromDraft(api.blankDraft());
+  assert.equal(Object.hasOwn(body, 'icon'), false, 'the icon is changed only through its endpoints (contract §2.1)');
+  assert.equal(Object.hasOwn(body, 'iconUrl'), false);
 });
 
 check('every dictionary value is a non-empty string', () => {

@@ -3,7 +3,7 @@
 This file is the single source of truth shared by the Host half (`lib/index.js` and friends),
 the Client half (`lib/client.js`) and the tests (`test/`). Change it before changing either side.
 
-Status: **frozen for 0.1.0**. Everything below is what 0.1.0 ships.
+Status: **frozen for 0.2.0**. Everything below is what 0.2.0 ships.
 
 ---
 
@@ -39,7 +39,7 @@ YAML. Everything the user configures lives in one JSON file under
     { "name": "Authorization", "value": "Bearer sk-..." }
   ],
   "oauth": { "mode": "none" },     // see 2.2
-  "icon": "🔌",                    // 0..8 chars, rendered in the tile; "" = fall back to first letter
+  "icon": { "kind": "auto" },      // see 2.6: auto = MCP server icon else first letter; upload = stored file
   "color": "blue",                 // one of: blue, violet, teal, green, amber, rose, slate
   "group": "",                     // "" = ungrouped; otherwise 1..60 chars, free text
   "presets": "all",                // "all" | string[] of agent-preset ids (may be [])
@@ -52,7 +52,7 @@ YAML. Everything the user configures lives in one JSON file under
 Store file:
 
 ```jsonc
-{ "version": 1, "servers": [ /* Server records, stable order = list order */ ] }
+{ "version": 2, "servers": [ /* Server records, stable order = list order */ ] }
 ```
 
 Rules enforced before any write (the API answers `400` with `{ ok:false, code, error }`):
@@ -67,7 +67,12 @@ Rules enforced before any write (the API answers `400` with `{ ok:false, code, e
   chars, at most 20 headers.
 - `presets`: `"all"`, or an array of known preset ids (unknown ids are rejected with the roster in
   the message), at most 40 entries.
-- `icon` ≤ 8 UTF-16 code units; `color` from the fixed palette; `group` ≤ 60 chars.
+- `icon` is not accepted in save drafts: a new server starts `{ "kind": "auto" }`, and the icon is
+  changed only through the icon endpoints in §3. `color` from the fixed palette; `group` ≤ 60 chars.
+  A store written by 0.1.0 (schema version 1) is migrated in memory when it is loaded: every legacy
+  string icon becomes `{ "kind": "auto" }`; unknown icons in version 2 are reset to auto. The file is
+  rewritten with `"version": 2` by the next successful write (the plugin never rewrites a file it was
+  only asked to read).
 - `timeoutMs` integer 1000..600000; `enabled` boolean.
 - Unknown fields are dropped, not stored.
 
@@ -132,6 +137,34 @@ Public tool name: `mcp__<key>__<rawName>`, then normalized to DSH's function-nam
 `(key, rawName)` is appended, exactly like `@deepseek-ai/dsh-mcp-client`. The raw name is what goes
 on the MCP wire; the public name is never parsed back.
 
+### 2.6 Server icon
+
+An icon is shown in the card tile; it has exactly two sources:
+
+```jsonc
+{ "kind": "auto" }   // default: the first icon the MCP server declares, else the name's first letter
+{ "kind": "upload",  // set only through POST /servers/:id/icon
+  "file": "srv_1f3c9a2b70.png",
+  "mimeType": "image/png",
+  "updatedAt": "2026-11-16T10:00:00.000Z" }
+```
+
+- **auto** reads `serverInfo.icons[]` from the MCP `initialize` result (MCP `Implementation.icons`,
+  `Icon = { src, mimeType?, sizes?, theme? }`). Preference order: an icon with no theme or
+  `theme: "light"`, then any; `src` may be a `data:` URI or an `http(s)` URL. The Host fetches HTTP
+  sources itself with the server's configured headers/OAuth (5 s timeout, 512 KiB cap, accepted raster types only —
+  PNG/JPEG/WebP/GIF; an SVG icon is skipped, never served) and caches the bytes per server + `src` for 10 minutes. A missing/invalid icon is not an
+  error: the icon endpoint answers 404 and the page shows the name's first letter.
+- **upload** stores exactly one file under `$DSH_HOME/better-mcp-manager/icons/<id>.<ext>` (0600,
+  directory 0700, atomic replace). Accepted decoded media types: `image/png`, `image/jpeg`,
+  `image/webp`, `image/gif`; max 512 KiB decoded. SVG is rejected on purpose (same-origin script
+  risk). Replacing or deleting the server deletes the previous file; there is no orphan.
+- `GET /servers` and every server answer expose the icon through `iconUrl`
+  (`/better-mcp-manager/api/servers/<id>/icon?v=<updatedAt|auto>`; `v` is a cache-buster whose exact
+  value carries no semantics beyond changing when the icon changes); the client renders that URL as
+  an `<img>` and falls back to the first letter when it fails to load.
+- No built-in emoji palette and no emoji string icon: 0.2.0 removed them.
+
 ## 3. Host HTTP API
 
 Base: `/better-mcp-manager/api`, same-origin only. `kind: 'prefix'` route on `ctx.webServer`.
@@ -140,7 +173,8 @@ Base: `/better-mcp-manager/api`, same-origin only. `kind: 'prefix'` route on `ct
   `{ "ok": false, "code": "...", "error": "human text" }` with status 400/404/405/413/415/500.
 - Every mutation is same-origin checked (no `Origin`, or an `Origin` matching the request
   `Host`). Body-bearing mutations also require `Content-Type: application/json` and a body
-  ≤ 64 KiB; `DELETE` and `/reconnect` carry no body.
+  ≤ 64 KiB; the icon upload is the one exception (≤ 1 MiB body, ≤ 512 KiB decoded). `DELETE` and
+  `/reconnect` carry no body.
 - Read requests are `GET`. No authentication beyond the Harness's own web auth.
 
 | Method | Path | Body | Answer |
@@ -153,6 +187,9 @@ Base: `/better-mcp-manager/api`, same-origin only. `kind: 'prefix'` route on `ct
 | POST | `/servers/:id/enabled` | `{ enabled: boolean }` | `{ ok, server }` |
 | POST | `/servers/:id/reconnect` | — | `{ ok, server }` (starts a fresh connection attempt now) |
 | POST | `/servers/test` | full server draft (not stored) | `{ ok, status }` — 15s cap, always answers 200 unless the body is invalid |
+| GET | `/servers/:id/icon` | — | image bytes with their `Content-Type`, `ETag` and `Cache-Control: private, max-age=300`; `304` on matching `If-None-Match`; JSON 404 when there is no icon |
+| POST | `/servers/:id/icon` | `{ dataUrl: "data:image/png;base64,..." }` | `{ ok, server }`; stores the decoded image and sets `icon.kind = "upload"` |
+| DELETE | `/servers/:id/icon` | — | `{ ok, server }`; deletes the stored file and resets `icon = { kind: "auto" }` |
 | GET | `/presets` | — | `{ ok, presets: [Preset] }` where `Preset = { id, name, description, order }` |
 | GET | `/agents` | — | `{ ok, agents: [{ sessionId, preset, servers: [key], tools: [publicName] }] }` — live exposure diagnostics |
 | GET | `/health` | — | `{ ok, version, pid, uptimeMs }` |
@@ -190,12 +227,12 @@ Page (dark and light theme, tokens only — no literal colors outside artwork):
 
 1. Header: title 管理 / MCP 管理 + subtitle count; primary `+ 添加 MCP` button.
 2. Server cards grouped by `group` (ungrouped shown last as 其他（未分组）). Each card:
-   icon tile (color + emoji/letter), name, status line (`已连接 · HTTP · 工具 19/19`,
+   icon tile (color + image from `iconUrl`, falling back to the name’s first letter), name, status line (`已连接 · HTTP · 工具 19/19`,
    `连接失败 · HTTP · 工具 0`, `已停用 · SSE`), status dot (green/red/gray/amber), `···` menu
    (编辑, 测试连接, 重新连接, 删除), and for errors an inline error bubble with the first 2 lines
    of the message and a 详情 link that opens a dialog with message + detail.
 3. Add/edit form (a right-hand sheet or full page level; both are fine): 是否启用 switch;
-   服务器图标 picker (emoji + color); 分组 select (existing groups + free text); 名称; 传输类型
+   服务器图标 (preview + 上传图标 file picker + 恢复自动; no emoji palette) and color; 分组 select (existing groups + free text); 名称; 传输类型
    segmented HTTP / SSE / 内置(stdio); 服务器地址 (or 命令 + 参数 + 环境变量 for stdio);
    OAuth 设置 dialog (mode none/bearer/client_credentials); 自定义请求头 rows (name, value,
    delete, `+ 添加请求头`); 预设 section (radio: 全部预设 / 指定预设, then preset checkboxes);

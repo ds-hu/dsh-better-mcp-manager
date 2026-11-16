@@ -34,7 +34,7 @@ export async function startFixtures({ repoRoot, runDir, runId, reporter }) {
     memoryMax: '256M',
     command: process.execPath,
     args: [join(repoRoot, 'test', 'fixtures', 'serve.mjs')],
-    env: {},
+    env: { TMPDIR: join(runDir, 'tmp'), TMP: join(runDir, 'tmp'), TEMP: join(runDir, 'tmp') },
     cwd: repoRoot,
     logPath,
     errPath,

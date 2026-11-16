@@ -74,6 +74,22 @@ export class InstanceApi {
     return this.request('DELETE', path);
   }
 
+  /** Raw response for binary/conditional requests (icons, 304s). */
+  async raw(method, path, { headers = {}, body } = {}) {
+    const merged = { cookie: this.cookie, ...headers };
+    if (method !== 'GET') merged.origin = this.origin;
+    const url = path.startsWith('http://') || path.startsWith('https://') ? path : `${this.origin}${path}`;
+    const response = await fetch(url, {
+      method,
+      headers: merged,
+      body,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(30_000),
+    });
+    const bytes = Buffer.from(await response.arrayBuffer());
+    return { status: response.status, headers: response.headers, bytes };
+  }
+
   // ── plugin API convenience wrappers ──────────────────────────────────────
   async health() {
     return (await this.get('/better-mcp-manager/api/health')).payload;
@@ -115,5 +131,27 @@ export class InstanceApi {
 
   async testServer(draft) {
     return (await this.post('/better-mcp-manager/api/servers/test', draft)).payload;
+  }
+
+  /** `GET /servers/:id/icon` (iconUrl carries a cache-busting `?v=`). */
+  async fetchIcon(iconUrl, { ifNoneMatch } = {}) {
+    const headers = {};
+    if (ifNoneMatch !== undefined) headers['if-none-match'] = ifNoneMatch;
+    const result = await this.raw('GET', iconUrl, { headers });
+    return {
+      status: result.status,
+      contentType: result.headers.get('content-type'),
+      etag: result.headers.get('etag'),
+      cacheControl: result.headers.get('cache-control'),
+      bytes: result.bytes,
+    };
+  }
+
+  async uploadIcon(id, dataUrl) {
+    return (await this.post(`/better-mcp-manager/api/servers/${encodeURIComponent(id)}/icon`, { dataUrl })).payload;
+  }
+
+  async deleteIcon(id) {
+    return (await this.delete(`/better-mcp-manager/api/servers/${encodeURIComponent(id)}/icon`)).payload;
   }
 }

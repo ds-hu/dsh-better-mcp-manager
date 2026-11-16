@@ -75,6 +75,18 @@ A free-text label on a server (`group`), used only for ordering the page. An emp
 **其他（未分组）** and is shown last. Groups have no id, no order, and no life of their own; they
 exist as long as at least one server uses the label.
 
+### Icon
+
+The artwork in a server's card tile, with exactly two sources: **automatic** (default,
+`{ kind: "auto" }`) uses the first icon the MCP server declares in its `initialize` result
+(`serverInfo.icons`, preferring a light or unthemed icon) and falls back to the first letter of the
+server name; **upload** (`{ kind: "upload", file, mimeType, updatedAt }`) is one raster file the
+operator supplied. There is no built-in emoji palette, no stock icon set, and no user-entered emoji
+string; SVG is rejected. The icon is not part of a save draft — only
+`POST /servers/:id/icon` (a `data:` URL) and `DELETE /servers/:id/icon` change it. The API view adds
+`iconUrl` with a cache-buster for the current version; the browser renders it and falls back to the
+letter when it fails.
+
 ### Tool
 
 A model-facing function discovered from an MCP server. Its public name is
@@ -93,23 +105,27 @@ Per-server authentication beyond custom headers: `none`, `bearer` (a static toke
 `Authorization: Bearer` header unless a custom `Authorization` header already exists — custom
 headers win), or `client_credentials` (fetch a token from `tokenUrl` with `clientId`,
 `clientSecret`, `scope`, cache it until `expires_in - 60s`, retry once on a 401). There is no
-authorization-code flow in 0.1.0. Secrets are stored in the data file, never written to logs.
+authorization-code flow in 0.2.0. Secrets are stored in the data file, never written to logs.
 
 ### Store and data directory
 
-One JSON document in one directory:
+One JSON document plus uploaded icon files in one directory:
 
 ```
 $DSH_HOME/better-mcp-manager/     mode 0700
-└── servers.json                  mode 0600, atomic replace
-{ "version": 1, "servers": [ ... ] }
+├── servers.json                  mode 0600, atomic replace
+│   { "version": 2, "servers": [ ... ] }
+└── icons/                        mode 0700, created on the first upload
+    └── <server id>.<ext>         mode 0600, exactly one file per server
 ```
 
-The directory is created lazily on the first save. It is **per DSH home, not per profile**:
-profiles under the same `$DSH_HOME` share one list. `DSH_MCP_MANAGER_DATA_DIR` overrides the
-location (test/scratch use; the CLI resolves it the same way). The store is the only source of truth
-for servers; live status is derived and recomputed. The **clean** CLI is what deletes this
-directory.
+The directory is created when the plugin mounts; `servers.json` appears on the first save and
+`icons/` on the first upload. It is **per DSH home, not per profile**: profiles under the same
+`$DSH_HOME` share one list. `DSH_MCP_MANAGER_DATA_DIR` overrides the location (test/scratch use; the
+CLI resolves it the same way). The store is the only source of truth for servers; live status is
+derived and recomputed. A schema-version-1 file (0.1.0 emoji strings) is migrated in memory on load
+and rewritten as version 2 by the next save. The **clean** CLI is what deletes this directory,
+including `icons/`.
 
 ## Invariants
 
@@ -130,23 +146,27 @@ directory.
    the server's raw tool name. A new key means new tools.
 8. **Exposure is per agent context.** Registering or releasing a tool happens on `agent.ctx`;
    removing a server must release every registration it made and close its connection.
-9. **Uninstall is two steps and leaves nothing else**: remove the bundle (the code, the row, the
-   route, the client) and run `clean` for the one directory. Installing without configuring creates
-   nothing on disk.
+9. **The icon never comes from a save draft.** `POST`/`PUT /servers` and every other draft path drop
+   an `icon` field; the icon changes only through the two icon endpoints, so a save can neither set
+   nor clear an uploaded icon by accident.
+10. **Uninstall is two steps and leaves nothing else**: remove the bundle (the code, the row, the
+    route, the client) and run `clean` for the one directory, which includes `icons/`. Mounting
+    without configuring writes no file (the directory itself is created on mount).
 
 ## File map
 
 | Path | Role |
 |---|---|
 | `lib/index.js` | Host plugin entry: `apply(ctx)` / dispose, wires store, manager, binder, API, CLI-independent |
-| `lib/store.js` | data directory resolution, load/save, atomic replace, mode `0600` |
-| `lib/model.js` | validation and normalisation of drafts, key allocation, preset predicate |
-| `lib/mcp.js` | one MCP client per server: transports, OAuth, connect/list/call, backoff, status |
+| `lib/store.js` | data directory resolution, load/save, atomic replace, mode `0600`, schema v1→v2 migration |
+| `lib/model.js` | validation and normalisation of drafts, key allocation, preset predicate, icon normalisation |
+| `lib/icons.js` | uploaded icons: data-URL decoding, raster magic checks, `icons/` storage (0600), deletion |
+| `lib/mcp.js` | one MCP client per server: transports, OAuth, connect/list/call, backoff, status, auto-icon fetch/cache |
 | `lib/presets.js` | `agent/created` binding, live-agent re-exposure, `systemPrompt.section` instructions |
 | `lib/tool-definition.js` | hand-built `ToolDefinition` for a discovered MCP tool |
 | `lib/result-projection.js` | MCP result → ordered text/image/diagnostic tool result |
-| `lib/api.js` | HTTP router for `/better-mcp-manager/api/*` |
-| `lib/http.js` | same-origin JSON guard, 64 KiB body cap, JSON responses |
+| `lib/api.js` | HTTP router for `/better-mcp-manager/api/*`, including the icon endpoints |
+| `lib/http.js` | same-origin JSON guard, 64 KiB body cap (1 MiB for icon uploads), JSON responses |
 | `lib/client.js` | browser half: `sidebar.panellist` entry, `main` page, polling, styles, locale dictionaries |
 | `bin/mcp-manager.mjs` | maintenance CLI: `status` (default), `path`, `clean [--yes]` |
 | `locale/en.json`, `locale/zh.json` | plugin-page metadata (title/description); the page's UI copy lives in `lib/client.js` |
@@ -192,6 +212,12 @@ The plugin is a guest in the Host and uses only public context capabilities:
   safe" — the contract says one connection per enabled server.
 - **Renaming does not rename tools.** Only deleting and re-adding a server allocates a new key and
   therefore new tool names. The UI shows the key but does not allow editing it.
+- **The icon is not state you can save.** It is absent from server drafts by design; changing it
+  means the icon endpoints, which also own the stored file. Treating it as an ordinary form field
+  would reintroduce stale files and put image bytes in `servers.json`.
+- **Auto icons belong to the live connection.** The server declares them at `initialize`, so a
+  reconnect to a different server version can change the icon. Fetch failures are remembered for
+  60 s and the page falls back to the first letter; never store that letter.
 - **A disabled server keeps its record.** Disabling is not deleting: status becomes `disabled`, the
   connection closes, live agents lose its tools, and the record plus its settings stay.
 - **A failing server still saves and lists.** Save is a store write first; connection failure

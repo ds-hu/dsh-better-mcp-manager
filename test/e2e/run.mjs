@@ -34,15 +34,15 @@
  *               prints the kept paths and leaves them running
  *   --verbose   verbose step logging and HTTP details
  */
-import { copyFile, mkdir, readFile, rm, stat } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Reporter, createRunId, formatBytes, redact, tailFileSync, waitFor } from './lib/util.mjs';
-import { currentCgroup, inProductionCgroup, listScopes, reexecInScope } from './lib/scope.mjs';
-import { snapshotProduction, describeSnapshot } from './lib/production.mjs';
+import { currentCgroup, inProductionCgroup, listScopes, residualScopes, reexecInScope } from './lib/scope.mjs';
+import { snapshotProduction, describeSnapshot, ancestorPids } from './lib/production.mjs';
 import { InstanceApi } from './lib/api.mjs';
 import {
   addBundleToManifest,
@@ -54,6 +54,7 @@ import {
   writeProfilePatch,
 } from './lib/profile.mjs';
 import { requestsForMarker, startFixtures, stdioFixtureSpec } from './lib/fixtures.mjs';
+import { ICONS } from '../fixtures/tiny-icons.mjs';
 import { collectDiagnostics, launchBrowser } from './lib/playwright.mjs';
 import * as ui from './lib/ui.mjs';
 
@@ -79,7 +80,11 @@ const PROFILE_NAME = `mcp-e2e-${RUN_ID}`;
 const PROFILE_DIR = join(DSH_HOME, 'profiles', PROFILE_NAME);
 const ARTIFACT_DIR = join(RUN_DIR, 'artifacts');
 const DOCS_SCREENSHOT_DIR = join(REPO_ROOT, 'docs', 'screenshots');
+const PACKAGE_VERSION = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')).version;
 const DATA_DIR = join(DSH_HOME, 'better-mcp-manager');
+const ICONS_DIR = join(DATA_DIR, 'icons');
+const UPLOAD_A_PATH = join(RUN_DIR, 'tmp', 'upload-a.png');
+const UPLOAD_B_PATH = join(RUN_DIR, 'tmp', 'upload-b.png');
 
 const reporter = new Reporter({ verbose: FLAGS.verbose });
 const resources = { browser: null, dsh: null, fixtures: null };
@@ -105,8 +110,16 @@ async function main() {
   reporter.log(`production before: ${describeSnapshot(before)}`);
 
   await mkdir(join(RUN_DIR, 'logs'), { recursive: true });
+  await mkdir(join(RUN_DIR, 'tmp'), { recursive: true });
   await mkdir(ARTIFACT_DIR, { recursive: true });
   await mkdir(WORKSPACE_DIR, { recursive: true });
+  // The development host runs the assistant inside dsh-web.service, whose TMPDIR
+  // is the shared /var/tmp/dsh scratch home. Redirect every child (test DSH,
+  // fixtures, pnpm, chromium) to this run's own tmp dir so the isolated E2E
+  // never writes into that shared scratch space.
+  process.env.TMPDIR = join(RUN_DIR, 'tmp');
+  process.env.TMP = process.env.TMPDIR;
+  process.env.TEMP = process.env.TMPDIR;
 
   let page;
   let diagnostics = { consoleErrors: [], pageErrors: [], failedRequests: [] };
@@ -114,6 +127,7 @@ async function main() {
   let fixtures;
   let api;
   let serverKey;
+  let stdioId;
   const screenshotArtifacts = [];
 
   try {
@@ -155,7 +169,7 @@ async function main() {
 
     await reporter.step('Host plugin mounted and serving its HTTP API', async () => {
       const health = await api.health();
-      reporter.check('/better-mcp-manager/api/health answers ok + 0.1.0', health?.ok === true && health?.version === '0.1.0', JSON.stringify(health));
+      reporter.check(`/better-mcp-manager/api/health answers ok + ${PACKAGE_VERSION}`, health?.ok === true && health?.version === PACKAGE_VERSION, JSON.stringify(health));
       const catalog = await api.servers();
       reporter.check(
         'GET /servers starts empty with the real preset roster',
@@ -234,6 +248,7 @@ async function main() {
       const record = catalog.servers.find((server) => server.name === stdioName);
       if (record === undefined) throw new Error('saved stdio server is missing from GET /servers');
       serverKey = record.key;
+      stdioId = record.id;
       reporter.check('server record has a derived key and the chosen preset exactly', /^[a-z0-9][a-z0-9_-]{0,31}$/.test(record.key) && JSON.stringify(record.presets) === JSON.stringify(['standard']), `key ${record.key}, presets ${JSON.stringify(record.presets)}`);
       reporter.check('server record reports connected with toolCount 2', record.status?.state === 'connected' && record.status?.toolCount === 2, JSON.stringify(record.status));
 
@@ -250,6 +265,35 @@ async function main() {
       const stored = JSON.parse(await readFile(dataFile, 'utf8'));
       reporter.check('store file lives in the isolated data dir with mode 0600', mode === 0o600, `mode 0${mode.toString(8)}`);
       reporter.check('store file contains the saved server and nothing outside the data dir', stored.servers?.some((server) => server.id === record.id));
+
+      // ── 0.2.0 icons: the server-declared (auto) icon ──
+      reporter.check(
+        'new server starts with icon.kind="auto" and a cache-busted iconUrl',
+        record.icon?.kind === 'auto' && typeof record.iconUrl === 'string' && record.iconUrl.startsWith(`/better-mcp-manager/api/servers/${record.id}/icon?`) && record.iconUrl.includes('v='),
+        JSON.stringify({ icon: record.icon, iconUrl: record.iconUrl }),
+      );
+      const autoIcon = await api.fetchIcon(record.iconUrl);
+      const autoSize = pngSize(autoIcon.bytes);
+      reporter.check(
+        'auto icon serves the preferred light/no-theme MCP icon bytes (not the dark one)',
+        autoIcon.status === 200 && autoIcon.contentType === 'image/png' && sameBytes(autoIcon.bytes, ICONS.stdio.bytes) && autoSize.width === 16 && autoSize.height === 16 && !sameBytes(autoIcon.bytes, ICONS.stdioDark.bytes),
+        `HTTP ${autoIcon.status} ${autoIcon.contentType} ${autoSize.width}x${autoSize.height} ${autoSize.size}B`,
+      );
+      reporter.check(
+        'icon response carries ETag + private max-age and honours If-None-Match with 304',
+        typeof autoIcon.etag === 'string' && autoIcon.etag.length > 0 && /private/u.test(autoIcon.cacheControl ?? '') && /max-age=300/u.test(autoIcon.cacheControl ?? '') && (await api.fetchIcon(record.iconUrl, { ifNoneMatch: autoIcon.etag })).status === 304,
+        redact(`etag=${autoIcon.etag} cache-control=${autoIcon.cacheControl}`),
+      );
+      const svgUpload = await api.request('POST', `/better-mcp-manager/api/servers/${record.id}/icon`, {
+        body: { dataUrl: `data:image/svg+xml;base64,${Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64')}` },
+        expectOk: false,
+      });
+      const afterSvg = await api.serverDetail(record.id);
+      reporter.check(
+        'SVG icon upload is rejected and leaves the auto icon untouched',
+        svgUpload.status >= 400 && svgUpload.status < 500 && svgUpload.payload?.code === 'invalid-icon' && afterSvg.server.icon?.kind === 'auto' && (await api.fetchIcon(record.iconUrl)).status === 200,
+        `HTTP ${svgUpload.status} ${redact(svgUpload.text).slice(0, 140)}`,
+      );
     });
 
     let httpId;
@@ -313,6 +357,14 @@ async function main() {
       if (httpId === undefined) throw new Error('no HTTP server id captured for the edit step');
       const detail = await api.serverDetail(httpId);
       reporter.check('Host API reconnected the same record and discovered 3 tools', detail.server.status?.state === 'connected' && detail.server.status?.toolCount === 3 && (detail.server.tools ?? []).length === 3);
+
+      const httpRecord = (await api.servers()).servers.find((server) => server.id === httpId);
+      const httpIcon = await api.fetchIcon(httpRecord.iconUrl);
+      reporter.check(
+        'HTTP server icon is proxied by the Host from the absolute http URL and matches the fixture bytes',
+        httpRecord.icon?.kind === 'auto' && typeof httpRecord.iconUrl === 'string' && httpIcon.status === 200 && httpIcon.contentType === 'image/png' && sameBytes(httpIcon.bytes, ICONS.http.bytes),
+        redact(`iconUrl=${httpRecord.iconUrl} HTTP ${httpIcon.status} ${httpIcon.bytes.length}B`),
+      );
     });
 
     await reporter.step('the enable switch round-trips through 已停用 and back to 已连接', async () => {
@@ -371,6 +423,131 @@ async function main() {
     });
 
     // ── phase 5: preset scoping and a real MCP tool call ────────────────
+
+    await reporter.step('icon controls: upload, replace and 恢复自动 through the form', async () => {
+      if (stdioId === undefined) throw new Error('no stdio server id captured for the icon phase');
+      await mkdir(dirname(UPLOAD_A_PATH), { recursive: true });
+      await writeFile(UPLOAD_A_PATH, ICONS.uploadA.bytes);
+      await writeFile(UPLOAD_B_PATH, ICONS.uploadB.bytes);
+
+      await ui.editServer(page, stdioName);
+      const controls = await ui.formIconControls(page);
+      reporter.check(
+        'edit form has icon-preview + icon-upload + icon-file and no emoji palette',
+        controls.preview > 0 && controls.upload > 0 && controls.file > 0 && controls.emoji === 0,
+        JSON.stringify(controls),
+      );
+      screenshotArtifacts.push(await ui.screenshotIconSection(page, join(ARTIFACT_DIR, 'mcp-manager-form-icon.png')));
+
+      await ui.chooseIconFile(page, UPLOAD_A_PATH);
+      await ui.closeFormIfOpen(page);
+      const uploadedA = await waitFor(
+        async () => {
+          const detail = await api.serverDetail(stdioId);
+          return detail.server.icon?.kind === 'upload' ? detail.server : undefined;
+        },
+        { timeoutMs: 20_000, intervalMs: 250, label: 'icon upload A to be recorded' },
+      );
+      const filesA = await iconFilesForId(stdioId);
+      const fileA = filesA.length === 1 ? await stat(join(ICONS_DIR, filesA[0])) : undefined;
+      const fetchedA = await api.fetchIcon(uploadedA.iconUrl);
+      reporter.check(
+        'uploaded icon is one 0600 file in a 0700 dir and is served back byte-for-byte',
+        uploadedA.icon.mimeType === 'image/png' && filesA.length === 1 && fileA !== undefined && (fileA.mode & 0o777) === 0o600 && sameBytes(fetchedA.bytes, ICONS.uploadA.bytes) && (await iconsDirListing()).mode === 0o700,
+        `${filesA.join(',')} mode=${fileA === undefined ? '-' : (fileA.mode & 0o777).toString(8)} served=${fetchedA.bytes.length}B`,
+      );
+      const cardA = await ui.cardIcon(page, stdioName);
+      reporter.check(
+        'card renders the uploaded icon as a loaded <img data-testid="server-icon">',
+        cardA.imageCount === 1 && cardA.naturalWidth > 0 && cardA.complete === true && String(cardA.src).includes(`/servers/${stdioId}/icon`),
+        JSON.stringify(cardA),
+      );
+
+      await ui.editServer(page, stdioName);
+      await ui.chooseIconFile(page, UPLOAD_B_PATH);
+      await ui.closeFormIfOpen(page);
+      const uploadedB = await waitFor(
+        async () => {
+          const detail = await api.serverDetail(stdioId);
+          const fetched = await api.fetchIcon(detail.server.iconUrl);
+          return detail.server.icon?.kind === 'upload' && sameBytes(fetched.bytes, ICONS.uploadB.bytes) ? detail.server : undefined;
+        },
+        { timeoutMs: 20_000, intervalMs: 250, label: 'icon upload B to replace upload A' },
+      );
+      const filesB = await iconFilesForId(stdioId);
+      const diskB = filesB.length === 1 ? await readFile(join(ICONS_DIR, filesB[0])) : undefined;
+      reporter.check(
+        'replacing the icon keeps exactly one file, on disk and on the wire',
+        filesB.length === 1 && uploadedB.icon.file === filesB[0] && diskB !== undefined && sameBytes(diskB, ICONS.uploadB.bytes) && sameBytes((await api.fetchIcon(uploadedB.iconUrl)).bytes, ICONS.uploadB.bytes),
+        filesB.join(','),
+      );
+
+      await ui.editServer(page, stdioName);
+      const beforeReset = await ui.formIconControls(page);
+      reporter.check('an uploaded icon exposes the 恢复自动 (icon-remove) control', beforeReset.remove > 0, JSON.stringify({ remove: beforeReset.remove }));
+      await ui.resetIconToAuto(page);
+      await ui.closeFormIfOpen(page);
+      const restored = await waitFor(
+        async () => {
+          const detail = await api.serverDetail(stdioId);
+          return detail.server.icon?.kind === 'auto' ? detail.server : undefined;
+        },
+        { timeoutMs: 20_000, intervalMs: 250, label: 'icon reset to auto' },
+      );
+      const fetchedAuto = await api.fetchIcon(restored.iconUrl);
+      reporter.check(
+        '恢复自动 removes the stored file and serves the fixture icon again',
+        (await iconFilesForId(stdioId)).length === 0 && sameBytes(fetchedAuto.bytes, ICONS.stdio.bytes),
+        `files=${(await iconFilesForId(stdioId)).join(',') || '(none)'} bytes=${fetchedAuto.bytes.length}`,
+      );
+      const cardAuto = await ui.cardIcon(page, stdioName);
+      reporter.check('card icon returns to the server-provided icon after the reset', cardAuto.imageCount === 1 && cardAuto.naturalWidth > 0 && sameBytes((await api.fetchIcon(restored.iconUrl)).bytes, ICONS.stdio.bytes), JSON.stringify(cardAuto));
+    });
+
+    await reporter.step('deleting a server removes its uploaded icon file (no orphan)', async () => {
+      if (httpId === undefined) throw new Error('no HTTP server id captured for the icon delete phase');
+      const uploaded = await api.uploadIcon(httpId, `data:image/png;base64,${ICONS.uploadA.base64}`);
+      const files = await iconFilesForId(httpId);
+      reporter.check('uploaded icon file exists before the delete', files.length === 1 && uploaded.server.icon?.kind === 'upload', files.join(','));
+      await ui.deleteServerViaCard(page, httpName);
+      reporter.check('deleting the server removes its icon file from dataDir/icons', (await iconFilesForId(httpId)).length === 0, (await iconsDirListing()).entries.join(',') || '(icons dir empty)');
+      const gone = await api.request('GET', `/better-mcp-manager/api/servers/${httpId}/icon`, { expectOk: false });
+      reporter.check('icon endpoint for the deleted server answers a JSON 404', gone.status === 404 && gone.payload?.ok === false, `HTTP ${gone.status} ${redact(gone.text).slice(0, 120)}`);
+      reporter.check('remaining servers left no icon files behind', (await iconsDirListing()).entries.length === 0, (await iconsDirListing()).entries.join(',') || '(icons dir empty)');
+    });
+
+    await reporter.step('a server that declares no icon falls back to its first letter', async () => {
+      const draft = {
+        name: 'E2E 无图标服务器',
+        transport: 'stdio',
+        command: stdioSpec.command,
+        args: stdioSpec.args,
+        env: { MCP_FIXTURE_LABEL: 'fallback', MCP_FIXTURE_NO_ICONS: '1' },
+        presets: 'all',
+      };
+      const created = await api.createServer(draft);
+      const fallbackId = created.server.id;
+      await waitFor(
+        async () => {
+          const catalog = await api.servers();
+          return catalog.servers.find((server) => server.id === fallbackId)?.status?.state === 'connected' ? true : undefined;
+        },
+        { timeoutMs: 30_000, intervalMs: 300, label: 'no-icon fixture server to connect' },
+      );
+      const noIcon = await api.request('GET', created.server.iconUrl, { expectOk: false });
+      reporter.check('GET icon for a connected server without icons answers a JSON 404', noIcon.status === 404 && noIcon.payload?.ok === false, `HTTP ${noIcon.status} ${redact(noIcon.text).slice(0, 140)}`);
+      const fallbackCard = await waitFor(
+        async () => {
+          const state = await ui.cardIcon(page, 'E2E 无图标服务器');
+          return state.fallbackCount > 0 ? state : undefined;
+        },
+        { timeoutMs: 30_000, intervalMs: 500, label: 'first-letter fallback tile' },
+      );
+      reporter.check('card shows the first-letter fallback element (16x16 auto icon unavailable)', fallbackCard.fallbackCount > 0 && (fallbackCard.imageCount === 0 || fallbackCard.naturalWidth === 0), JSON.stringify(fallbackCard));
+      await api.deleteServer(fallbackId);
+      reporter.check('deleting the no-icon server leaves no icon file', (await iconFilesForId(fallbackId)).length === 0 && (await iconsDirListing()).entries.length === 0);
+    });
+
     await reporter.step('preset scoping: standard sees the MCP tools, minimal does not', async () => {
       if (serverKey === undefined) throw new Error('no stdio server key available for the scoping phase');
       const standardMarker = `E2E-STD-${RUN_ID}`;
@@ -482,10 +659,23 @@ async function main() {
       );
     });
 
+    const icon404s = diagnostics.httpErrors.filter((entry) => entry.status === 404 && /\/better-mcp-manager\/api\/servers\/[^/]+\/icon/.test(entry.url));
+    const unexpectedHttp = diagnostics.httpErrors.filter((entry) => !icon404s.includes(entry));
+    const explainedConsole = diagnostics.consoleErrors.filter(
+      (text) => icon404s.length > 0 && /Failed to load resource: the server responded with a status of 404/.test(text),
+    );
+    const unexpectedConsole = diagnostics.consoleErrors.filter((text) => !explainedConsole.includes(text));
     reporter.check(
-      'no browser console errors or page errors for the whole UI pass',
-      diagnostics.consoleErrors.length === 0 && diagnostics.pageErrors.length === 0,
-      redact([...diagnostics.consoleErrors, ...diagnostics.pageErrors].slice(0, 3).join(' | ')),
+      'no unexpected console/page/network errors (icon 404 fallbacks are the only allowed noise)',
+      unexpectedConsole.length === 0 && diagnostics.pageErrors.length === 0 && unexpectedHttp.length === 0,
+      redact(
+        [
+          ...unexpectedConsole,
+          ...diagnostics.pageErrors,
+          ...unexpectedHttp.map((entry) => `HTTP ${entry.status} ${entry.url}`),
+          `expected icon 404s: ${icon404s.length}`,
+        ].slice(0, 4).join(' | '),
+      ),
     );
   } catch (error) {
     reporter.check('E2E scenario completed without an unexpected error', false, redact(error instanceof Error ? `${error.message}` : String(error)));
@@ -524,7 +714,7 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
   // Publish screenshots only from a fully successful UI pass (the caller has
   // already recorded failures; a missing artifact is a failure, not silence).
   await reporter.step('publish sanitized screenshots to docs/screenshots', async () => {
-    const wanted = ['mcp-manager-list.png', 'mcp-manager-sidebar.png', 'mcp-manager-error-detail.png', 'mcp-manager-form-presets.png'];
+    const wanted = ['mcp-manager-list.png', 'mcp-manager-sidebar.png', 'mcp-manager-error-detail.png', 'mcp-manager-form-presets.png', 'mcp-manager-form-icon.png'];
     const published = [];
     for (const name of wanted) {
       const source = screenshotArtifacts.find((file) => basename(file) === name);
@@ -536,7 +726,7 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
       await copyFile(source, target);
       published.push(`${name} (${formatBytes(size)})`);
     }
-    reporter.check('four sanitized screenshots published under docs/screenshots', published.length === 4, published.join(', '));
+    reporter.check('five sanitized screenshots published under docs/screenshots', published.length === 5, published.join(', '));
   });
 
   if (clean) {
@@ -544,8 +734,13 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
       await rm(RUN_DIR, { recursive: true, force: true });
     });
     await reporter.step('residue proof: no scopes, processes, listeners or files left behind', async () => {
-      const scopes = listScopes(`mcp-e2e-${RUN_ID}`);
-      reporter.check('no transient systemd scope of this run remains', scopes.length === 0, scopes.join(', '));
+      const residual = residualScopes(`mcp-e2e-${RUN_ID}`);
+      reporter.check(
+        'no transient systemd scope of this run is active or holds processes',
+        residual.length === 0,
+        residual.map((entry) => `${entry.unit} ${entry.activeState} [${entry.procs.join(',')}]`).join(' | ') || '(none)',
+      );
+      reporter.debug(`scopes known to systemd for this run: ${listScopes(`mcp-e2e-${RUN_ID}`).join(', ') || '(none)'}`);
 
       const runProcesses = findProcessesMentioning([RUN_DIR, RUN_ID, PROFILE_NAME]);
       reporter.check('no process mentions the test run id or its paths', runProcesses.length === 0, runProcesses.slice(0, 3).join(' | '));
@@ -572,7 +767,12 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
     reporter.log(`production after:  ${describeSnapshot(after)}`);
     reporter.check('production dsh-web.service MainPID unchanged', before.mainPid === after.mainPid && after.mainPid > 0, `${before.mainPid} -> ${after.mainPid}`);
     reporter.check('production dsh-web.service still active', after.activeState === 'active', `${after.activeState}/${after.subState}`);
-    const foreign = after.entries.filter((entry) => [RUN_DIR, RUN_ID, 'mcp-e2e-'].some((marker) => entry.cmdline.includes(marker)));
+    reporter.check('production dsh-web.service NRestarts unchanged', before.nRestarts === after.nRestarts, `${before.nRestarts} -> ${after.nRestarts}`);
+    reporter.check('production dsh-web.service was not restarted (same ActiveEnterTimestamp)', before.activeEnterTimestamp !== '' && before.activeEnterTimestamp === after.activeEnterTimestamp, `${before.activeEnterTimestamp} -> ${after.activeEnterTimestamp}`);
+    const ancestors = ancestorPids();
+    const foreign = after.entries.filter(
+      (entry) => !ancestors.has(entry.pid) && [RUN_DIR, RUN_ID, 'mcp-e2e-'].some((marker) => entry.cmdline.includes(marker)),
+    );
     reporter.check('no test process is charged to the production cgroup', foreign.length === 0, foreign.map((entry) => `${entry.pid} ${entry.cmdline.slice(0, 80)}`).join(' | '));
     reporter.check('production cgroup stays below its MemoryMax', !Number.isFinite(after.memoryMax) || after.memoryCurrent < after.memoryMax, `${formatBytes(after.memoryCurrent)} / ${formatBytes(after.memoryMax)}`);
     reporter.log(`production memory delta: cgroup memory.current ${formatBytes(after.memoryCurrent - before.memoryCurrent)}, PSS ${formatBytes(after.pss - before.pss)}`);
@@ -643,6 +843,26 @@ function portClosed(port) {
     socket.once('timeout', () => done(true));
     socket.once('error', () => done(true));
   });
+}
+
+/** 16x16 PNG dimensions, read from the IHDR chunk. */
+function pngSize(bytes) {
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20), size: bytes.length };
+}
+
+function sameBytes(left, right) {
+  return Buffer.compare(Buffer.from(left), Buffer.from(right)) === 0;
+}
+
+/** Icon files currently stored for one server id. */
+async function iconFilesForId(id) {
+  const entries = await readdir(ICONS_DIR).catch(() => []);
+  return entries.filter((entry) => entry.startsWith(`${id}.`));
+}
+
+async function iconsDirListing() {
+  const [entries, info] = await Promise.all([readdir(ICONS_DIR).catch(() => []), stat(ICONS_DIR).catch(() => undefined)]);
+  return { entries, mode: info === undefined ? undefined : info.mode & 0o777 };
 }
 
 function findProcessesMentioning(needles) {

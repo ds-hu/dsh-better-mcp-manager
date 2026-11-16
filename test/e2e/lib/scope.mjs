@@ -61,6 +61,8 @@ export async function reexecInScope({ runId, argv }) {
       'MemoryMax=1G',
       '-p',
       'MemorySwapMax=0',
+      '-p',
+      'TimeoutStopSec=10',
       '--unit',
       unit,
       '--quiet',
@@ -72,10 +74,22 @@ export async function reexecInScope({ runId, argv }) {
     ],
     { stdio: 'inherit', env: { ...process.env, MCP_E2E_SCOPED: '1', MCP_E2E_RUN_UNIT: unit } },
   );
-  return await new Promise((resolve, reject) => {
+  const exitCode = await new Promise((resolve, reject) => {
     child.on('error', reject);
     child.on('exit', (code, signal) => resolve(code ?? (signal === null ? 1 : 1)));
   });
+  // The runner's own transient scope can stay `active (Tasks: 0)` after the
+  // child exits when systemd failed to install its cgroup inotify watch (seen on
+  // this host under watch pressure). Stop it from the outside so no zombie scope
+  // accumulates between runs; the unit name is exact, so this is safe.
+  for (const command of ['stop', 'reset-failed']) {
+    try {
+      execFileSync('systemctl', [command, `${unit}.scope`], { stdio: 'ignore', timeout: 10_000 });
+    } catch {
+      // already gone
+    }
+  }
+  return exitCode;
 }
 
 /**
@@ -97,6 +111,8 @@ export function startScoped({ unit, memoryMax = '1G', command, args = [], env = 
       `MemoryMax=${memoryMax}`,
       '-p',
       'MemorySwapMax=0',
+      '-p',
+      'TimeoutStopSec=5',
       '--unit',
       unit,
       '--quiet',
@@ -202,6 +218,14 @@ export async function stopUnit(unit, { timeoutMs = 20_000, reporter } = {}) {
       // already gone
     }
     await sleep(300);
+    try {
+      await waitFor(
+        () => cgroupProcs(scoped).length === 0 && !['active', 'activating'].includes(unitState(scoped).ActiveState ?? ''),
+        { timeoutMs: 6000, intervalMs: 200, label: `${scoped} to lose its processes` },
+      );
+    } catch {
+      // fall through to the final state check below
+    }
   }
   try {
     execFileSync('systemctl', ['reset-failed', scoped], { stdio: 'ignore', timeout: 10_000 });
@@ -214,6 +238,29 @@ export async function stopUnit(unit, { timeoutMs = 20_000, reporter } = {}) {
   if (final.ActiveState === 'active' || final.ActiveState === 'activating') {
     throw new Error(`${scoped} is still ${final.ActiveState} after stop`);
   }
+  if (final.ActiveState === 'deactivating') {
+    // A failed cgroup inotify watch can leave a process-less transient scope in
+    // `deactivating` until its TimeoutStopSec fires. No process remains charged
+    // to it, so this is systemd bookkeeping, not residue.
+    reporter?.debug(`${scoped} is empty but still deactivating; systemd will collect it within TimeoutStopSec`);
+  }
+}
+
+/**
+ * Scopes of this run that still hold live processes or are running.
+ * @param {string} prefix - unit name prefix.
+ * @returns {{ unit: string, activeState: string, procs: number[] }[]} leftovers.
+ */
+export function residualScopes(prefix = 'mcp-e2e-') {
+  const leftover = [];
+  for (const unit of listScopes(prefix)) {
+    const state = unitState(unit);
+    const procs = cgroupProcs(unit);
+    if (procs.length > 0 || ['active', 'activating', 'reloading'].includes(state.ActiveState ?? '')) {
+      leftover.push({ unit, activeState: state.ActiveState ?? 'unknown', procs });
+    }
+  }
+  return leftover;
 }
 
 /** Async tail helper for a scoped process's stderr/stdout log. */

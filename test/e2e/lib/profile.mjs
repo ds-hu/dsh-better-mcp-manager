@@ -45,6 +45,13 @@ export function isolatedEnv({ dshHome, homeDir, extra = {} }) {
   delete env.DSH_WEB_PORT;
   env.HOME = homeDir;
   env.DSH_HOME = dshHome;
+  delete env.TMPDIR;
+  delete env.TMP;
+  delete env.TEMP;
+  const tmpDir = join(dshHome, '..', 'tmp');
+  env.TMPDIR = tmpDir;
+  env.TMP = tmpDir;
+  env.TEMP = tmpDir;
   return { ...env, ...extra };
 }
 

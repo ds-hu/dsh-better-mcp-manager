@@ -91,6 +91,7 @@ check('the tarball carries every runtime module', () => {
     'lib/presets.js',
     'lib/api.js',
     'lib/http.js',
+    'lib/icons.js',
     'lib/version.js',
     'bin/mcp-manager.mjs',
   ]) {

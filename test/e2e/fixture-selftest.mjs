@@ -14,6 +14,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import {
+  HTTP_ICON_PNG_BASE64,
+  STDIO_DARK_ICON_PNG_BASE64,
+  STDIO_ICON_PNG_BASE64,
+  UPLOAD_ICON_A_PNG_BASE64,
+  iconBytes,
+} from '../fixtures/tiny-icons.mjs';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, '..', '..');
 const fixtures = join(repoRoot, 'test', 'fixtures');
@@ -81,6 +89,19 @@ function check(name, ok, detail = '') {
   process.stdout.write(`${ok ? 'ok  ' : 'FAIL'}  ${name}${detail ? `  — ${detail}` : ''}\n`);
 }
 
+/** Minimal PNG sanity: signature, IHDR dimensions, non-empty IDAT. */
+function pngInfo(bytes) {
+  const signature = bytes.subarray(0, 8).toString('hex');
+  const width = bytes.readUInt32BE(16);
+  const height = bytes.readUInt32BE(20);
+  const valid = signature === '89504e470d0a1a0a' && width > 0 && height > 0 && bytes.includes(Buffer.from('IDAT'));
+  return { valid, width, height, size: bytes.length };
+}
+
+function sameBytes(left, right) {
+  return Buffer.compare(Buffer.from(left), Buffer.from(right)) === 0;
+}
+
 const mcp = resolveMcpClient();
 process.stdout.write(`using @modelcontextprotocol/client ${mcp.version} from ${mcp.directory}\n`);
 const { Client, StreamableHTTPClientTransport } = await import(mcp.index);
@@ -108,6 +129,21 @@ try {
   check('stdio tools/call fail is an MCP error result', fail.isError === true, JSON.stringify(fail.content));
   const instructions = stdioClient.getInstructions();
   check('stdio initialize carries instructions', typeof instructions === 'string' && instructions.length > 0);
+  const serverVersion = stdioClient.getServerVersion();
+  const icons = serverVersion?.icons;
+  check(
+    'stdio initialize declares dark+light theme PNG icons, dark first',
+    Array.isArray(icons) &&
+      icons.length === 2 &&
+      icons[0]?.theme === 'dark' &&
+      icons[0]?.mimeType === 'image/png' &&
+      icons[1]?.src === `data:image/png;base64,${STDIO_ICON_PNG_BASE64}` &&
+      JSON.stringify(icons[1]?.sizes) === JSON.stringify(['16x16']),
+    JSON.stringify(icons?.map((icon) => ({ theme: icon.theme, mimeType: icon.mimeType, sizes: icon.sizes })) ?? null),
+  );
+  const darkInfo = pngInfo(iconBytes(STDIO_DARK_ICON_PNG_BASE64));
+  const lightInfo = pngInfo(iconBytes(STDIO_ICON_PNG_BASE64));
+  check('stdio fixture icon payloads are valid 16x16 PNGs with different bytes', darkInfo.valid && lightInfo.valid && !sameBytes(STDIO_DARK_ICON_PNG_BASE64, STDIO_ICON_PNG_BASE64), `${darkInfo.width}x${darkInfo.height}/${darkInfo.size}B vs ${lightInfo.width}x${lightInfo.height}/${lightInfo.size}B`);
 } finally {
   await stdioClient.close();
 }
@@ -127,11 +163,47 @@ try {
     const add = await httpClient.callTool({ name: 'add', arguments: { a: 2, b: 5 } });
     check('http tools/call add returns sum', add.content?.[0]?.text === 'sum: 7', String(add.content?.[0]?.text));
     check('http initialize carries instructions', typeof httpClient.getInstructions() === 'string');
+    const httpIcons = httpClient.getServerVersion()?.icons;
+    const expectedIconUrl = `http://127.0.0.1:${httpFixture.info.port}/icon.png`;
+    check(
+      'http initialize declares the absolute icon URL with the real bound port',
+      Array.isArray(httpIcons) && httpIcons.length === 1 && httpIcons[0]?.src === expectedIconUrl && httpIcons[0]?.mimeType === 'image/png',
+      JSON.stringify(httpIcons ?? null),
+    );
+    const iconResponse = await fetch(expectedIconUrl);
+    const iconPayload = Buffer.from(await iconResponse.arrayBuffer());
+    check(
+      'http fixture serves GET /icon.png as the expected image/png bytes',
+      iconResponse.status === 200 &&
+        iconResponse.headers.get('content-type') === 'image/png' &&
+        sameBytes(iconPayload, iconBytes(HTTP_ICON_PNG_BASE64)) &&
+        pngInfo(iconPayload).valid,
+      `HTTP ${iconResponse.status} ${iconPayload.length}B`,
+    );
+    const uploadInfo = pngInfo(iconBytes(UPLOAD_ICON_A_PNG_BASE64));
+    check('upload PNG fixture is valid and differs from every server icon', uploadInfo.valid && !sameBytes(UPLOAD_ICON_A_PNG_BASE64, HTTP_ICON_PNG_BASE64) && !sameBytes(UPLOAD_ICON_A_PNG_BASE64, STDIO_ICON_PNG_BASE64), `${uploadInfo.width}x${uploadInfo.height}/${uploadInfo.size}B`);
   } finally {
     await httpClient.close();
   }
 } finally {
   httpFixture.child.kill('SIGTERM');
+}
+
+// ── stdio fixture without icons (page fallback path) ──────────────────────
+{
+  const noIconClient = new Client(clientInfo, { capabilities: {} });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(fixtures, 'mcp-stdio-server.mjs')],
+    env: { ...process.env, MCP_FIXTURE_LABEL: 'selftest-no-icons', MCP_FIXTURE_NO_ICONS: '1' },
+    stderr: 'pipe',
+  });
+  await noIconClient.connect(transport);
+  try {
+    check('MCP_FIXTURE_NO_ICONS=1 omits serverInfo.icons', noIconClient.getServerVersion()?.icons === undefined, JSON.stringify(noIconClient.getServerVersion() ?? null));
+  } finally {
+    await noIconClient.close();
+  }
 }
 
 // ── connection failure surface ────────────────────────────────────────────

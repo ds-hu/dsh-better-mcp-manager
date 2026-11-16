@@ -7,11 +7,16 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
   allocateKey,
+  AUTO_ICON,
   createServerId,
   DEFAULT_TIMEOUT_MS,
+  ICON_MIME_EXT,
   InputError,
   keyFromName,
+  MAX_ICON_BYTES,
+  MAX_ICON_JSON_BYTES,
   normalizeDraft,
+  normalizeStoredIcon,
   presetAllows,
   publicToolName,
   SERVER_COLORS,
@@ -21,6 +26,14 @@ import {
 } from '../lib/model.js';
 
 const NOW = Date.parse('2026-11-16T10:00:00.000Z');
+
+/** One valid stored upload-icon object. */
+const UPLOAD_ICON = Object.freeze({
+  kind: 'upload',
+  file: 'srv_1f3c9a2b70.png',
+  mimeType: 'image/png',
+  updatedAt: '2026-11-16T10:00:00.000Z',
+});
 
 /** One minimal valid http draft, with overrides. */
 function httpDraft(overrides = {}) {
@@ -147,7 +160,7 @@ test('model: a valid http draft is normalized with the documented defaults', () 
   assert.equal(record.cwd, '');
   assert.deepEqual(record.headers, []);
   assert.deepEqual(record.oauth, { mode: 'none' });
-  assert.equal(record.icon, '', 'no icon means the tile falls back to the first letter of the name');
+  assert.deepEqual(record.icon, { kind: 'auto' }, 'a new server always starts on the automatic icon');
   assert.equal(record.color, 'blue');
   assert.equal(record.group, '');
   assert.equal(record.presets, 'all');
@@ -260,13 +273,69 @@ test('model: preset selection accepts "all", arrays of known ids, and rejects un
   expectInputError(() => normalizeDraft(httpDraft({ presets: [1] }), { presets: roster }), 'invalid-presets', 'presets');
 });
 
-test('model: icon, color, group and timeout follow the contract bounds', () => {
-  assert.equal(normalizeDraft(httpDraft({ icon: '12345678' })).icon, '12345678');
-  expectInputError(() => normalizeDraft(httpDraft({ icon: '123456789' })), 'invalid-icon', 'icon');
-  expectInputError(() => normalizeDraft(httpDraft({ icon: 42 })), 'invalid-icon', 'icon');
-  assert.equal(normalizeDraft(httpDraft({ icon: '' })).icon, '', 'an explicitly cleared icon stays empty');
-  assert.equal(normalizeDraft(httpDraft({ icon: '🔌' })).icon, '🔌');
+test('model: the icon schema is the 0.2.0 object, not an emoji string', () => {
+  assert.deepEqual(AUTO_ICON, { kind: 'auto' });
+  assert.equal(Object.isFrozen(AUTO_ICON), true);
+  assert.deepEqual(ICON_MIME_EXT, {
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+  });
+  assert.equal(Object.isFrozen(ICON_MIME_EXT), true);
+  assert.equal(MAX_ICON_BYTES, 524288, '512 KiB decoded, per contract §2.6');
+  assert.equal(MAX_ICON_JSON_BYTES, 1048576, '1 MiB data-URL envelope, per contract §3');
+});
 
+test('model: normalizeStoredIcon migrates legacy strings and rejects damaged uploads', () => {
+  // 0.1.0 stored an emoji string; every legacy value becomes the automatic icon.
+  for (const legacy of ['🔌', '', 'x', 42, null, undefined, [], true]) {
+    assert.deepEqual(normalizeStoredIcon(legacy), { kind: 'auto' }, `${JSON.stringify(legacy)} must migrate to auto`);
+  }
+  assert.deepEqual(normalizeStoredIcon({ kind: 'auto' }), { kind: 'auto' });
+  assert.deepEqual(normalizeStoredIcon({ kind: 'upload', ...UPLOAD_ICON }), { ...UPLOAD_ICON }, 'a valid upload icon round-trips');
+  assert.notEqual(normalizeStoredIcon(UPLOAD_ICON), UPLOAD_ICON, 'the helper returns a detached object');
+  assert.equal('extra' in normalizeStoredIcon({ ...UPLOAD_ICON, extra: 'x' }), false, 'unknown fields are dropped');
+
+  // Anything that cannot be safely served from disk resets to auto.
+  const damaged = [
+    { kind: 'upload' },
+    { ...UPLOAD_ICON, file: '../escape.png' },
+    { ...UPLOAD_ICON, file: '/etc/passwd.png' },
+    { ...UPLOAD_ICON, file: 'srv_1f3c9a2b70' },
+    { ...UPLOAD_ICON, file: `${'x'.repeat(65)}.png` },
+    { ...UPLOAD_ICON, mimeType: 'image/svg+xml' },
+    { ...UPLOAD_ICON, mimeType: 'text/html' },
+    { ...UPLOAD_ICON, mimeType: undefined },
+    { ...UPLOAD_ICON, updatedAt: '' },
+    { ...UPLOAD_ICON, updatedAt: 42 },
+    { ...UPLOAD_ICON, kind: 'emoji', file: 'x.png' },
+  ];
+  for (const value of damaged) {
+    assert.deepEqual(normalizeStoredIcon(value), { kind: 'auto' }, `${JSON.stringify(value)} must reset to auto`);
+  }
+});
+
+test('model: a draft never sets the icon; an update preserves the stored one', () => {
+  // Contract §2.1: the icon has its own endpoints, so drafts ignore any value.
+  for (const raw of ['🔌', '', UPLOAD_ICON, { kind: 'auto' }, 42, null]) {
+    assert.deepEqual(normalizeDraft(httpDraft({ icon: raw }), { now: () => NOW }).icon, { kind: 'auto' }, 'create always starts auto');
+  }
+  assert.equal('iconUrl' in normalizeDraft(httpDraft({ iconUrl: '/x' }), { now: () => NOW }), false, 'only the API adds iconUrl');
+
+  const auto = normalizeDraft(httpDraft(), { now: () => NOW });
+  assert.deepEqual(normalizeDraft(httpDraft({ name: 'Renamed', icon: '🔌' }), { existing: auto, now: () => NOW }).icon, { kind: 'auto' });
+
+  const uploaded = normalizeDraft(httpDraft(), { now: () => NOW });
+  uploaded.icon = { ...UPLOAD_ICON };
+  for (const raw of ['🔌', { kind: 'auto' }, { kind: 'upload', ...UPLOAD_ICON, file: 'other.gif' }, undefined]) {
+    const updated = normalizeDraft(httpDraft({ name: 'Renamed' }), { existing: uploaded, now: () => NOW });
+    assert.deepEqual(updated.icon, { ...UPLOAD_ICON }, `update must keep the stored icon (draft icon ${JSON.stringify(raw)} ignored)`);
+    assert.notEqual(updated.icon, uploaded.icon, 'the stored icon is copied, never shared');
+  }
+});
+
+test('model: color, group and timeout follow the contract bounds', () => {
   for (const color of SERVER_COLORS) assert.equal(normalizeDraft(httpDraft({ color })).color, color);
   expectInputError(() => normalizeDraft(httpDraft({ color: 'purple' })), 'invalid-color', 'color');
   for (const transport of TRANSPORTS) {
@@ -360,8 +429,17 @@ test('model: serverView is a detached panel-facing copy with a transport label',
     oauth: { mode: 'bearer', token: 'secret' },
     presets: ['standard'],
   }), { presets: [{ id: 'standard' }], now: () => NOW });
+  record.icon = { ...UPLOAD_ICON };
   const view = serverView(record);
   assert.equal(view.transportLabel, 'HTTP');
+  assert.deepEqual(view.icon, { ...UPLOAD_ICON }, 'serverView reports the stored icon object');
+  view.icon.file = 'mutated.png';
+  assert.equal(record.icon.file, 'srv_1f3c9a2b70.png', 'the icon object is deep-copied');
+
+  const autoRecord = normalizeDraft(httpDraft(), { now: () => NOW });
+  const autoView = serverView(autoRecord);
+  assert.deepEqual(autoView.icon, { kind: 'auto' });
+  assert.notEqual(autoView.icon, AUTO_ICON, 'the automatic icon is copied too');
   assert.equal(view.id, record.id);
   assert.deepEqual(view.headers, [{ name: 'X-One', value: '1' }]);
   assert.equal('status' in view, false, 'status is derived and added by the API, not by serverView');

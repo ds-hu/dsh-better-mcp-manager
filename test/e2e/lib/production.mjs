@@ -58,6 +58,31 @@ export function productionProcesses() {
   return { pids, entries };
 }
 
+/**
+ * PIDs of this process's ancestors. A launcher shell that merely mentions
+ * `mcp-e2e-` in its command line is not a test process, so the production
+ * guards ignore the ancestor chain (the runner itself lives in its own scope).
+ */
+export function ancestorPids() {
+  const pids = new Set();
+  let pid = process.pid;
+  for (let depth = 0; depth < 64; depth += 1) {
+    pids.add(pid);
+    let status;
+    try {
+      status = readFileSync(`/proc/${pid}/status`, 'utf8');
+    } catch {
+      break;
+    }
+    const match = status.match(/^PPid:\s+(\d+)$/m);
+    if (match === null) break;
+    const parent = Number.parseInt(match[1], 10);
+    if (!Number.isInteger(parent) || parent <= 1 || pids.has(parent)) break;
+    pid = parent;
+  }
+  return pids;
+}
+
 /** Sum of PSS across production processes (what the service really uses). */
 function productionPss(entries) {
   let total = 0;
@@ -74,7 +99,7 @@ function productionPss(entries) {
 }
 
 export function snapshotProduction() {
-  const show = systemctlShow(['MainPID', 'ActiveState', 'SubState', 'MemoryCurrent', 'MemoryMax', 'MemoryHigh']);
+  const show = systemctlShow(['MainPID', 'ActiveState', 'SubState', 'MemoryCurrent', 'MemoryMax', 'MemoryHigh', 'NRestarts', 'ActiveEnterTimestamp']);
   const { pids, entries } = productionProcesses();
   return {
     at: new Date().toISOString(),
@@ -88,12 +113,14 @@ export function snapshotProduction() {
     pss: productionPss(entries),
     pids,
     entries,
+    nRestarts: Number.parseInt(show.NRestarts ?? '0', 10),
+    activeEnterTimestamp: show.ActiveEnterTimestamp ?? '',
   };
 }
 
 /** Human-readable one-liner for the run report. */
 export function describeSnapshot(snapshot) {
-  return `pid ${snapshot.mainPid} ${snapshot.activeState}/${snapshot.subState}, cgroup memory.current ${formatBytes(snapshot.memoryCurrent)}, PSS ${formatBytes(snapshot.pss)}, ${snapshot.pids.length} PIDs`;
+  return `pid ${snapshot.mainPid} ${snapshot.activeState}/${snapshot.subState}, NRestarts ${snapshot.nRestarts}, cgroup memory.current ${formatBytes(snapshot.memoryCurrent)}, PSS ${formatBytes(snapshot.pss)}, ${snapshot.pids.length} PIDs`;
 }
 
 /**

@@ -5,7 +5,7 @@
  * Speaks newline-delimited JSON-RPC 2.0 over stdin/stdout and implements just
  * enough of the MCP server surface for the plugin's stdio transport:
  *
- *   initialize                     -> capabilities.tools + instructions
+ *   initialize                     -> capabilities.tools + instructions + icons
  *   notifications/initialized      -> no reply
  *   tools/list                     -> `echo` and `fail`
  *   tools/call                     -> `echo` returns text, `fail` returns isError
@@ -14,14 +14,17 @@
  * Environment knobs used by the e2e runner:
  *   MCP_FIXTURE_LABEL          serverInfo.name suffix / instruction label (default "stdio")
  *   MCP_FIXTURE_EXIT_IMMEDIATELY=1  write to stderr and exit(1) before initialize
+ *   MCP_FIXTURE_NO_ICONS=1     omit serverInfo.icons (fallback-to-initial test)
  *   MCP_FIXTURE_DEBUG=1        log every request to stderr
  *
  * It never writes to stdout except JSON-RPC frames.
  */
 import { createInterface } from 'node:readline';
+import { STDIO_DARK_ICON_DATA_URI, STDIO_ICON_DATA_URI } from './tiny-icons.mjs';
 
 const LABEL = process.env.MCP_FIXTURE_LABEL || 'stdio';
 const DEBUG = process.env.MCP_FIXTURE_DEBUG === '1';
+const WITH_ICONS = process.env.MCP_FIXTURE_NO_ICONS !== '1';
 const SERVER_NAME = `mcp-e2e-${LABEL}`;
 const PROTOCOL_VERSIONS = new Set(['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07']);
 
@@ -31,6 +34,19 @@ if (process.env.MCP_FIXTURE_EXIT_IMMEDIATELY === '1') {
 }
 
 const INSTRUCTIONS = `Fixture MCP server "${SERVER_NAME}". Use the echo tool to repeat text.`;
+
+/**
+ * MCP `Implementation.icons`: the dark-theme icon is declared FIRST on purpose.
+ * Per docs/API-CONTRACT.md §2.6 the Host prefers an icon with no theme or
+ * `theme: "light"`, so the bytes it proxies must be the orange light icon and
+ * not this blue dark one.
+ */
+const SERVER_ICONS = WITH_ICONS
+  ? [
+      { src: STDIO_DARK_ICON_DATA_URI, mimeType: 'image/png', sizes: ['16x16'], theme: 'dark' },
+      { src: STDIO_ICON_DATA_URI, mimeType: 'image/png', sizes: ['16x16'] },
+    ]
+  : undefined;
 
 const TOOLS = [
   {
@@ -106,7 +122,7 @@ function handleMessage(raw) {
       result(id, {
         protocolVersion: negotiated,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: SERVER_NAME, version: '1.0.0' },
+        serverInfo: { name: SERVER_NAME, version: '1.0.0', ...(SERVER_ICONS === undefined ? {} : { icons: SERVER_ICONS }) },
         instructions: INSTRUCTIONS,
       });
       return;

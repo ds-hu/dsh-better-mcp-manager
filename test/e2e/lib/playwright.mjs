@@ -54,7 +54,7 @@ export async function launchBrowser({ reporter } = {}) {
  * "no slot crash / no console error" assertions unless explicitly waived.
  */
 export function collectDiagnostics(page) {
-  const diagnostics = { consoleErrors: [], pageErrors: [], failedRequests: [] };
+  const diagnostics = { consoleErrors: [], pageErrors: [], failedRequests: [], httpErrors: [] };
   page.on('console', (message) => {
     if (message.type() === 'error') diagnostics.consoleErrors.push(message.text());
   });
@@ -62,6 +62,9 @@ export function collectDiagnostics(page) {
   page.on('requestfailed', (request) => {
     const failure = request.failure();
     diagnostics.failedRequests.push(`${request.method()} ${request.url()} — ${failure?.errorText ?? 'failed'}`);
+  });
+  page.on('response', (response) => {
+    if (response.status() >= 400) diagnostics.httpErrors.push({ status: response.status(), url: response.url() });
   });
   return diagnostics;
 }

@@ -224,6 +224,26 @@ export async function cardText(page, name) {
   return card(page, name).innerText();
 }
 
+/**
+ * Visual icon state of one card: the server-icon <img> (loaded bytes via
+ * naturalWidth) or the first-letter fallback element.
+ */
+export async function cardIcon(page, name) {
+  const locator = card(page, name);
+  const image = locator.locator('[data-testid="server-icon"]');
+  const fallback = locator.locator('[data-testid="server-icon-fallback"], .mm-tileLetter');
+  const imageCount = await image.count();
+  const fallbackCount = await fallback.count();
+  return {
+    imageCount,
+    fallbackCount,
+    src: imageCount > 0 ? await image.first().getAttribute('src') : undefined,
+    naturalWidth: imageCount > 0 ? await image.first().evaluate((element) => element.naturalWidth).catch(() => 0) : 0,
+    complete: imageCount > 0 ? await image.first().evaluate((element) => element.complete).catch(() => false) : false,
+    fallbackText: fallbackCount > 0 ? await fallback.first().innerText().catch(() => '') : undefined,
+  };
+}
+
 /** Poll a card's derived status until it reaches one of `states`. */
 export async function waitCardState(page, name, states, { timeoutMs = 30_000 } = {}) {
   const accepted = Array.isArray(states) ? states : [states];
@@ -261,6 +281,47 @@ export async function openAddForm(page) {
   await clearOverlays(page);
   await page.locator('[data-testid="add-mcp"]').click();
   await page.locator('[data-testid="form-name"]').waitFor({ state: 'visible', timeout: 15_000 });
+}
+
+// ── management page: icon controls (0.2.0) ─────────────────────────────────
+
+/** Assert the icon row exists and that the removed emoji palette is really gone. */
+export async function formIconControls(page) {
+  const preview = page.locator('[data-testid="icon-preview"]');
+  const upload = page.locator('[data-testid="icon-upload"]');
+  const file = page.locator('[data-testid="icon-file"]');
+  const remove = page.locator('[data-testid="icon-remove"]');
+  const emoji = page.locator('[data-testid*="emoji"], [class*="emoji"]');
+  await preview.first().waitFor({ state: 'attached', timeout: 10_000 });
+  const previewImage = preview.locator('img').first();
+  const previewLetter = preview.locator('.mm-iconPreviewLetter').first();
+  return {
+    preview: await preview.count(),
+    upload: await upload.count(),
+    file: await file.count(),
+    remove: await remove.count(),
+    emoji: await emoji.count(),
+    previewImageCount: await previewImage.count(),
+    previewImageSrc: (await previewImage.getAttribute('src').catch(() => undefined)) ?? undefined,
+    previewLetter: (await previewLetter.count()) > 0 ? (await previewLetter.innerText().catch(() => '')) ?? '' : undefined,
+    accept: (await file.getAttribute('accept').catch(() => undefined)) ?? undefined,
+  };
+}
+
+/** Pick a local file for the icon upload input. */
+export async function chooseIconFile(page, path) {
+  const input = page.locator('[data-testid="icon-file"]');
+  await input.waitFor({ state: 'attached', timeout: 10_000 });
+  await input.setInputFiles(path);
+  await sleep(400);
+}
+
+/** Click 恢复自动 (icon-remove) if present. */
+export async function resetIconToAuto(page) {
+  const button = page.locator('[data-testid="icon-remove"]');
+  await button.waitFor({ state: 'visible', timeout: 10_000 });
+  await button.click();
+  await sleep(500);
 }
 
 export async function formValues(page) {
@@ -313,6 +374,19 @@ export async function fillServerForm(page, spec) {
     }
   }
   return formValues(page);
+}
+
+/** Close an open server form by saving it (used after icon-only actions). */
+export async function closeFormIfOpen(page) {
+  const form = page.locator('[data-testid="form-name"]');
+  if ((await form.count()) === 0) return false;
+  const save = page.locator('[data-testid="form-save"]');
+  if ((await save.count()) > 0) await save.click();
+  await waitFor(async () => (await page.locator('[data-testid="form-name"]').count()) === 0, {
+    timeoutMs: 20_000,
+    label: 'form to close',
+  });
+  return true;
 }
 
 export async function saveForm(page, { expectError = false } = {}) {
@@ -435,6 +509,16 @@ export async function screenshotElement(locator, path, { maxHeight } = {}) {
     clip: { x: box.x, y: box.y, width: box.width, height: Math.min(box.height, maxHeight) },
   });
   return path;
+}
+
+/** Screenshot the basic section of the server form (icon row: preview, upload, 恢复自动, colors). */
+export async function screenshotIconSection(page, path) {
+  const section = page
+    .locator('section.mm-section')
+    .filter({ has: page.locator('[data-testid="form-icon"]') })
+    .first();
+  await section.waitFor({ state: 'visible', timeout: 10_000 });
+  return screenshotElement(section, path);
 }
 
 /** Screenshot the 预设暴露 section of the server form (preset selection is the point). */

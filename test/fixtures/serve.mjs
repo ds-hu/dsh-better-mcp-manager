@@ -79,12 +79,14 @@ function stop(code = 0) {
   for (const child of children) {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
   }
+  // Leave no orphan in the scope: SIGKILL whatever is still alive after a short
+  // grace period so the transient scope empties and systemd can collect it.
   setTimeout(() => {
     for (const child of children) {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }
-    process.exit(code);
-  }, 2000).unref();
+  }, 400);
+  setTimeout(() => process.exit(code), 900);
 }
 
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => stop(0));
