@@ -25,14 +25,14 @@ applies to live agents as soon as you save.
 
 ## Features
 
-- **Full-page manager** in the sidebar, directly below 自动化任务. Dark rounded cards, iOS-like
-  toggles and segmented controls, light and dark themes.
+- **Full-page manager** in the sidebar, directly below 自动化任务. Rounded cards, iOS-like toggles
+  and segmented controls, light and dark themes.
 - **CRUD + enable/disable** for MCP servers. A disabled server keeps its settings and status, and
   can be re-enabled in one click.
 - **Three transports**: HTTP (Streamable HTTP), SSE, and 内置 / stdio (a local command).
 - **Custom headers** for HTTP/SSE, and **OAuth 设置**: no auth, a static bearer token, or the
   client-credentials grant.
-- **Groups and icons** for the list; ungroupped servers are shown last as 其他（未分组）.
+- **Groups and icons** for the list; ungrouped servers are shown last as 其他（未分组）.
 - **Live status**: connected / connecting / retrying / error / disabled, tool count, last error with
   a 详情 dialog containing the full message and detail.
 - **Per-server preset exposure**: 全部预设 or 指定预设 with checkboxes for the presets the Host
@@ -53,7 +53,7 @@ with `plugin_manager` (`action: install_bundle`). Reload the Web page; with HMR 
 DSH Web process. Requirements: DSH 0.2.x with the Web profile, Node.js ≥ 20.19.
 
 After install, **MCP 管理** appears in the sidebar directly below **自动化任务**. The page is
-global — it is the same server list for every session in the profile.
+global — it is the same server list for every session (and every profile sharing this `$DSH_HOME`).
 
 ## Quick start
 
@@ -65,7 +65,7 @@ Press **+ 添加 MCP**, keep 传输类型 on **HTTP**, and fill in:
 - **服务器地址** — the MCP endpoint, e.g. `https://mcp.example.com/mcp`;
 - **自定义请求头** — add `Authorization` / `Bearer …` if the server needs it, or use **OAuth 设置**
   instead;
-- **预设** — leave **全部预设**, or pick the presets that should receive the tools.
+- **预设暴露** — leave **全部预设**, or pick the presets that should receive the tools.
 
 Press **测试连接** to probe it without saving, then **保存**. A failing connection still saves: the
 card shows the error, and the server keeps retrying with backoff.
@@ -85,7 +85,7 @@ environment plus the variables you set.
 
 ### 3. Choose who gets the tools
 
-Each server has a **预设** section:
+Each server has a **预设暴露** section:
 
 - **全部预设** — every agent, including agents without a preset id;
 - **指定预设** — only the checked presets. An empty selection is legal and exposes the server to
@@ -168,8 +168,8 @@ prints the data directory. Both only read.
   deleting a row here never touches them.
 - **HTTP/SSE servers must be reachable from the DSH Host**, not from the browser. `localhost` in
   the URL means the host's localhost.
-- **Preset switching after the first turn is not re-bound.** DSH fixes an agent's preset when the
-  session starts; select the preset before the conversation begins.
+- **Preset selection is fixed once a session's first turn starts.** Choose the preset before the
+  conversation begins; the binder re-binds a blank session when it selects another preset.
 - The server list lives per `$DSH_HOME`, not per profile: profiles under the same DSH home share
   it. Use a separate `$DSH_HOME` if you need an isolated list.
 

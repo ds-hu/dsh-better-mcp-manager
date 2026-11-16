@@ -34,7 +34,7 @@ The transport is editable; `http` and `sse` use `url`, `stdio` uses `command`, `
 The **live, derived state** of one server: `disabled`, `connecting`, `connected`, or `error`, plus
 `toolCount`, `discoveredCount`, `instructionsBytes`, `error`, `attempts`, `connectedAt`,
 `lastAttemptAt`, `nextRetryAt`. There is no separate `retrying` state: a scheduled retry keeps the
-state `error` with `nextRetryAt` set, and the page presents that as **重试中**. Status is never
+state `error` with `nextRetryAt` set, and the page presents that as **重连中**. Status is never
 stored: after a restart a server is `connecting` again until it succeeds, and a disabled server
 never opens a connection.
 
@@ -52,7 +52,7 @@ disposed. A manual **重新连接** resets the attempt budget. One server has ex
 ### Preset exposure
 
 Which agent presets receive a server's tools. Stored as `"all"` or an array of agent-preset ids
-(`[]` means no preset). The UI calls this **预设** with a choice of **全部预设** / **指定预设**.
+(`[]` means no preset). The UI section is **预设暴露**, with a choice of **全部预设** / **指定预设**.
 
 - `"all"` — every agent, including agents without a preset id.
 - an id list — only agents whose composed preset id is in the list.

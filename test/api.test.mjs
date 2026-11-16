@@ -456,6 +456,16 @@ test('api: grouped servers report their group names once, in list order', async 
   assert.deepEqual(list.body.groups, ['Work', 'Home']);
 });
 
+test('api: an unexpected failure answers a 500 server-error envelope', async (t) => {
+  const { call, store } = await harness(t);
+  store.list = () => {
+    throw new Error('disk on fire');
+  };
+  const result = await call({ path: '/servers' });
+  assertError(result, 500, 'server-error');
+  assert.match(result.body.error, /disk on fire/u);
+});
+
 test('api: unknown paths answer a 404 JSON envelope', async (t) => {
   const { call } = await harness(t);
   const result = await call({ path: '/nope' });

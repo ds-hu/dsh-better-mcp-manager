@@ -202,6 +202,24 @@ test('mcp oauth: invalid JSON, a missing access_token and a bad body are auth-fa
 /* credential headers                                                */
 /* ---------------------------------------------------------------- */
 
+test('mcp oauth: a 401 is auth-failed and invalidating yields a fresh Authorization header', async (t) => {
+  // This is the unit-testable seam of the contract's retry-once rule: the
+  // connection retries with a fresh token when a failed attempt looks 401-ish.
+  const calls = mockFetch(t, (_call, index) => response({ json: { access_token: `tok-${index}` } }));
+  const tokens = createTokenSource(oauth(), () => 0);
+  const server = { headers: [], oauth: oauth() };
+  const tokensFor = () => tokens;
+
+  assert.deepEqual(await buildHeaders(server, tokensFor), { Authorization: 'Bearer tok-0' });
+  const unauthorized = new Error('the server rejected the credential');
+  unauthorized.status = 401;
+  assert.equal(classifyFailure(unauthorized), 'auth-failed', 'a 401 is the condition the retry-once rule looks for');
+
+  tokens.invalidate();
+  assert.deepEqual(await buildHeaders(server, tokensFor), { Authorization: 'Bearer tok-1' });
+  assert.equal(calls.length, 2, 'the retry fetches a fresh token instead of reusing the rejected one');
+});
+
 test('mcp headers: a bearer token becomes an Authorization header', async () => {
   const server = {
     headers: [{ name: 'X-Trace', value: '1' }],

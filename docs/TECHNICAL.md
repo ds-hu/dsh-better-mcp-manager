@@ -90,7 +90,7 @@ deliberately small: start, stop, reconfigure, status, cached tools, cached instr
 
 **States.** The supervisor's own values are `disabled`, `connecting`, `connected` and `error`; while
 an `error` server is waiting for its next attempt, `nextRetryAt` is set, which the page presents as
-**重试中**. Each snapshot also carries `attempts`, `connectedAt`, `lastAttemptAt`, `nextRetryAt` and
+**重连中**. Each snapshot also carries `attempts`, `connectedAt`, `lastAttemptAt`, `nextRetryAt` and
 the last `error` (`{ code, message, detail, at }`). The state is derived, never stored.
 
 ```
@@ -451,10 +451,13 @@ npm run e2e         # isolated DSH instance + Playwright (opt-in, see below)
 
 The unit suites are offline and finish in seconds; they need no Host. `test/e2e/fixture-selftest.mjs`
 is a standalone check that drives the fixture MCP servers with the same `@modelcontextprotocol/client`
-version the plugin depends on — run it directly after changing a fixture or the SDK. The e2e suite is
-the only one that boots DSH: it uses a fresh `$DSH_HOME` and profile in its own systemd scope on a
-free port, and never touches the user's running instance or `/root/.dsh`. That isolation is a
-property of the test harness, not of the plugin.
+version the plugin depends on — run it directly after changing a fixture or the SDK. The e2e fixtures
+live in `test/fixtures/`: a stdio MCP server with echo/fail tools and instructions, a Streamable HTTP
+MCP server with add/echo/fail tools and instructions, and a fake OpenAI-compatible endpoint that
+records every request (notably `tools[].function.name` and the messages) and can answer with a scripted
+tool call. The e2e suite is the only one that boots DSH: it uses a fresh `$DSH_HOME` and profile in its
+own systemd scope on a free port, and never touches the user's running instance or `/root/.dsh`. That
+isolation is a property of the test harness, not of the plugin.
 
 ## Failure modes
 

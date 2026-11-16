@@ -91,6 +91,7 @@ check('the tarball carries every runtime module', () => {
     'lib/presets.js',
     'lib/api.js',
     'lib/http.js',
+    'lib/version.js',
     'bin/mcp-manager.mjs',
   ]) {
     assert.ok(has(path), `${path} is missing from the tarball`);

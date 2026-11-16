@@ -63,6 +63,8 @@ if (source !== '') {
     const unexpected = required.filter((specifier) => specifier !== 'react');
     assert.deepEqual(unexpected, [], `lib/client.js requires ${unexpected.join(', ')}; only "react" exists in the shell's client module table`);
     assert.ok(required.includes('react'), 'lib/client.js must obtain React through require("react")');
+    const calls = [...source.matchAll(/\brequire\s*\(/gu)].length;
+    assert.equal(calls, required.length, 'every require() call must be a string literal; the shell cannot resolve a dynamic specifier');
   });
 
   check('the browser half talks only to /better-mcp-manager/api', () => {
