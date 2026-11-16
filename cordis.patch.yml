@@ -1,0 +1,16 @@
+# The @ds-hu/dsh-better-mcp-manager bundle patch.
+#
+# One row: the Host half. `name` must be this package's name so the Loader
+# resolves the row (and therefore the code it mounts) from the profile's
+# node_modules; `id` must equal the `name` the Host half exports from
+# lib/index.js, so the row and the plugin are recognizably the same thing.
+# Both parity rules are guarded by test/mount-check.mjs.
+#
+# The plugin publishes no Cordis service and inserts no other rows, so it sits
+# loose in the Host root realm. Everything it owns lives in one directory,
+# $DSH_HOME/better-mcp-manager/ — see docs/TECHNICAL.md#uninstall. Removing the
+# bundle removes this row; `bin/mcp-manager.mjs clean` removes the directory.
+
+- insert:
+    - id: dsh-better-mcp-manager
+      name: '@ds-hu/dsh-better-mcp-manager'

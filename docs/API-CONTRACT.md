@@ -1,0 +1,222 @@
+# Internal contract — Host HTTP API, data model, and exposure rules
+
+This file is the single source of truth shared by the Host half (`lib/index.js` and friends),
+the Client half (`lib/client.js`) and the tests (`test/`). Change it before changing either side.
+
+Status: **frozen for 0.1.0**. Everything below is what 0.1.0 ships.
+
+---
+
+## 1. Where the plugin sits
+
+| Piece | File | Mounted by | Talks to |
+|---|---|---|---|
+| Host | `lib/index.js` (`name = 'dsh-better-mcp-manager'`) | the profile patch row in `cordis.patch.yml` | DSH Host services + MCP servers |
+| Client | `lib/client.js` (`window.__ModuleLoader__`, `id = '@ds-hu/dsh-better-mcp-manager'`) | the Web shell, via `package.json` → `dsh.client` | the Host over same-origin `/better-mcp-manager/api/*` |
+| Cleanup CLI | `bin/mcp-manager.mjs` | the user, after `remove_bundle` | the data directory only |
+
+The Host half never writes `cordis.patch.yml`, never mounts Loader rows and never edits agent-preset
+YAML. Everything the user configures lives in one JSON file under
+`$DSH_HOME/better-mcp-manager/servers.json` (mode `0600`, atomic replace).
+
+## 2. Data model
+
+### 2.1 Server record (stored)
+
+```jsonc
+{
+  "id": "srv_1f3c9a2b70",          // immutable, `srv_` + 10 lowercase hex
+  "key": "mylocal",                // immutable tool namespace, `[A-Za-z0-9_-]{1,32}`, unique
+  "name": "My MCP",                // user-facing, 1..80 chars, unique is NOT enforced
+  "enabled": true,
+  "transport": "http",             // "http" | "sse" | "stdio"
+  "url": "http://localhost:3000/mcp", // http/sse only
+  "command": "",                   // stdio only: executable
+  "args": [],                      // stdio only
+  "cwd": "",                       // stdio only, "" = inherit
+  "env": {},                       // stdio only, string → string
+  "headers": [                     // http/sse only, ordered, names unique (case-insensitive)
+    { "name": "Authorization", "value": "Bearer sk-..." }
+  ],
+  "oauth": { "mode": "none" },     // see 2.2
+  "icon": "🔌",                    // 0..8 chars, rendered in the tile; "" = fall back to first letter
+  "color": "blue",                 // one of: blue, violet, teal, green, amber, rose, slate
+  "group": "",                     // "" = ungrouped; otherwise 1..60 chars, free text
+  "presets": "all",                // "all" | string[] of agent-preset ids (may be [])
+  "timeoutMs": 60000,              // 1000..600000, per tools/call
+  "createdAt": "2026-11-16T10:00:00.000Z",
+  "updatedAt": "2026-11-16T10:00:00.000Z"
+}
+```
+
+Store file:
+
+```jsonc
+{ "version": 1, "servers": [ /* Server records, stable order = list order */ ] }
+```
+
+Rules enforced before any write (the API answers `400` with `{ ok:false, code, error }`):
+
+- `name` trimmed, 1..80 chars.
+- `key` derives from `name` by ASCII slug (`[^A-Za-z0-9_-]` → `-`, collapse dashes, lowercase,
+  trim to 32); an empty slug becomes `mcp-<id suffix>`; a duplicate key appends `-<4 hex>`. The key
+  is frozen at creation and never changes on rename.
+- `transport` must be one of the three; `http`/`sse` need an absolute `http:`/`https:` URL; `stdio`
+  needs a non-empty `command`.
+- Header names match `^[A-Za-z0-9!#$%&'*+.^_`|~-]+$`, unique case-insensitively, each value ≤ 4096
+  chars, at most 20 headers.
+- `presets`: `"all"`, or an array of known preset ids (unknown ids are rejected with the roster in
+  the message), at most 40 entries.
+- `icon` ≤ 8 UTF-16 code units; `color` from the fixed palette; `group` ≤ 60 chars.
+- `timeoutMs` integer 1000..600000; `enabled` boolean.
+- Unknown fields are dropped, not stored.
+
+### 2.2 OAuth object
+
+```jsonc
+{ "mode": "none" }
+{ "mode": "bearer", "token": "opaque-token" }
+{ "mode": "client_credentials", "tokenUrl": "https://idp/token", "clientId": "...", "clientSecret": "...", "scope": "mcp.read" }
+```
+
+- `bearer` adds `Authorization: Bearer <token>` unless the user already set an `Authorization`
+  header (custom headers win).
+- `client_credentials` POSTs `grant_type=client_credentials&client_id=...&client_secret=...&scope=...`
+  (`application/x-www-form-urlencoded`) to `tokenUrl` before an HTTP/SSE connect, caches the access
+  token until `expires_in - 60s`, and retries once with a fresh token when a request answers 401.
+  A failed token fetch is a connection error with `code: "auth-failed"`.
+- Every field is optional-but-validated as above; `clientSecret`/`token` are never written into logs.
+
+### 2.3 Live status (derived, never stored)
+
+```jsonc
+{
+  "serverId": "srv_1f3c9a2b70",
+  "state": "disabled",   // "disabled" | "connecting" | "connected" | "error"
+  "transportLabel": "HTTP",          // "HTTP" | "SSE" | "内置"
+  "toolCount": 19,                   // discovered tools currently registered on live agents
+  "discoveredCount": 19,             // discovered tools (both numbers equal in 0.1.0)
+  "instructionsBytes": 412,
+  "error": null,                     // or { "code": "...", "message": "...", "detail": "...", "at": "ISO" }
+  "attempts": 0,                     // consecutive failed attempts
+  "connectedAt": null,               // ISO or null
+  "lastAttemptAt": "2026-11-16T10:00:00.000Z",
+  "nextRetryAt": null                // ISO or null
+}
+```
+
+`error.code` is one of: `connect-failed`, `auth-failed`, `timeout`, `protocol`, `invalid-config`,
+`closed`. While a retry is scheduled the state stays `error` and `nextRetryAt` names the next
+attempt; the panel presents that as 重连中.
+
+### 2.4 Preset exposure
+
+- `server.presets === "all"` → the server's tools are exposed to every agent, including agents with
+  no preset id.
+- `server.presets === [...]` → exposed only when
+  `ctx.agentPresets.composedPreset(agent.ctx)` (or `agent/created`'s inherited preset) is in the list.
+- Exposure happens at `agent/created` and for already-live agents when the plugin mounts or the
+  configuration changes. A session that selects another preset before its first turn is re-exposed
+  on `agent-preset/selected`.
+- Tools are registered on `agent.ctx`, so they live and die with that agent (that is also what makes
+  two agents able to use the same server without colliding).
+- MCP `instructions` (if the server returns any) are added as one `systemPrompt.section` per server
+  on that same `agent.ctx`, name `mcp-manager:<key>`, order `getSectionOrder('MCP_SERVERS')`.
+  Only servers whose tools are actually exposed contribute prompt text: a connected server with
+  zero discovered tools contributes no instructions.
+
+### 2.5 Tool naming
+
+Public tool name: `mcp__<key>__<rawName>`, then normalized to DSH's function-name contract
+(`[A-Za-z0-9_-]`, ≤ 64 chars). If normalization changes the string, a 12-hex SHA-256 of
+`(key, rawName)` is appended, exactly like `@deepseek-ai/dsh-mcp-client`. The raw name is what goes
+on the MCP wire; the public name is never parsed back.
+
+## 3. Host HTTP API
+
+Base: `/better-mcp-manager/api`, same-origin only. `kind: 'prefix'` route on `ctx.webServer`.
+
+- Every response is JSON: success `{ "ok": true, ... }`, failure
+  `{ "ok": false, "code": "...", "error": "human text" }` with status 400/404/405/413/415/500.
+- Every mutation is same-origin checked (no `Origin`, or an `Origin` matching the request
+  `Host`). Body-bearing mutations also require `Content-Type: application/json` and a body
+  ≤ 64 KiB; `DELETE` and `/reconnect` carry no body.
+- Read requests are `GET`. No authentication beyond the Harness's own web auth.
+
+| Method | Path | Body | Answer |
+|---|---|---|---|
+| GET | `/servers` | — | `{ ok, servers: [{ ...server, status }], presets: [Preset], groups: string[], version, dataDir }` |
+| POST | `/servers` | full server draft | `201 { ok, server: { ...server, status } }` |
+| GET | `/servers/:id` | — | `{ ok, server: { ...server, status, tools: [{name, publicName, description}] } }` |
+| PUT | `/servers/:id` | full server draft (same shape as POST) | `{ ok, server: { ...server, status } }` |
+| DELETE | `/servers/:id` | — | `{ ok, deleted: true }` |
+| POST | `/servers/:id/enabled` | `{ enabled: boolean }` | `{ ok, server }` |
+| POST | `/servers/:id/reconnect` | — | `{ ok, server }` (starts a fresh connection attempt now) |
+| POST | `/servers/test` | full server draft (not stored) | `{ ok, status }` — 15s cap, always answers 200 unless the body is invalid |
+| GET | `/presets` | — | `{ ok, presets: [Preset] }` where `Preset = { id, name, description, order }` |
+| GET | `/agents` | — | `{ ok, agents: [{ sessionId, preset, servers: [key], tools: [publicName] }] }` — live exposure diagnostics |
+| GET | `/health` | — | `{ ok, version, pid, uptimeMs }` |
+
+`Preset` display names come from `ctx.agentPresets.list()` (`id`, `name ?? id`, `description`,
+`order ?? 0`); presets with a failed activation are still listed, with their diagnostic in
+`description`. When the service is absent, `presets` is `[]` and the UI explains that per-preset
+selection needs agent presets.
+
+Save/update mutates the store first (atomic), then applies the connection change. A server whose
+connection fails still saves and lists.
+
+## 4. Host lifecycle
+
+- Mount: load store → start one connection supervisor per **enabled** server → register the HTTP
+  route → bind live agents → listen for `agent/created` / `agent/disposed` /
+  `agent-preset/selected`.
+- Supervisor: connect → initialize → `tools/list` → cache tools + `getInstructions()`; keep the
+  connection; a dropped connection retries with backoff 1s, 2s, 4s, 8s, 16s, 30s (cap), forever,
+  until disabled/removed/disposed. A manual reconnect resets the budget.
+- Any tool-list change notification re-lists tools and re-exposes live agents.
+- Dispose: clear timers, close clients/transports (5s cap), unregister the route, release all
+  `agent.ctx` registrations, clear derived state. Nothing survives in memory.
+- Two servers can never share a `key` (enforced at save).
+
+## 5. Client requirements
+
+Register two slots, both under `ctx.slots.inject(...)`:
+
+- `sidebar.panellist` — `id: 'mcp-manager'`, `order: 20`, `locale`, `label: () => t('panel')`
+  (自动化任务 is order 10, Plugins is 0, so 20 puts MCP 管理 directly below 自动化任务).
+- `main` — `key: 'mcp-manager'`, the page component.
+
+Page (dark and light theme, tokens only — no literal colors outside artwork):
+
+1. Header: title 管理 / MCP 管理 + subtitle count; primary `+ 添加 MCP` button.
+2. Server cards grouped by `group` (ungrouped shown last as 其他（未分组）). Each card:
+   icon tile (color + emoji/letter), name, status line (`已连接 · HTTP · 工具 19/19`,
+   `连接失败 · HTTP · 工具 0`, `已停用 · SSE`), status dot (green/red/gray/amber), `···` menu
+   (编辑, 测试连接, 重新连接, 删除), and for errors an inline error bubble with the first 2 lines
+   of the message and a 详情 link that opens a dialog with message + detail.
+3. Add/edit form (a right-hand sheet or full page level; both are fine): 是否启用 switch;
+   服务器图标 picker (emoji + color); 分组 select (existing groups + free text); 名称; 传输类型
+   segmented HTTP / SSE / 内置(stdio); 服务器地址 (or 命令 + 参数 + 环境变量 for stdio);
+   OAuth 设置 dialog (mode none/bearer/client_credentials); 自定义请求头 rows (name, value,
+   delete, `+ 添加请求头`); 预设 section (radio: 全部预设 / 指定预设, then preset checkboxes);
+   保存 (and 删除 in edit mode) with inline validation errors and a saving state.
+4. Empty state with an add CTA; loading skeleton/spinner; retry on network failure.
+5. Poll `GET /servers` every 2.5s while the page is mounted (and immediately after every mutation);
+   stop when unmounted.
+6. All copy through `ctx.locale.register(NS, { zh, en })`; locale namespace `mcpManager`.
+7. Cleanup: one `<style data-plugin-css>` tag per plugin instance, removed on dispose; every timer
+   cleared in `ctx.effect` cleanup.
+
+## 6. Test surface
+
+- Unit (plain `node --test`, no Host): store/validation, key allocation, preset predicate, tool
+  name derivation, API router with mock `req`/`res`, MCP result projection (text/resource/image
+  diagnostic), client-credentials refresh.
+- Mount check: patch row id === Host `name`, exports resolve, no `@deepseek-ai/*` import in `lib/`,
+  no writes outside the data dir, locale/icon exported and packed.
+- Client smoke: run `lib/client.js` in a `vm` with a fake `window.__ModuleLoader__` + fake React,
+  assert both slots register, dictionaries cover zh/en, no timer outlives dispose.
+- E2E (isolated DSH_HOME + its own systemd scope, never the production instance): install the packed
+  tarball into a fresh `web` profile, boot on a free port, drive the real page with Playwright,
+  verify connect/fail/tool-count/preset scoping against local fixture MCP servers and a fake
+  OpenAI-compatible endpoint that records the tool schemas it receives.

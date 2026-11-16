@@ -1,0 +1,42 @@
+dsh-better-mcp-manager
+Copyright (c) 2026 the dsh-better-mcp-manager authors
+
+This product is MIT-licensed (see LICENSE).
+
+Third-party material
+--------------------
+
+Runtime dependency
+  @modelcontextprotocol/client 2.2.0 — MIT, the Model Context Protocol project.
+  It is used unmodified as the MCP wire client for the stdio, Streamable HTTP
+  and SSE transports.
+
+Peer dependency
+  The package declares a single peer dependency on @deepseek-ai/cordis, which the
+  DeepSeek Harness installation supplies. No @deepseek-ai/* module is imported or
+  vendored at runtime; every Harness capability is reached through the Cordis
+  context object.
+
+Adapted behavior
+  Portions of the MCP connection lifecycle (connect / initialize / tools-list,
+  reconnection with backoff, per-server instructions) and of the tool-result
+  projection (text in block order, resource links rendered as text, image and
+  unsupported-content diagnostics) are adapted from
+  @deepseek-ai/dsh-mcp-client 0.2.1-rc.5, MIT, Copyright (c) 2026 DeepSeek
+  (DeepSeek Harness). The code in this package is a smaller reimplementation
+  for its one-connection-per-server, per-preset model. It does not import or
+  vendor that package: a profile-installed plugin cannot resolve Harness
+  internal packages, which is also why the tool definition is built by hand
+  instead of importing the Harness tool helpers (see
+  docs/adr/0005-hand-built-tool-definition.md).
+
+Borrowed patterns
+  The bundle patch layout, the Host/Client split, the plugin-owned JSON store
+  with atomic replace, and the maintenance CLI follow the ds-hu sibling plugins
+  (MIT), notably @ds-hu/dsh-auto-task-center. Those packages are not
+  dependencies and their source is not vendored here.
+
+Original material
+  The icon (icon.svg), the client UI, and the zh/en locale dictionaries were
+  written for this project. "DeepSeek" and "DeepSeek Harness" are names of the
+  host platform, not a claim of endorsement.

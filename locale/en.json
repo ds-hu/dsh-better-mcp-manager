@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP Manager",
+    "description": "Manage MCP servers from the sidebar: transports, headers, OAuth, groups, live status and tool counts, and which agent presets each server's tools are exposed to."
+  }
+}

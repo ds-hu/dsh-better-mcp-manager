@@ -1,0 +1,93 @@
+{
+  "name": "@ds-hu/dsh-better-mcp-manager",
+  "version": "0.1.0",
+  "description": "MCP manager for the DeepSeek Harness Web GUI: add, edit, group, test and remove MCP servers from the sidebar, choose which agent presets each server's tools are exposed to, and see live connection status and tool counts.",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ds-hu/dsh-better-mcp-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ds-hu/dsh-better-mcp-manager/issues"
+  },
+  "homepage": "https://github.com/ds-hu/dsh-better-mcp-manager#readme",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "cordis",
+    "mcp",
+    "model-context-protocol",
+    "mcp-client",
+    "agent-preset",
+    "web-ui"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml"
+      ]
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.2.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "license": "MIT",
+  "files": [
+    "bin",
+    "lib",
+    "locale",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "README.zh-CN.md",
+    "CONTEXT.md",
+    "docs",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "lint": "eslint .",
+    "test:unit": "node --test test/*.test.mjs",
+    "test:mount": "node test/mount-check.mjs",
+    "test:client": "node test/client-smoke.mjs",
+    "test:pack": "node test/package.mjs",
+    "test": "npm run test:unit && npm run test:mount && npm run test:client",
+    "check": "npm run lint && npm test && npm run test:pack",
+    "e2e": "node test/e2e/run.mjs",
+    "prepublishOnly": "npm run check"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.10.0",
+    "globals": "17.12.0"
+  },
+  "bin": {
+    "dsh-better-mcp-manager": "bin/mcp-manager.mjs"
+  }
+}
