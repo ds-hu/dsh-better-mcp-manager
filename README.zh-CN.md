@@ -3,6 +3,10 @@
 **MCP 管理 / MCP Manager** —— 在 DeepSeek Harness 的 Web 界面里管理 MCP 服务器，并按 Agent 预设
 决定每个服务器的工具交给谁。
 
+<p align="center">
+  <img src="docs/screenshots/mcp-manager-sidebar.png" alt="浏览器整页：侧边栏里的 MCP 管理就在 自动化任务 正下方；页面里是三张不同状态的服务器卡片" width="860">
+</p>
+
 <p>
   <a href="LICENSE"><img alt="license: MIT" src="https://img.shields.io/badge/license-MIT-2E7DD1"></a>
   <a href="README.md">English</a>
@@ -34,6 +38,10 @@ DSH 本来就能使用外部 MCP 服务器提供的工具，方式是在 profile
 - **按服务器选择预设暴露**：全部预设，或指定预设（勾选 Host 提供的预设）。
 - **测试连接**：不用保存就能先探一下草稿。
 - **每台服务器单独的工具调用超时**，默认 60 秒。
+
+<p align="center">
+  <img src="docs/screenshots/mcp-manager-list.png" alt="混合状态列表：已连接 · 内置 · 工具 2/2；已停用 · HTTP；重连中 · HTTP · 工具 0/0，卡片上带错误气泡" width="820">
+</p>
 
 ## 安装
 
@@ -82,6 +90,10 @@ dsh plugin --profile web add @ds-hu/dsh-better-mcp-manager
 - **全部预设**——所有 Agent，包括没有预设 id 的 Agent；
 - **指定预设**——只给勾选的预设。一个都不勾也是合法的，表示这台服务器不对任何 Agent 暴露。
 
+<p align="center">
+  <img src="docs/screenshots/mcp-manager-form-presets.png" alt="编辑表单的 预设暴露 区域：全部预设 / 指定预设 单选卡片，已勾选 标准模式" width="760">
+</p>
+
 工具在 Agent 创建时注册；保存服务器或切换启用状态时，运行中的 Agent 会被重新绑定，所以不用重启
 就能在已打开的会话里看到变化。还没开始第一轮对话的会话，在切换预设时会按新预设重新绑定。
 
@@ -129,8 +141,10 @@ npx -y @ds-hu/dsh-better-mcp-manager clean --yes
 ```
 
 从源码目录运行时，同一条命令是 `node bin/mcp-manager.mjs clean --yes`；等价的手工操作是
-`rm -rf "$DSH_HOME/better-mcp-manager"`。除此之外没有别的东西要清：不写 profile 配置，不注册
-服务或定时器。卸载后刷新一下页面——还开着的旧页面会记得那个已经失效的侧边栏入口，直到刷新为止。
+`rm -rf "$DSH_HOME/better-mcp-manager"`。移除命令会自己清掉依赖和 bundle 行，所以在 profile 里
+不留东西：没有运行过安装脚本，也没有服务或定时器要清。只剩 `clean` 这一步，而且只是因为服务器
+列表是留是删由你决定。卸载后刷新一下页面——还开着的旧页面会记得那个已经失效的侧边栏入口，直到
+刷新为止。
 
 `clean` **必须带 `--yes`**：不带就拒绝执行并以非零状态退出，误敲也不会删东西。它同样拒绝任何
 名字不是 `better-mcp-manager` 的数据目录，删完会打印实际删掉的路径。

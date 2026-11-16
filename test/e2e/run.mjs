@@ -1,0 +1,682 @@
+#!/usr/bin/env node
+/**
+ * Isolated end-to-end test for @ds-hu/dsh-better-mcp-manager.
+ *
+ *   node test/e2e/run.mjs [--keep] [--verbose]
+ *
+ * What it proves, against a real Web page served by a real DSH instance:
+ *
+ *   boot       an isolated profile (fresh copy of the shipped `web` template,
+ *              the packed tarball installed with `dsh plugin add`) boots in its
+ *              own systemd scope and prints an authenticated URL;
+ *   bundle     the sidebar row `MCP 管理` sits directly below `自动化任务` and
+ *              opens the management page with no console/page errors;
+ *   CRUD       stdio + streamable-HTTP servers connect with live tool counts,
+ *              a wrong port surfaces a failing (重连中) card whose 详情 dialog
+ *              and 测试连接 dialog carry the real error, editing to the right
+ *              port recovers, the enable switch round-trips, and deleting
+ *              removes the card;
+ *   scoping    with a local fake OpenAI-compatible provider, a standard-preset
+ *              session's model request carries `mcp__<key>__echo`, while a
+ *              minimal-preset session's request does not; a tool_call for the
+ *              MCP tool executes against the fixture and its result is fed back
+ *              to the model on the next request;
+ *   hygiene    cleanup removes scopes/processes/files/ports and the production
+ *              dsh-web.service MainPID and cgroup are untouched.
+ *
+ * Safety: every long-running process (this runner included, the test DSH, the
+ * fixtures) runs inside a transient systemd scope with MemoryMax, so nothing is
+ * accounted in the production dsh-web.service cgroup. The runner never touches
+ * the production instance beyond reading its PID/cgroup for the baseline.
+ *
+ * Flags:
+ *   --keep      do not stop scopes or delete the run directory (debugging);
+ *               prints the kept paths and leaves them running
+ *   --verbose   verbose step logging and HTTP details
+ */
+import { copyFile, mkdir, readFile, rm, stat } from 'node:fs/promises';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { connect, createServer } from 'node:net';
+import { basename, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { Reporter, createRunId, formatBytes, redact, tailFileSync, waitFor } from './lib/util.mjs';
+import { currentCgroup, inProductionCgroup, listScopes, reexecInScope } from './lib/scope.mjs';
+import { snapshotProduction, describeSnapshot } from './lib/production.mjs';
+import { InstanceApi } from './lib/api.mjs';
+import {
+  addBundleToManifest,
+  bootDsh,
+  createFreshProfile,
+  installPackedPlugin,
+  packPlugin,
+  scanBootLog,
+  writeProfilePatch,
+} from './lib/profile.mjs';
+import { requestsForMarker, startFixtures, stdioFixtureSpec } from './lib/fixtures.mjs';
+import { collectDiagnostics, launchBrowser } from './lib/playwright.mjs';
+import * as ui from './lib/ui.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(HERE, '..', '..');
+const args = process.argv.slice(2);
+const FLAGS = {
+  keep: args.includes('--keep'),
+  verbose: args.includes('--verbose'),
+};
+const UNKNOWN_FLAGS = args.filter((argument) => !['--keep', '--verbose'].includes(argument));
+if (UNKNOWN_FLAGS.length > 0) {
+  process.stderr.write(`unknown flag(s): ${UNKNOWN_FLAGS.join(' ')}\nusage: node test/e2e/run.mjs [--keep] [--verbose]\n`);
+  process.exit(2);
+}
+
+const RUN_ID = createRunId();
+const RUN_DIR = `/var/tmp/dsh-mcp-e2e-${RUN_ID}`;
+const DSH_HOME = join(RUN_DIR, 'home');
+const HOME_DIR = join(RUN_DIR, 'userhome');
+const WORKSPACE_DIR = join(HOME_DIR, 'workspace');
+const PROFILE_NAME = `mcp-e2e-${RUN_ID}`;
+const PROFILE_DIR = join(DSH_HOME, 'profiles', PROFILE_NAME);
+const ARTIFACT_DIR = join(RUN_DIR, 'artifacts');
+const DOCS_SCREENSHOT_DIR = join(REPO_ROOT, 'docs', 'screenshots');
+const DATA_DIR = join(DSH_HOME, 'better-mcp-manager');
+
+const reporter = new Reporter({ verbose: FLAGS.verbose });
+const resources = { browser: null, dsh: null, fixtures: null };
+let cleanupDone = false;
+
+/**
+ * Re-exec into a private cgroup before doing anything heavy. Playwright's
+ * chromium children inherit the runner's cgroup, and the runner itself may be
+ * started from the production service's own cgroup (this repo's development
+ * environment runs the assistant inside dsh-web.service).
+ */
+if (process.env.MCP_E2E_SCOPED !== '1') {
+  const code = await reexecInScope({ runId: RUN_ID, argv: [resolve(process.argv[1]), ...args] });
+  if (code !== undefined) process.exit(code);
+}
+
+process.stdout.write(`\nDSH plugin E2E — run ${RUN_ID}\n`);
+process.stdout.write(`cgroup: ${currentCgroup()}${inProductionCgroup() ? ' (production!)' : ''}\n`);
+process.stdout.write(`run dir: ${RUN_DIR}\n`);
+
+async function main() {
+  const before = snapshotProduction();
+  reporter.log(`production before: ${describeSnapshot(before)}`);
+
+  await mkdir(join(RUN_DIR, 'logs'), { recursive: true });
+  await mkdir(ARTIFACT_DIR, { recursive: true });
+  await mkdir(WORKSPACE_DIR, { recursive: true });
+
+  let page;
+  let diagnostics = { consoleErrors: [], pageErrors: [], failedRequests: [] };
+  let dsh;
+  let fixtures;
+  let api;
+  let serverKey;
+  const screenshotArtifacts = [];
+
+  try {
+    // ── phase 1: fixtures ────────────────────────────────────────────────
+    await reporter.step('start fixture servers in their own scope', async () => {
+      fixtures = await startFixtures({ repoRoot: REPO_ROOT, runDir: RUN_DIR, runId: RUN_ID, reporter });
+      resources.fixtures = fixtures;
+      reporter.check('fixture fake LLM + MCP HTTP are listening', true, `LLM :${fixtures.fakeLlmPort}, MCP :${fixtures.mcpPort}`);
+    });
+
+    // ── phase 2: package + isolated profile + install + boot ─────────────
+    let pack;
+    await reporter.step('pack the plugin and install it into a fresh profile', async () => {
+      pack = await packPlugin({ repoRoot: REPO_ROOT, runDir: RUN_DIR });
+      reporter.check('npm pack produced the installable tarball', existsSync(pack.tarball), basename(pack.tarball));
+
+      await createFreshProfile({ repoRoot: REPO_ROOT, runDir: RUN_DIR, dshHome: DSH_HOME, homeDir: HOME_DIR, profileName: PROFILE_NAME, profileDir: PROFILE_DIR });
+      const bundles = addBundleToManifest({ profileDir: PROFILE_DIR });
+      reporter.check('test profile is the shipped web template plus this bundle', bundles.includes('@deepseek-ai/dsh-base') && bundles.includes('@deepseek-ai/dsh-web-app') && bundles.includes('@ds-hu/dsh-better-mcp-manager'));
+
+      writeProfilePatch({ profileDir: PROFILE_DIR, fakeBaseURL: fixtures.fakeBaseURL });
+      const install = await installPackedPlugin({ repoRoot: REPO_ROOT, runDir: RUN_DIR, dshHome: DSH_HOME, homeDir: HOME_DIR, profileName: PROFILE_NAME, profileDir: PROFILE_DIR, tarball: pack.tarball });
+      reporter.check(
+        'packed tarball installed via `dsh plugin add` with the real registry dependency',
+        install.installedVersion === JSON.parse(await readFile(join(REPO_ROOT, 'package.json'), 'utf8')).version && install.mcpClientVersion === '2.2.0',
+        `plugin ${install.installedVersion}, @modelcontextprotocol/client ${install.mcpClientVersion}`,
+      );
+    });
+
+    await reporter.step('boot the isolated DSH instance under its own scope', async () => {
+      dsh = await bootDsh({ repoRoot: REPO_ROOT, runDir: RUN_DIR, dshHome: DSH_HOME, homeDir: HOME_DIR, profileName: PROFILE_NAME, port: await freePort(), reporter });
+      resources.dsh = dsh;
+      reporter.check('test instance printed an authenticated URL with a token parameter', new URL(dsh.url).searchParams.get('token') !== null, redact(dsh.url));
+      reporter.check('test instance is not on the production port 3080', dsh.port !== 3080, `port ${dsh.port}`);
+      api = new InstanceApi({ origin: dsh.origin, reporter });
+      const login = await api.login(dsh.url);
+      reporter.check('authenticated URL mints the browser-auth cookie', typeof login.status === 'number', `index HTTP ${login.status}`);
+    });
+
+    await reporter.step('Host plugin mounted and serving its HTTP API', async () => {
+      const health = await api.health();
+      reporter.check('/better-mcp-manager/api/health answers ok + 0.1.0', health?.ok === true && health?.version === '0.1.0', JSON.stringify(health));
+      const catalog = await api.servers();
+      reporter.check(
+        'GET /servers starts empty with the real preset roster',
+        catalog?.ok === true && Array.isArray(catalog.servers) && catalog.servers.length === 0 && catalog.presets.some((preset) => preset.id === 'standard') && catalog.presets.some((preset) => preset.id === 'minimal'),
+        `presets: ${(catalog?.presets ?? []).map((preset) => preset.id).join(', ')}`,
+      );
+      reporter.check('data directory is under the isolated DSH_HOME', catalog?.dataDir === DATA_DIR, catalog?.dataDir);
+
+      const bootScan = await scanBootLog({ logPath: dsh.logPath, errPath: dsh.errPath });
+      reporter.check(
+        'no plugin mount errors or duplicate rows in the boot log',
+        bootScan.suspicious.length === 0 && bootScan.duplicate.length === 0,
+        redact([...bootScan.suspicious, ...bootScan.duplicate].slice(0, 3).join(' | ')),
+      );
+
+      const unknownApi = await api.request('GET', '/better-mcp-manager/api/nope', { expectOk: false });
+      reporter.check(
+        'unknown plugin API path answers a JSON 404 instead of a crash',
+        unknownApi.status === 404 && unknownApi.payload?.ok === false,
+        `HTTP ${unknownApi.status} ${redact(unknownApi.text).slice(0, 120)}`,
+      );
+      const unknownPage = await api.request('GET', '/better-mcp-manager/not-a-page', { expectOk: false });
+      reporter.check('unknown non-API plugin path never answers 5xx', unknownPage.status < 500, `HTTP ${unknownPage.status}`);
+    });
+
+    // ── phase 3: browser — bundle loads ──────────────────────────────────
+    await reporter.step('sidebar entry + management page render in the real browser', async () => {
+      const browser = await launchBrowser({ reporter });
+      resources.browser = browser;
+      const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'zh-CN', timezoneId: 'UTC' });
+      page = await context.newPage();
+      diagnostics = collectDiagnostics(page);
+      await ui.openApp(page, dsh.url);
+
+      const order = await ui.sidebarPanelOrder(page);
+      reporter.check(
+        'sidebar shows MCP 管理 directly below 自动化任务',
+        order.automationIndex >= 0 && order.mcpIndex === order.automationIndex + 1 && order.mcpBox !== null && order.automationBox !== null && order.mcpBox.y > order.automationBox.y,
+        `rows: ${order.rows.join(' | ')}`,
+      );
+
+      await ui.openMcpPage(page);
+      reporter.check('clicking MCP 管理 opens the management page', (await page.locator('[data-testid="mcp-page"]').count()) === 1);
+      reporter.check(
+        'no console errors or page errors while opening the plugin page',
+        diagnostics.consoleErrors.length === 0 && diagnostics.pageErrors.length === 0,
+        redact([...diagnostics.consoleErrors, ...diagnostics.pageErrors].slice(0, 3).join(' | ')),
+      );
+    });
+
+    // ── phase 4: UI CRUD ─────────────────────────────────────────────────
+    const stdioSpec = stdioFixtureSpec({ repoRoot: REPO_ROOT });
+    const stdioName = 'E2E 标准模式服务器';
+    const httpName = 'E2E HTTP 服务器';
+    const brokenName = 'E2E 故障服务器';
+
+    await reporter.step('add the stdio fixture through the form with preset scoping', async () => {
+      await ui.openAddForm(page);
+      const values = await ui.fillServerForm(page, {
+        name: stdioName,
+        transport: 'stdio',
+        command: stdioSpec.command,
+        args: stdioSpec.args,
+        presets: ['standard'],
+      });
+      reporter.check('form accepted name/command/args and 指定预设+标准模式', values.name === stdioName && values.command === stdioSpec.command && values.args === stdioSpec.args.join('\n'));
+
+      screenshotArtifacts.push(await ui.screenshotPresetSection(page, join(ARTIFACT_DIR, 'mcp-manager-form-presets.png')));
+
+      await ui.saveForm(page);
+      await ui.waitCardState(page, stdioName, 'connected');
+      const text = await ui.waitCardText(page, stdioName, '工具 2/2');
+      reporter.check('saved stdio server shows 已连接 · 内置 · 工具 2/2', text.includes('已连接') && text.includes('内置') && text.includes('工具 2/2'), text.replaceAll('\n', ' '));
+
+      const catalog = await api.servers();
+      const record = catalog.servers.find((server) => server.name === stdioName);
+      if (record === undefined) throw new Error('saved stdio server is missing from GET /servers');
+      serverKey = record.key;
+      reporter.check('server record has a derived key and the chosen preset exactly', /^[a-z0-9][a-z0-9_-]{0,31}$/.test(record.key) && JSON.stringify(record.presets) === JSON.stringify(['standard']), `key ${record.key}, presets ${JSON.stringify(record.presets)}`);
+      reporter.check('server record reports connected with toolCount 2', record.status?.state === 'connected' && record.status?.toolCount === 2, JSON.stringify(record.status));
+
+      const detail = await api.serverDetail(record.id);
+      const publicNames = (detail.server.tools ?? []).map((tool) => tool.publicName);
+      reporter.check(
+        'GET /servers/:id lists mcp__<key>__echo and mcp__<key>__fail',
+        publicNames.includes(`mcp__${serverKey}__echo`) && publicNames.includes(`mcp__${serverKey}__fail`),
+        publicNames.join(', '),
+      );
+
+      const dataFile = join(DATA_DIR, 'servers.json');
+      const mode = (await stat(dataFile)).mode & 0o777;
+      const stored = JSON.parse(await readFile(dataFile, 'utf8'));
+      reporter.check('store file lives in the isolated data dir with mode 0600', mode === 0o600, `mode 0${mode.toString(8)}`);
+      reporter.check('store file contains the saved server and nothing outside the data dir', stored.servers?.some((server) => server.id === record.id));
+    });
+
+    let httpId;
+    await reporter.step('wrong port surfaces a failing card with 详情 + 测试连接 diagnostics', async () => {
+      const deadPort = await freePort();
+      await ui.openAddForm(page);
+      await ui.fillServerForm(page, {
+        name: httpName,
+        transport: 'http',
+        url: `http://127.0.0.1:${deadPort}/mcp`,
+        presets: 'all',
+      });
+      await ui.saveForm(page);
+
+      // Capture the record before any UI-word assertion: later steps depend on its id.
+      const catalog = await api.servers();
+      const record = catalog.servers.find((server) => server.name === httpName);
+      if (record === undefined) throw new Error('saved HTTP server is missing from GET /servers');
+      httpId = record.id;
+      reporter.check(
+        'Host API reports state=error, code connect-failed and a scheduled retry',
+        record.status?.state === 'error' && record.status?.error?.code === 'connect-failed' && typeof record.status?.nextRetryAt === 'string',
+        JSON.stringify({ state: record.status?.state, code: record.status?.error?.code, nextRetryAt: record.status?.nextRetryAt }),
+      );
+
+      const state = await ui.waitCardState(page, httpName, ['error', 'retrying'], { timeoutMs: 40_000 });
+      const card = await ui.waitCardText(page, httpName, 'ECONNREFUSED');
+      reporter.check(
+        'failing card shows the contract word 重连中 and the real ECONNREFUSED error bubble',
+        card.includes('重连中') && /ECONNREFUSED/.test(card),
+        card.replaceAll('\n', ' '),
+      );
+      reporter.check('failing card status dot reports retrying/error', state === 'retrying' || state === 'error', `data-state=${state}`);
+
+      const error = await ui.openErrorDetail(page, httpName);
+      screenshotArtifacts.push(await ui.screenshotElement(error.dialog, join(ARTIFACT_DIR, 'mcp-manager-error-detail.png'), { maxHeight: 310 }));
+      reporter.check(
+        '详情 dialog shows 错误码 connect-failed, 错误信息 with ECONNREFUSED and 下次重试',
+        error.text.includes('错误码') && error.text.includes('connect-failed') && error.text.includes('错误信息') && /ECONNREFUSED/.test(error.text) && error.text.includes('下次重试'),
+        redact(error.text.replaceAll('\n', ' ').slice(0, 320)),
+      );
+      await error.close();
+
+      const test = await ui.testServerViaCard(page, httpName);
+      reporter.check(
+        'menu → 测试连接 dialog shows the literal 连接失败 with the error message',
+        test.text.includes('连接失败') && /ECONNREFUSED/.test(test.text),
+        redact(test.text.replaceAll('\n', ' ').slice(0, 260)),
+      );
+      await test.close();
+    });
+
+    await reporter.step('editing the URL to the live port recovers to 已连接 + 工具 3/3', async () => {
+      await ui.editServer(page, httpName);
+      await ui.updateUrl(page, fixtures.mcpUrl);
+      await ui.saveForm(page);
+      await ui.waitCardState(page, httpName, 'connected');
+      const text = await ui.waitCardText(page, httpName, '工具 3/3');
+      reporter.check('edited HTTP server shows 已连接 · HTTP · 工具 3/3', text.includes('已连接') && text.includes('HTTP') && text.includes('工具 3/3'), text.replaceAll('\n', ' '));
+
+      if (httpId === undefined) throw new Error('no HTTP server id captured for the edit step');
+      const detail = await api.serverDetail(httpId);
+      reporter.check('Host API reconnected the same record and discovered 3 tools', detail.server.status?.state === 'connected' && detail.server.status?.toolCount === 3 && (detail.server.tools ?? []).length === 3);
+    });
+
+    await reporter.step('the enable switch round-trips through 已停用 and back to 已连接', async () => {
+      await ui.toggleServer(page, httpName);
+      await ui.waitCardState(page, httpName, 'disabled');
+      await ui.waitCardText(page, httpName, '已停用');
+      let catalog = await api.servers();
+      reporter.check('disabling the server persists enabled=false', catalog.servers.find((server) => server.name === httpName)?.enabled === false);
+
+      await ui.toggleServer(page, httpName);
+      await ui.waitCardState(page, httpName, 'connected');
+      await ui.waitCardText(page, httpName, '工具 3/3');
+      catalog = await api.servers();
+      reporter.check('re-enabling the server reconnects it and persists enabled=true', catalog.servers.find((server) => server.name === httpName)?.enabled === true && catalog.servers.find((server) => server.name === httpName)?.status?.state === 'connected');
+
+      // Leave it disabled for the mixed-state screenshot below.
+      await ui.toggleServer(page, httpName);
+      await ui.waitCardState(page, httpName, 'disabled');
+    });
+
+    await reporter.step('mixed-state list screenshot + delete removes the card', async () => {
+      const deadPort = await freePort();
+      await ui.openAddForm(page);
+      await ui.fillServerForm(page, {
+        name: brokenName,
+        transport: 'http',
+        url: `http://127.0.0.1:${deadPort}/mcp`,
+        presets: 'all',
+      });
+      await ui.saveForm(page);
+      await ui.waitCardState(page, brokenName, ['error', 'retrying'], { timeoutMs: 40_000 });
+
+      const names = await ui.cardNames(page);
+      reporter.check('list holds connected + disabled + failing servers side by side', names.includes(stdioName) && names.includes(httpName) && names.includes(brokenName), names.join(' | '));
+      const summary = await page.locator('[data-testid="mcp-page"]').innerText();
+      reporter.check(
+        'list header counts 3 servers / 1 connected',
+        summary.includes('共 3 个服务器') && summary.includes('1 个已连接'),
+        summary.replaceAll('\n', ' ').slice(0, 160),
+      );
+      reporter.check(
+        'list renders 已连接 + 已停用 + 重连中 with the failing ECONNREFUSED bubble side by side',
+        summary.includes('已连接') && summary.includes('已停用') && summary.includes('重连中') && /ECONNREFUSED/.test(summary),
+        summary.replaceAll('\n', ' ').slice(0, 260),
+      );
+      await ui.dismissBanners(page);
+      screenshotArtifacts.push(await ui.screenshotPageSurface(page, join(ARTIFACT_DIR, 'mcp-manager-list.png')));
+      // Whole viewport: sidebar with 自动化任务 directly above the active MCP 管理 row.
+      screenshotArtifacts.push(await ui.screenshotViewport(page, join(ARTIFACT_DIR, 'mcp-manager-sidebar.png')));
+
+      await ui.deleteServerViaCard(page, brokenName);
+      const remaining = await ui.cardNames(page);
+      reporter.check('deleting a server removes its card from the list', !remaining.includes(brokenName) && remaining.includes(stdioName), remaining.join(' | '));
+      const catalog = await api.servers();
+      reporter.check('Host API lists two servers after the delete', catalog.servers.length === 2 && !catalog.servers.some((server) => server.name === brokenName));
+    });
+
+    // ── phase 5: preset scoping and a real MCP tool call ────────────────
+    await reporter.step('preset scoping: standard sees the MCP tools, minimal does not', async () => {
+      if (serverKey === undefined) throw new Error('no stdio server key available for the scoping phase');
+      const standardMarker = `E2E-STD-${RUN_ID}`;
+      const minimalMarker = `E2E-MIN-${RUN_ID}`;
+      await fixtures.reset();
+      await fixtures.configure({
+        defaultText: `fixture-llm: reply-${RUN_ID}`,
+        afterToolText: `fixture-llm: tool-result-${RUN_ID}`,
+        markers: [
+          { match: standardMarker, reply: { kind: 'text', text: `fixture-llm: standard-${RUN_ID}` } },
+          { match: minimalMarker, reply: { kind: 'text', text: `fixture-llm: minimal-${RUN_ID}` } },
+        ],
+      });
+
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'standard');
+      await ui.sendMessage(page, `${standardMarker} 标准模式请求`);
+      const standardRequest = await waitFor(
+        async () => {
+          const state = await fixtures.state();
+          const matches = requestsForMarker(state, standardMarker);
+          return matches.length > 0 ? matches[0] : undefined;
+        },
+        { timeoutMs: 90_000, intervalMs: 500, label: 'standard-preset model request' },
+      );
+      const standardTools = standardRequest.tools;
+      reporter.check(
+        'standard-preset model request has mcp__<key>__echo and mcp__<key>__fail in tools[]',
+        standardTools.includes(`mcp__${serverKey}__echo`) && standardTools.includes(`mcp__${serverKey}__fail`),
+        `${standardTools.length} tools, MCP: ${standardTools.filter((name) => name.startsWith('mcp__')).join(', ')}`,
+      );
+      await ui.waitForBodyText(page, `fixture-llm: standard-${RUN_ID}`);
+
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'minimal');
+      await ui.sendMessage(page, `${minimalMarker} 极简模式请求`);
+      const minimalRequest = await waitFor(
+        async () => {
+          const state = await fixtures.state();
+          const matches = requestsForMarker(state, minimalMarker);
+          return matches.length > 0 ? matches[0] : undefined;
+        },
+        { timeoutMs: 90_000, intervalMs: 500, label: 'minimal-preset model request' },
+      );
+      reporter.check(
+        'minimal-preset model request carries none of the MCP tools',
+        !minimalRequest.tools.some((name) => name.startsWith(`mcp__${serverKey}__`) || name.startsWith('mcp__')),
+        `${minimalRequest.tools.length} tools: ${minimalRequest.tools.join(', ')}`,
+      );
+      reporter.check(
+        'minimal-preset request is a strict subset of the standard tool catalog',
+        minimalRequest.tools.length < standardTools.length,
+        `${minimalRequest.tools.length} vs ${standardTools.length}`,
+      );
+      await ui.waitForBodyText(page, `fixture-llm: minimal-${RUN_ID}`);
+
+      const diagnosticsPayload = await api.agents();
+      const standardAgents = diagnosticsPayload.agents.filter((agent) => agent.preset === 'standard');
+      const minimalAgents = diagnosticsPayload.agents.filter((agent) => agent.preset === 'minimal');
+      reporter.check(
+        'GET /agents exposes the server only on the standard-preset agent',
+        standardAgents.some((agent) => agent.servers.includes(serverKey) && agent.tools.includes(`mcp__${serverKey}__echo`)) && minimalAgents.some((agent) => agent.servers.length === 0 && agent.tools.length === 0),
+        `standard: ${JSON.stringify(standardAgents.map((agent) => agent.tools.length))}, minimal: ${JSON.stringify(minimalAgents.map((agent) => agent.tools.length))}`,
+      );
+    });
+
+    await reporter.step('tool call round-trip: model -> MCP fixture -> tool result -> model', async () => {
+      const toolMarker = `E2E-TOOL-${RUN_ID}`;
+      const echoArgument = `fixture-echo-${RUN_ID}`;
+      const state = await fixtures.state();
+      await fixtures.configure({
+        ...state.config,
+        markers: [
+          ...(state.config.markers ?? []).filter((rule) => !String(rule.match).includes(toolMarker)),
+          { match: toolMarker, reply: { kind: 'tool', toolName: `mcp__${serverKey}__echo`, arguments: { text: echoArgument } } },
+        ],
+      });
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'standard');
+      await ui.sendMessage(page, `${toolMarker} 请调用 MCP echo 工具`);
+
+      const followUp = await waitFor(
+        async () => {
+          const current = await fixtures.state();
+          const matches = requestsForMarker(current, toolMarker);
+          const withResult = matches.find((request) => (request.toolResultTexts ?? []).some((text) => text.includes(`echo: ${echoArgument}`)));
+          return withResult ?? undefined;
+        },
+        { timeoutMs: 120_000, intervalMs: 500, label: 'the model request that contains the MCP tool result' },
+      );
+      reporter.check(
+        'the fixture echo tool actually ran and its output was sent back to the model',
+        followUp.toolResultTexts.some((text) => text.includes(`echo: ${echoArgument}`)),
+        followUp.toolResultTexts.map((text) => text.slice(0, 80)).join(' | '),
+      );
+      const assistantToolCalls = (followUp.messages ?? []).flatMap((message) => message.tool_calls ?? []);
+      reporter.check(
+        'the tool call named the plugin public tool name mcp__<key>__echo',
+        assistantToolCalls.some((call) => call.name === `mcp__${serverKey}__echo`),
+        assistantToolCalls.map((call) => call.name).join(', '),
+      );
+      reporter.check('tool result travelled as an OpenAI role=tool message', (followUp.messages ?? []).some((message) => message.role === 'tool'));
+      await ui.waitForBodyText(page, `fixture-llm: tool-result-${RUN_ID}`);
+
+      const after = await api.agents();
+      reporter.check(
+        'after the tool call the standard agent still exposes both MCP tools',
+        after.agents.some((agent) => agent.preset === 'standard' && agent.tools.includes(`mcp__${serverKey}__echo`)),
+      );
+    });
+
+    reporter.check(
+      'no browser console errors or page errors for the whole UI pass',
+      diagnostics.consoleErrors.length === 0 && diagnostics.pageErrors.length === 0,
+      redact([...diagnostics.consoleErrors, ...diagnostics.pageErrors].slice(0, 3).join(' | ')),
+    );
+  } catch (error) {
+    reporter.check('E2E scenario completed without an unexpected error', false, redact(error instanceof Error ? `${error.message}` : String(error)));
+    const logs = await collectFailureEvidence({ dsh, fixtures, diagnostics, page });
+    if (logs !== '') process.stdout.write(`\n--- failure evidence ---\n${redact(logs)}\n--- end evidence ---\n`);
+  } finally {
+    await finish({ before, dsh, fixtures, page, diagnostics, screenshotArtifacts });
+  }
+}
+
+/**
+ * Screenshot publishing and cleanup:
+ *  - copy the three sanitized screenshots into docs/screenshots (< 400 KiB each);
+ *  - close the browser, stop both scopes, delete the run directory;
+ *  - verify no scopes/processes/listeners/files remain;
+ *  - verify production MainPID/cgroup are untouched.
+ */
+async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
+  const clean = FLAGS.keep !== true;
+  if (clean) {
+    await guard('close browser', async () => {
+      if (page !== null && page !== undefined) await page.context().close().catch(() => {});
+      if (resources.browser !== null) await resources.browser.close().catch(() => {});
+      resources.browser = null;
+    });
+    await guard('stop the isolated DSH scope', async () => {
+      if (resources.dsh !== null) await resources.dsh.stop();
+      resources.dsh = null;
+    });
+    await guard('stop the fixture scope', async () => {
+      if (resources.fixtures !== null) await resources.fixtures.stop();
+      resources.fixtures = null;
+    });
+  }
+
+  // Publish screenshots only from a fully successful UI pass (the caller has
+  // already recorded failures; a missing artifact is a failure, not silence).
+  await reporter.step('publish sanitized screenshots to docs/screenshots', async () => {
+    const wanted = ['mcp-manager-list.png', 'mcp-manager-sidebar.png', 'mcp-manager-error-detail.png', 'mcp-manager-form-presets.png'];
+    const published = [];
+    for (const name of wanted) {
+      const source = screenshotArtifacts.find((file) => basename(file) === name);
+      if (source === undefined || !existsSync(source)) throw new Error(`missing screenshot artifact ${name}`);
+      const { size } = await stat(source);
+      if (size > 400 * 1024) throw new Error(`screenshot ${name} is ${formatBytes(size)}, over the 400 KiB budget`);
+      await mkdir(DOCS_SCREENSHOT_DIR, { recursive: true });
+      const target = join(DOCS_SCREENSHOT_DIR, name);
+      await copyFile(source, target);
+      published.push(`${name} (${formatBytes(size)})`);
+    }
+    reporter.check('four sanitized screenshots published under docs/screenshots', published.length === 4, published.join(', '));
+  });
+
+  if (clean) {
+    await guard('delete the test DSH_HOME and artifacts', async () => {
+      await rm(RUN_DIR, { recursive: true, force: true });
+    });
+    await reporter.step('residue proof: no scopes, processes, listeners or files left behind', async () => {
+      const scopes = listScopes(`mcp-e2e-${RUN_ID}`);
+      reporter.check('no transient systemd scope of this run remains', scopes.length === 0, scopes.join(', '));
+
+      const runProcesses = findProcessesMentioning([RUN_DIR, RUN_ID, PROFILE_NAME]);
+      reporter.check('no process mentions the test run id or its paths', runProcesses.length === 0, runProcesses.slice(0, 3).join(' | '));
+
+      const ports = [dsh?.port, fixtures?.fakeLlmPort, fixtures?.mcpPort].filter((port) => Number.isInteger(port));
+      const open = [];
+      for (const port of ports) if (!(await portClosed(port))) open.push(port);
+      reporter.check('all test TCP ports are closed', open.length === 0, open.length === 0 ? `checked ${ports.join(', ')}` : `still listening: ${open.join(', ')}`);
+
+      reporter.check('the test DSH_HOME/run directory is gone', !existsSync(RUN_DIR), RUN_DIR);
+    });
+  } else {
+    reporter.log(`\n--keep: leaving the run for debugging`);
+    reporter.log(`  run dir:   ${RUN_DIR}`);
+    reporter.log(`  dsh log:   ${dsh?.logPath ?? '(none)'}`);
+    reporter.log(`  fixtures log: ${fixtures?.logPath ?? '(none)'}`);
+    reporter.log(`  scopes:    ${[...listScopes(`mcp-e2e-${RUN_ID}`), ...listScopes(`mcp-e2e-run-${RUN_ID}`)].join(', ') || '(none)'}`);
+    reporter.log('  (the authenticated URL token is only in the dsh log; do not share it)');
+    reporter.log(`  stop manually: systemctl stop mcp-e2e-${RUN_ID}-dsh.scope mcp-e2e-${RUN_ID}-fixtures.scope; rm -rf ${RUN_DIR}`);
+  }
+
+  await reporter.step('production instance untouched (PID, cgroup, no test processes)', async () => {
+    const after = snapshotProduction();
+    reporter.log(`production after:  ${describeSnapshot(after)}`);
+    reporter.check('production dsh-web.service MainPID unchanged', before.mainPid === after.mainPid && after.mainPid > 0, `${before.mainPid} -> ${after.mainPid}`);
+    reporter.check('production dsh-web.service still active', after.activeState === 'active', `${after.activeState}/${after.subState}`);
+    const foreign = after.entries.filter((entry) => [RUN_DIR, RUN_ID, 'mcp-e2e-'].some((marker) => entry.cmdline.includes(marker)));
+    reporter.check('no test process is charged to the production cgroup', foreign.length === 0, foreign.map((entry) => `${entry.pid} ${entry.cmdline.slice(0, 80)}`).join(' | '));
+    reporter.check('production cgroup stays below its MemoryMax', !Number.isFinite(after.memoryMax) || after.memoryCurrent < after.memoryMax, `${formatBytes(after.memoryCurrent)} / ${formatBytes(after.memoryMax)}`);
+    reporter.log(`production memory delta: cgroup memory.current ${formatBytes(after.memoryCurrent - before.memoryCurrent)}, PSS ${formatBytes(after.pss - before.pss)}`);
+  });
+
+  cleanupDone = true;
+  const passed = reporter.summary();
+  process.exitCode = passed ? 0 : 1;
+}
+
+/** Run one cleanup action; a failure becomes a failed check, never a throw. */
+async function guard(name, action) {
+  try {
+    await action();
+    return true;
+  } catch (error) {
+    reporter.check(`cleanup: ${name}`, false, redact(error instanceof Error ? error.message : String(error)));
+    return false;
+  }
+}
+
+async function collectFailureEvidence({ dsh, fixtures, diagnostics, page }) {
+  const parts = [];
+  if (dsh !== null && dsh !== undefined) parts.push(`dsh log tail:\n${redact(tailFileSync(readFileSync, dsh.logPath, 6000))}`);
+  if (fixtures !== null && fixtures !== undefined) {
+    parts.push(`fixtures stderr tail:\n${redact(tailFileSync(readFileSync, fixtures.errPath, 3000))}`);
+  }
+  if (diagnostics !== null && diagnostics !== undefined) {
+    if (diagnostics.consoleErrors.length > 0) parts.push(`console errors:\n${redact(diagnostics.consoleErrors.slice(0, 10).join('\n'))}`);
+    if (diagnostics.pageErrors.length > 0) parts.push(`page errors:\n${redact(diagnostics.pageErrors.slice(0, 10).join('\n'))}`);
+    if (diagnostics.failedRequests.length > 0) parts.push(`failed requests:\n${redact(diagnostics.failedRequests.slice(0, 10).join('\n'))}`);
+  }
+  if (page !== null && page !== undefined) {
+    try {
+      const body = await page.locator('body').innerText({ timeout: 2000 });
+      parts.push(`page body tail:\n${redact(body.slice(-2500))}`);
+    } catch {
+      // browser already gone
+    }
+  }
+  return parts.join('\n\n');
+}
+
+// ── small process/port/net helpers ─────────────────────────────────────────
+
+function freePort() {
+  return new Promise((resolvePort, reject) => {
+    const server = createServer();
+    server.unref();
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address !== null ? address.port : 0;
+      server.close(() => resolvePort(port));
+    });
+  });
+}
+
+function portClosed(port) {
+  return new Promise((resolveClosed) => {
+    const socket = connect({ host: '127.0.0.1', port });
+    const done = (closed) => {
+      socket.destroy();
+      resolveClosed(closed);
+    };
+    socket.setTimeout(1200);
+    socket.once('connect', () => done(false));
+    socket.once('timeout', () => done(true));
+    socket.once('error', () => done(true));
+  });
+}
+
+function findProcessesMentioning(needles) {
+  const hits = [];
+  let entries;
+  try {
+    entries = readdirSync('/proc', { withFileTypes: true });
+  } catch {
+    return hits;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const pid = Number.parseInt(entry.name, 10);
+    if (pid === process.pid) continue;
+    try {
+      const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replaceAll('\0', ' ').trim();
+      if (cmdline !== '' && needles.some((needle) => needle !== undefined && cmdline.includes(needle))) hits.push(`${pid} ${cmdline.slice(0, 200)}`);
+    } catch {
+      // process exited while scanning
+    }
+  }
+  return hits;
+}
+
+// Keep the promise rejection surface explicit: an unexpected throw inside
+// finish() must still print a FAIL summary and a non-zero exit code.
+main().catch(async (error) => {
+  reporter.check('runner finished without an internal error', false, redact(error instanceof Error ? `${error.message}\n${error.stack ?? ''}` : String(error)));
+  if (!cleanupDone) {
+    await guard('emergency cleanup', async () => {
+      for (const resource of [resources.dsh, resources.fixtures]) if (resource !== null) await resource.stop();
+      if (resources.browser !== null) await resources.browser.close();
+    });
+  }
+  reporter.summary();
+  process.exitCode = 1;
+});

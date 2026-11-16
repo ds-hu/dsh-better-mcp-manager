@@ -3,6 +3,10 @@
 **MCP 管理 / MCP Manager** — manage MCP servers from the DeepSeek Harness Web GUI, and decide
 per agent preset whose tools each server hands out.
 
+<p align="center">
+  <img src="docs/screenshots/mcp-manager-sidebar.png" alt="The browser page with MCP 管理 in the sidebar directly below 自动化任务; the page lists three server cards in different states" width="860">
+</p>
+
 <p>
   <a href="LICENSE"><img alt="license: MIT" src="https://img.shields.io/badge/license-MIT-2E7DD1"></a>
   <a href="README.zh-CN.md">中文</a>
@@ -30,15 +34,19 @@ applies to live agents as soon as you save.
 - **CRUD + enable/disable** for MCP servers. A disabled server keeps its settings and status, and
   can be re-enabled in one click.
 - **Three transports**: HTTP (Streamable HTTP), SSE, and 内置 / stdio (a local command).
-- **Custom headers** for HTTP/SSE, and **OAuth 设置**: no auth, a static bearer token, or the
-  client-credentials grant.
+- **Custom headers** for HTTP/SSE, and **OAuth**: Disabled, a static Bearer token, or Client
+  credentials.
 - **Groups and icons** for the list; ungrouped servers are shown last as 其他（未分组）.
-- **Live status**: connected / connecting / retrying / error / disabled, tool count, last error with
-  a 详情 dialog containing the full message and detail.
+- **Live status**: Connected / Connecting / Retrying / Connection failed / Disabled, tool count, last
+  error with a 详情 dialog containing the full message and detail.
 - **Per-server preset exposure**: 全部预设 or 指定预设 with checkboxes for the presets the Host
   offers.
 - **Test connection** on an unsaved draft before saving it.
 - **Per-server tool timeout**, default 60 seconds.
+
+<p align="center">
+  <img src="docs/screenshots/mcp-manager-list.png" alt="Mixed-state server list: 已连接 · 内置 · 工具 2/2, 已停用 · HTTP, and 重连中 · HTTP · 工具 0/0 with an error bubble" width="820">
+</p>
 
 ## Install
 
@@ -90,6 +98,10 @@ Each server has a **预设暴露** section:
 - **全部预设** — every agent, including agents without a preset id;
 - **指定预设** — only the checked presets. An empty selection is legal and exposes the server to
   nobody.
+
+<p align="center">
+  <img src="docs/screenshots/mcp-manager-form-presets.png" alt="The edit form's 预设暴露 section: 全部预设 or 指定预设 radio cards, with 标准模式 ticked" width="760">
+</p>
 
 Tools are registered on the agent when it is created, and live agents are re-bound when you save a
 server or toggle it, so an open session gets the tools without a restart. A session that has not
@@ -143,9 +155,11 @@ npx -y @ds-hu/dsh-better-mcp-manager clean --yes
 ```
 
 From a checkout, the same command is `node bin/mcp-manager.mjs clean --yes`. The manual equivalent
-is `rm -rf "$DSH_HOME/better-mcp-manager"`. Nothing else is written, so there are no profile edits,
-services or timers to clean up. Reload the page afterwards: a page that was already open remembers
-the old sidebar entry until it reloads.
+is `rm -rf "$DSH_HOME/better-mcp-manager"`. The remove command drops the dependency and the bundle
+row itself, so nothing is left in the profile: no install scripts ran, and there are no services or
+timers to clean up. `clean` is the only remaining step, and only because the server list is yours to
+keep or delete. Reload the page afterwards: a page that was already open remembers the old sidebar
+entry until it reloads.
 
 `clean` **requires `--yes`** — without it the command refuses and exits non-zero, so it is safe to
 run by accident. It also refuses any directory that is not a `better-mcp-manager` data directory,

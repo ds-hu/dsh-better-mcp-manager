@@ -178,8 +178,9 @@ and never adding a server writes nothing.
 
 The resolver understands one test/scratch override: `DSH_MCP_MANAGER_DATA_DIR` (absolute path) wins
 over `$DSH_HOME`; without either, the directory is `~/.dsh/better-mcp-manager`. The directory is
-**per DSH home, not per profile**: two profiles under the same `$DSH_HOME` share one server list and
-its connections are started by whichever Host mounts the plugin. The Host and the
+**per DSH home, not per profile**: two profiles under the same `$DSH_HOME` share one server list.
+Each Host process that mounts the plugin keeps its own connections against that shared list and
+neither instance coordinates with the other beyond the atomic file replace. The Host and the
 `bin/mcp-manager.mjs` CLI use the same resolver, so `clean` and `status` always target the directory
 the Host would use for the same environment. `test/mount-check.mjs` asserts the default resolution
 and the override.
@@ -371,6 +372,12 @@ dictionaries are checked key-by-key by `test/client-smoke.mjs`. The `locale/en.j
 reads without activating the plugin. The sidebar label and page title are **MCP 管理** in Chinese and
 **MCP Manager** in English.
 
+Sanitized screenshots of the shipped UI live in `docs/screenshots/`: the
+[sidebar placement](screenshots/mcp-manager-sidebar.png), the
+[mixed-state list](screenshots/mcp-manager-list.png), the
+[preset-exposure form section](screenshots/mcp-manager-form-presets.png) and the
+[连接错误 详情 dialog](screenshots/mcp-manager-error-detail.png). The README embeds the first three.
+
 ## Lifecycle and dispose
 
 Mount creates nothing on disk and starts no work for disabled servers. The Host half owns one
@@ -415,6 +422,15 @@ schema version, the server count and one line per server; it exits 1 when the st
 `path` prints the directory. Neither read command writes anything, and none of them need the Host
 running. The manual equivalent is `rm -rf "$DSH_HOME/better-mcp-manager"`.
 
+**Verified on a throwaway profile** (not the production home): installing the packed tarball with
+`dsh plugin --profile <t> add <tgz>` and booting it writes only the data directory when a server is
+created (`0700` directory, `0600` file); `dsh plugin --profile <t> remove
+@ds-hu/dsh-better-mcp-manager` removes the dependency, the `dsh.profile.bundles` row and the
+`node_modules` entry itself, leaves no `.better*` residue in the profile, and the profile boots again
+without a dangling-bundle error. `bin/mcp-manager.mjs clean --yes` then removes the data directory
+entirely. No install scripts run, no service or timer is created, and `$DSH_HOME/storages` and
+`.plugin-manager` never carry this plugin's name.
+
 Two honest caveats:
 
 1. **Open pages keep a dead sidebar entry until the browser reloads.** The client unregisters its
@@ -429,8 +445,9 @@ Two honest caveats:
 
 ```bash
 npm run lint        # eslint over the shipped sources and tests
-npm test            # unit + mount + client smoke
-npm run test:pack   # what npm publish would upload
+npm test            # 128 unit tests + 24 mount checks + 19 client-smoke checks
+npm run test:pack   # the 9-check `npm pack --dry-run` audit (33 files)
+npm run check       # all of the above; the same gate prepublishOnly runs
 npm run e2e         # isolated DSH instance + Playwright (opt-in, see below)
 ```
 
@@ -447,7 +464,7 @@ npm run e2e         # isolated DSH instance + Playwright (opt-in, see below)
 | `test/mount-check.mjs` | patch row id = Host `name`, exports and `bin` resolve, locale metadata and icon present, no `@deepseek-ai/*` import in `lib/`/`bin/`, no profile/absolute-path writes, data-dir resolver, frozen constants |
 | `test/client-smoke.mjs` | `lib/client.js` runs in a `vm` with a fake `window.__ModuleLoader__` + React: exactly the two slots and their ids/orders, zh/en dictionaries cover the same non-empty keys, no foreign API paths or imports, one owned `<style>` removed on dispose, every timer cleared |
 | `test/package.mjs` | `npm pack --dry-run` audit: the `files` list covers every runtime artefact (bin/lib/locale/icon/docs/legal) and excludes tests/dev config; dependency and lifecycle-script rules |
-| `test/e2e/run.mjs` | real page in a throwaway DSH instance, fixture MCP servers (stdio + Streamable HTTP), a fake OpenAI-compatible endpoint recording the tool schemas it receives: CRUD, live status/tool counts, connection failure + 详情, preset scoping, tool execution |
+| `test/e2e/run.mjs` | 55 checks in about 2.5 minutes: boot (fresh `web` profile + the real packed tarball in transient systemd scopes, authenticated URL), bundle (sidebar row directly below 自动化任务, page opens without console/page errors), CRUD (stdio + HTTP servers, live tool counts, wrong-port 连接失败 + 详情, edit-to-recover, enable round-trip, delete), scoping (fake OpenAI-compatible provider: `mcp__<key>__echo` present for a standard-preset session and absent for a minimal-preset session, plus a scripted tool-call round-trip), hygiene (cleanup of scopes/processes/files/ports, production MainPID/cgroup untouched) |
 
 The unit suites are offline and finish in seconds; they need no Host. `test/e2e/fixture-selftest.mjs`
 is a standalone check that drives the fixture MCP servers with the same `@modelcontextprotocol/client`
@@ -455,9 +472,14 @@ version the plugin depends on — run it directly after changing a fixture or th
 live in `test/fixtures/`: a stdio MCP server with echo/fail tools and instructions, a Streamable HTTP
 MCP server with add/echo/fail tools and instructions, and a fake OpenAI-compatible endpoint that
 records every request (notably `tools[].function.name` and the messages) and can answer with a scripted
-tool call. The e2e suite is the only one that boots DSH: it uses a fresh `$DSH_HOME` and profile in its
-own systemd scope on a free port, and never touches the user's running instance or `/root/.dsh`. That
-isolation is a property of the test harness, not of the plugin.
+tool call. The e2e suite is the only one that boots DSH: it uses a fresh `$DSH_HOME` and profile under
+`/var/tmp`, runs the runner, the test DSH and the fixtures in transient systemd scopes (`MemoryMax=1G`
+for the runner/DSH, `256M` for the fixtures, `MemorySwapMax=0`), installs the real packed tarball, and
+never touches the user's running instance or `/root/.dsh`. On success it publishes four sanitized
+screenshots to `docs/screenshots/`. `--keep` leaves the scopes and the run directory for debugging;
+`--verbose` adds step logging. It is opt-in — not part of `npm run check` — and needs Playwright with
+Chromium plus registry access for the profile install. That isolation is a property of the test
+harness, not of the plugin.
 
 ## Failure modes
 
@@ -501,7 +523,9 @@ than a silent success.
 - **Per-session exposure.** Exposure is decided per agent preset, not per session or per message.
 - **A CRUD CLI.** `bin/mcp-manager.mjs` is maintenance only (`status`, `path`, `clean`); server
   management is the Web page and its HTTP API.
-- **Tool-level permission mapping.** Tools run under the calling agent's existing permissions; the
-  manager adds no approval layer and no sandbox of its own.
+- **Tool-level permission mapping.** The manager adds no approval layer and no sandbox of its own:
+  a tool call is dispatched to the connected server, and the Host's own tool-execution and
+  permission path decides what is allowed. A stdio server runs as a child of the Host, with the
+  Host user's privileges.
 - **Multiple connections per server, load balancing or health probing beyond the one supervisor.**
   One enabled server means one connection.

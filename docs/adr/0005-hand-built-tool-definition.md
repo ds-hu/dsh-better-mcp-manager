@@ -26,8 +26,8 @@ unsupported-content diagnostic) follows the established behavior of
 `@deepseek-ai/dsh-mcp-client`, adapted for this plugin's single-connection model and credited in
 [NOTICE](../../NOTICE).
 
-`test/mount-check.mjs` enforces the rule by scanning `lib/` for `@deepseek-ai/` imports; a violation
-fails the test suite.
+`test/mount-check.mjs` enforces the rule by scanning the shipped `lib/` and `bin/` sources for
+`@deepseek-ai/` imports; a violation fails the test suite.
 
 ## Consequences
 

@@ -23,9 +23,9 @@ A **preset binder** (`lib/presets.js`) listens for `agent/created` (and `agent-p
 before an agent's first turn), resolves the agent's composed preset id, and registers the tools of
 every server whose `presets` field allows that id onto `agent.ctx`. `presets: "all"` means every
 agent, including agents without a preset id. Server `instructions` are added as one
-`systemPrompt.section` per server on the same `agent.ctx`. When the configuration changes or the
-plugin mounts, already-live agents are re-bound; on `agent/disposed`, every registration for that
-agent is released.
+`systemPrompt.section` per server on the same `agent.ctx`; a connected server with no discovered
+tools contributes no tools and no prompt text. When the configuration changes or the plugin mounts,
+already-live agents are re-bound; on `agent/disposed`, every registration for that agent is released.
 
 ## Consequences
 
@@ -40,7 +40,8 @@ agent is released.
 - **The preset roster is read from the Host** (`ctx.agentPresets`), so a profile may invent its own
   presets and the UI still lists them. Unknown preset ids are rejected at save time with the
   current roster in the error.
-- **A preset switch after the first turn is not re-bound** in 0.1.0; DSH fixes an agent's preset
-  once the first turn starts, and the binder deliberately does not fight that.
+- **Preset selection is re-bound only for a blank session.** The Host announces
+  `agent-preset/selected` before a session's first turn; once the first turn starts the preset is
+  fixed, so there is no later switch for the binder to apply.
 - **One connection is shared by all agents.** The MCP client is connected once per enabled server;
   agents get tool definitions that call into that connection.
