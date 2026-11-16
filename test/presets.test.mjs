@@ -56,6 +56,7 @@ function harness({
   agents = [],
   withTools = true,
   withSystemPrompt = true,
+  withApproval = true,
 } = {}) {
   const registered = [];
   const removed = [];
@@ -81,8 +82,17 @@ function harness({
     },
   };
 
+  const approvalRequests = [];
+  const approval = {
+    request: async (input) => {
+      approvalRequests.push(input);
+      return 'allowed-once';
+    },
+  };
   const hostCtx = {
     get(name) {
+      if (name === 'approval') return withApproval ? approval : undefined;
+      if (name === 'permissionPresets') return withApproval ? { current: () => 'standard' } : undefined;
       if (name === 'agentPresets') {
         return {
           composedPreset(agentCtx) {
@@ -128,6 +138,7 @@ function harness({
     sectionRemoved,
     sectionOrders,
     callToolCalls,
+    approvalRequests,
     presets,
     agents,
   };
@@ -371,4 +382,41 @@ test('presets: refreshSoon coalesces a burst into one rebind pass', async () => 
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(registered.length, 1, 'three notifications must cause one bind');
   assert.equal(exposure.list().length, 1);
+});
+
+test('presets: disabled tools are never registered and an all-disabled server contributes nothing', () => {
+  const mixed = harness({
+    servers: [server({ toolOverrides: { beta: { enabled: false }, gamma: { approval: true } } })],
+    connections: new Map([['srv_alpha', connection({ tools: [tool('alpha'), tool('beta'), tool('gamma')], instructions: 'Use these tools.' })]]),
+  });
+  mixed.exposure.bindAgent(mixed.agent());
+  assert.deepEqual(mixed.registered.map((definition) => definition.name), ['mcp__alpha__alpha', 'mcp__alpha__gamma'], 'only enabled tools are registered');
+  assert.deepEqual(mixed.exposure.list(), [{ sessionId: 'sess-1', preset: undefined, servers: ['alpha'], tools: ['mcp__alpha__alpha', 'mcp__alpha__gamma'] }]);
+  assert.equal(mixed.sections.length, 1, 'the server still contributes its instructions for its remaining tools');
+
+  const allDisabled = harness({
+    servers: [server({ toolOverrides: { alpha: { enabled: false } } })],
+    connections: new Map([['srv_alpha', connection({ tools: [tool('alpha')], instructions: 'Use these tools.' })]]),
+  });
+  allDisabled.exposure.bindAgent(allDisabled.agent());
+  assert.deepEqual(allDisabled.registered, [], 'no disabled tool may leak to an agent');
+  assert.deepEqual(allDisabled.sections, [], 'a server with no exposed tools contributes no prompt section');
+  assert.deepEqual(allDisabled.exposure.list(), [{ sessionId: 'sess-1', preset: undefined, servers: [], tools: [] }]);
+});
+
+test('presets: approvalRequired is passed into the registered tool definition', async () => {
+  const gated = harness({ servers: [server({ toolOverrides: { echo: { approval: true } } })] });
+  gated.exposure.bindAgent(gated.agent());
+  assert.equal(gated.registered.length, 1);
+  const exec = { agent: { session: { id: 'sess-1' } }, name: 'mcp__alpha__echo' };
+  await gated.registered[0].execute({}, exec);
+  assert.equal(gated.approvalRequests.length, 1, 'a tool marked for approval asks before the MCP call');
+  assert.equal(gated.approvalRequests[0].agent, exec.agent);
+  assert.deepEqual(gated.callToolCalls, [['srv_alpha', 'echo', {}, exec]], 'the MCP call still happens after approval');
+
+  const plain = harness();
+  plain.exposure.bindAgent(plain.agent());
+  await plain.registered[0].execute({}, exec);
+  assert.equal(plain.approvalRequests.length, 0, 'a tool without the override does not ask');
+  assert.equal(plain.callToolCalls.length, 1);
 });

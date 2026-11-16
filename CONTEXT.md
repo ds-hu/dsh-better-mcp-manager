@@ -32,7 +32,8 @@ The transport is editable; `http` and `sse` use `url`, `stdio` uses `command`, `
 ### Status
 
 The **live, derived state** of one server: `disabled`, `connecting`, `connected`, or `error`, plus
-`toolCount`, `discoveredCount`, `instructionsBytes`, `error`, `attempts`, `connectedAt`,
+`toolCount` and `discoveredCount` (the same discovered total), `enabledToolCount` (tools not
+disabled by a per-tool override), `instructionsBytes`, `error`, `attempts`, `connectedAt`,
 `lastAttemptAt`, `nextRetryAt`. There is no separate `retrying` state: a scheduled retry keeps the
 state `error` with `nextRetryAt` set, and the page presents that as **重连中**. Status is never
 stored: after a restart a server is `connecting` again until it succeeds, and a disabled server
@@ -96,8 +97,44 @@ name is the only name sent on the MCP wire; the public name is never parsed back
 the raw name are unchanged, the public name is stable — session history and permission rules depend
 on that.
 
+A tool also carries two operator settings, stored per server and edited in the **工具** tab:
+**enabled** (default) and **approval** (default off). Disabled tools are never registered for any
+agent; a tool with approval asks before a call outside a full-access session. See
+[Tool settings](#tool-settings) and [Approval](#approval).
+
 A **live agent** is an agent currently mounted in the Host. Its tool list is the union of its
-preset's native tools and the MCP tools exposed to it.
+preset's native tools and the enabled MCP tools exposed to it.
+
+### Tool settings
+
+The operator's per-tool choices on a server record:
+
+- `toolOverrides` — a map keyed by the **raw** MCP tool name. Only deviations from the defaults are
+  stored: `{ "enabled": false }` hides a tool, `{ "approval": true }` makes it ask. An override that
+  just restates the default is stripped, so the map stays empty for a server nobody configured.
+- `toolCache` — the last discovered descriptors (`{ at, tools: [{ name, publicName, description,
+  params }] }`, description ≤ 2000 chars) written when the server answers `tools/list` and when the
+  **工具** tab reads a connected server. It lets the tab work offline and is descriptors only — never
+  headers, tokens or other credentials.
+
+Both are changed only through `GET`/`PUT /servers/:id/tools`; save drafts drop them. The **工具** tab
+shows one card per tool (description, parameter chips, enable switch, **需要审批** switch), the
+**保存工具设置** footer writes the batch and re-binds live agents.
+
+### Approval
+
+A per-tool preference (`approval: true`, UI **需要审批**) meaning "ask before this call in restricted
+modes". It is not a replacement for the Host's permission system. At call time the tool body reads
+the calling session's permission preset through `permissionPresets.current(agent.session)`:
+
+- exactly `danger-full-access` (UI **完全权限**) — the call proceeds without asking;
+- every other preset — ask the Host approval service once: `allowed-once` proceeds,
+  `rejected`/`cancelled`/`unavailable` fail the call, and a missing approval service, permission
+  service, agent or execution context denies rather than silently allows. The MCP server is not
+  contacted unless approval was granted.
+
+The DSH UI presents that request as the **等待审批** composer with **拒绝 / 允许一次** and the reason
+`MCP 工具 "mcp__<key>__<tool>" 需要审批（当前不是完全权限）`.
 
 ### OAuth settings
 
@@ -105,7 +142,7 @@ Per-server authentication beyond custom headers: `none`, `bearer` (a static toke
 `Authorization: Bearer` header unless a custom `Authorization` header already exists — custom
 headers win), or `client_credentials` (fetch a token from `tokenUrl` with `clientId`,
 `clientSecret`, `scope`, cache it until `expires_in - 60s`, retry once on a 401). There is no
-authorization-code flow in 0.2.0. Secrets are stored in the data file, never written to logs.
+authorization-code flow in 0.3.0. Secrets are stored in the data file, never written to logs.
 
 ### Store and data directory
 
@@ -114,7 +151,7 @@ One JSON document plus uploaded icon files in one directory:
 ```
 $DSH_HOME/better-mcp-manager/     mode 0700
 ├── servers.json                  mode 0600, atomic replace
-│   { "version": 2, "servers": [ ... ] }
+│   { "version": 3, "servers": [ ... ] }
 └── icons/                        mode 0700, created on the first upload
     └── <server id>.<ext>         mode 0600, exactly one file per server
 ```
@@ -123,9 +160,10 @@ The directory is created when the plugin mounts; `servers.json` appears on the f
 `icons/` on the first upload. It is **per DSH home, not per profile**: profiles under the same
 `$DSH_HOME` share one list. `DSH_MCP_MANAGER_DATA_DIR` overrides the location (test/scratch use; the
 CLI resolves it the same way). The store is the only source of truth for servers; live status is
-derived and recomputed. A schema-version-1 file (0.1.0 emoji strings) is migrated in memory on load
-and rewritten as version 2 by the next save. The **clean** CLI is what deletes this directory,
-including `icons/`.
+derived and recomputed. A schema-version-1 or -2 file is migrated **in memory** on load (legacy
+emoji-string icons become `{ kind: "auto" }`; missing tool settings become `{}` / `null`) and is
+rewritten as version 3 by the next save, never by a read. The **clean** CLI is what deletes this
+directory, including `icons/`.
 
 ## Invariants
 
@@ -144,12 +182,22 @@ including `icons/`.
    per server, not per agent or per session.
 7. **Tool identity is stable**: `mcp__<key>__<rawName>` is a pure function of the immutable key and
    the server's raw tool name. A new key means new tools.
-8. **Exposure is per agent context.** Registering or releasing a tool happens on `agent.ctx`;
-   removing a server must release every registration it made and close its connection.
+8. **Exposure is per agent context and per enabled tool.** Registering or releasing a tool happens on
+   `agent.ctx`; removing a server must release every registration it made and close its connection.
+   A disabled tool is never registered for any agent or preset.
 9. **The icon never comes from a save draft.** `POST`/`PUT /servers` and every other draft path drop
    an `icon` field; the icon changes only through the two icon endpoints, so a save can neither set
    nor clear an uploaded icon by accident.
-10. **Uninstall is two steps and leaves nothing else**: remove the bundle (the code, the row, the
+10. **A server with no enabled tool contributes nothing.** If every discovered tool is disabled, the
+    server contributes neither tool registrations nor its system-prompt instruction section to any
+    agent.
+11. **Approval is skipped exactly in `danger-full-access`.** Any other permission preset asks; a
+    missing approval/permission service, agent or execution context denies the call. Approval is
+    never silently granted, and the MCP server is not called before it is granted.
+12. **Tool settings and the tool cache never come from a save draft.** `POST`/`PUT /servers` ignore
+    `toolOverrides`/`toolCache`; they change only through the tool endpoints, so a save cannot
+    overwrite a per-tool decision or corrupt the cache.
+13. **Uninstall is two steps and leaves nothing else**: remove the bundle (the code, the row, the
     route, the client) and run `clean` for the one directory, which includes `icons/`. Mounting
     without configuring writes no file (the directory itself is created on mount).
 
@@ -157,17 +205,17 @@ including `icons/`.
 
 | Path | Role |
 |---|---|
-| `lib/index.js` | Host plugin entry: `apply(ctx)` / dispose, wires store, manager, binder, API, CLI-independent |
-| `lib/store.js` | data directory resolution, load/save, atomic replace, mode `0600`, schema v1→v2 migration |
-| `lib/model.js` | validation and normalisation of drafts, key allocation, preset predicate, icon normalisation |
+| `lib/index.js` | Host plugin entry: `apply(ctx)` / dispose, wires store, manager, binder, API, tool-cache persistence |
+| `lib/store.js` | data directory resolution, load/save, atomic replace, mode `0600`, serialized `patch`, schema v1/v2→v3 migration |
+| `lib/model.js` | validation and normalisation of drafts, key allocation, preset predicate, icon normalisation, per-tool overrides and cache |
 | `lib/icons.js` | uploaded icons: data-URL decoding, raster magic checks, `icons/` storage (0600), deletion |
-| `lib/mcp.js` | one MCP client per server: transports, OAuth, connect/list/call, backoff, status, auto-icon fetch/cache |
-| `lib/presets.js` | `agent/created` binding, live-agent re-exposure, `systemPrompt.section` instructions |
-| `lib/tool-definition.js` | hand-built `ToolDefinition` for a discovered MCP tool |
-| `lib/result-projection.js` | MCP result → ordered text/image/diagnostic tool result |
-| `lib/api.js` | HTTP router for `/better-mcp-manager/api/*`, including the icon endpoints |
+| `lib/mcp.js` | one MCP client per server: transports, OAuth, connect/list/call, backoff, status counts, auto-icon fetch/cache |
+| `lib/presets.js` | `agent/created` binding, live-agent re-exposure, per-tool enable filtering, `systemPrompt.section` instructions |
+| `lib/tool-definition.js` | hand-built `ToolDefinition` for a discovered MCP tool, approval flag included |
+| `lib/result-projection.js` | MCP result → ordered text/image/diagnostic tool result; restricted-mode approval seam |
+| `lib/api.js` | HTTP router for `/better-mcp-manager/api/*`, including icon and tool endpoints |
 | `lib/http.js` | same-origin JSON guard, 64 KiB body cap (1 MiB for icon uploads), JSON responses |
-| `lib/client.js` | browser half: `sidebar.panellist` entry, `main` page, polling, styles, locale dictionaries |
+| `lib/client.js` | browser half: `sidebar.panellist` entry, `main` page, polling, two form tabs, styles, locale dictionaries |
 | `bin/mcp-manager.mjs` | maintenance CLI: `status` (default), `path`, `clean [--yes]` |
 | `locale/en.json`, `locale/zh.json` | plugin-page metadata (title/description); the page's UI copy lives in `lib/client.js` |
 | `icon.svg` | sidebar artwork and plugin-page icon |
@@ -195,6 +243,10 @@ The plugin is a guest in the Host and uses only public context capabilities:
   `composedPreset(agent.ctx)` for the id an agent runs.
 - **Per-agent registries** — `agent.ctx` tools and `systemPrompt.section` registrations; their
   lifetime is the agent's lifetime.
+- **Approval and permission presets** — only for tools marked **需要审批**:
+  `permissionPresets.current(agent.session)` decides whether the session is full access, and
+  `approval.request(...)` asks once in every other mode. Both are looked up lazily; a profile
+  without them denies approval-required calls instead of failing to load.
 - **Locale** — `ctx.locale.register(NS, { zh, en })`, namespace `mcpManager`, label from
   `t('panel')`.
 - **Cleanup** — every timer, poll, slot, route and `<style>` registration returns a disposer; all of
@@ -224,8 +276,20 @@ The plugin is a guest in the Host and uses only public context capabilities:
   becomes status, not a rollback. The user can fix the URL while the server is failing.
 - **The panel polls `GET /servers` every 2.5 s while mounted** and immediately after every mutation.
   Timers must be cleared on unmount; a leaked timer keeps the browser busy after dispose.
-- **`GET /servers/:id` returns tool names, not tools' schemas.** The detail view exists for
-  diagnostics, not for editing what a server offers.
+- **`GET /servers/:id` returns raw tool names, not schemas.** The detail view is diagnostics; the
+  **工具** tab reads `GET /servers/:id/tools` and never edits a tool's schema.
+- **Disabling a tool is not a page filter.** The tool is absent from registration, so no agent sees
+  it; a server with zero enabled tools also stops contributing its instructions. Do not keep a
+  disabled tool's definition "just in case" — that would expose it.
+- **The tool cache is not the live tool list.** `toolCache` is the last discovered descriptor set,
+  refreshed on connect and on a tab read; while offline it can be stale. Never treat it as proof that
+  the server currently offers those tools.
+- **Approval is opt-in, per tool, and mode-aware.** It is checked inside the tool body on every call;
+  `danger-full-access` skips it, everything else asks. With no approval or permission service the
+  call is denied — never fall back to allowing it, and never contact the MCP server first.
+- **Tool settings are not save-draft fields.** `toolOverrides` and `toolCache` are dropped from
+  drafts; only `PUT /servers/:id/tools` changes them. Treating them as ordinary form fields would
+  let a stale form silently re-enable a disabled tool.
 - **MCP instructions are per server, one system-prompt section each** (`mcp-manager:<key>`), added
   only to agents to which the server is exposed. A server that returns none adds no section, and a
   connected server with zero discovered tools contributes no prompt text at all.

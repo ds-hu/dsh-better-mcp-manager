@@ -3,7 +3,7 @@
 This file is the single source of truth shared by the Host half (`lib/index.js` and friends),
 the Client half (`lib/client.js`) and the tests (`test/`). Change it before changing either side.
 
-Status: **frozen for 0.2.0**. Everything below is what 0.2.0 ships.
+Status: **frozen for 0.3.0**. Everything below is what 0.3.0 ships.
 
 ---
 
@@ -40,6 +40,8 @@ YAML. Everything the user configures lives in one JSON file under
   ],
   "oauth": { "mode": "none" },     // see 2.2
   "icon": { "kind": "auto" },      // see 2.6: auto = MCP server icon else first letter; upload = stored file
+  "toolOverrides": {},             // see 2.7: raw tool name -> { enabled?: false, approval?: true }; absent = enabled, no approval
+  "toolCache": null,               // see 2.7: last discovered tool descriptors, or null before the first successful tools/list
   "color": "blue",                 // one of: blue, violet, teal, green, amber, rose, slate
   "group": "",                     // "" = ungrouped; otherwise 1..60 chars, free text
   "presets": "all",                // "all" | string[] of agent-preset ids (may be [])
@@ -52,7 +54,7 @@ YAML. Everything the user configures lives in one JSON file under
 Store file:
 
 ```jsonc
-{ "version": 2, "servers": [ /* Server records, stable order = list order */ ] }
+{ "version": 3, "servers": [ /* Server records, stable order = list order */ ] }
 ```
 
 Rules enforced before any write (the API answers `400` with `{ ok:false, code, error }`):
@@ -69,10 +71,10 @@ Rules enforced before any write (the API answers `400` with `{ ok:false, code, e
   the message), at most 40 entries.
 - `icon` is not accepted in save drafts: a new server starts `{ "kind": "auto" }`, and the icon is
   changed only through the icon endpoints in §3. `color` from the fixed palette; `group` ≤ 60 chars.
-  A store written by 0.1.0 (schema version 1) is migrated in memory when it is loaded: every legacy
-  string icon becomes `{ "kind": "auto" }`; unknown icons in version 2 are reset to auto. The file is
-  rewritten with `"version": 2` by the next successful write (the plugin never rewrites a file it was
-  only asked to read).
+  A store written by an older build is migrated in memory when it is loaded: version 1 legacy string
+  icons become `{ "kind": "auto" }`; every record from any readable version gets `toolOverrides: {}`
+  and `toolCache: null` when it has no valid value. The file is rewritten with `"version": 3` by the
+  next successful write (the plugin never rewrites a file it was only asked to read).
 - `timeoutMs` integer 1000..600000; `enabled` boolean.
 - Unknown fields are dropped, not stored.
 
@@ -99,8 +101,9 @@ Rules enforced before any write (the API answers `400` with `{ ok:false, code, e
   "serverId": "srv_1f3c9a2b70",
   "state": "disabled",   // "disabled" | "connecting" | "connected" | "error"
   "transportLabel": "HTTP",          // "HTTP" | "SSE" | "内置"
-  "toolCount": 19,                   // discovered tools currently registered on live agents
-  "discoveredCount": 19,             // discovered tools (both numbers equal in 0.1.0)
+  "toolCount": 19,                   // discovered tools on the live connection
+  "enabledToolCount": 17,            // discovered tools the operator has left enabled (contract 2.7)
+  "discoveredCount": 19,             // alias of toolCount, kept for the panel
   "instructionsBytes": 412,
   "error": null,                     // or { "code": "...", "message": "...", "detail": "...", "at": "ISO" }
   "attempts": 0,                     // consecutive failed attempts
@@ -165,6 +168,44 @@ An icon is shown in the card tile; it has exactly two sources:
   an `<img>` and falls back to the first letter when it fails to load.
 - No built-in emoji palette and no emoji string icon: 0.2.0 removed them.
 
+### 2.7 Tool list and per-tool settings
+
+The page can manage the tools one MCP server exposes:
+
+```jsonc
+"toolOverrides": {                 // only non-default entries are stored
+  "file_sharelink_set": { "approval": true },
+  "make_dir": { "enabled": false }
+},
+"toolCache": {                     // refreshed whenever a connected server lists its tools
+  "at": "2026-11-16T21:00:00.000Z",
+  "tools": [{
+    "name": "file_sharelink_set",  // raw MCP wire name
+    "publicName": "mcp__pan__file_sharelink_set",
+    "description": "创建文件分享链接。",   // <= 2000 chars, may be ""
+    "params": [{ "name": "fsid", "required": true }]   // derived from inputSchema.properties/required
+  }]
+}
+```
+
+- Effective setting for a tool: `enabled` unless `toolOverrides[name].enabled === false`;
+  `approval` only when `toolOverrides[name].approval === true`. Forging a default entry is normalized
+  away rather than stored.
+- **Enabled** controls exposure only: a disabled tool is never registered on any agent/preset (and a
+  server with no enabled tool contributes neither tools nor its instruction section). Disabling does
+  not stop `tools/list` from refreshing the cache.
+- **Approval**: `approval: true` means "ask in restricted modes". Before a call, the tool body
+  reads the calling session's permission preset through the Host `permissionPresets` service: when
+  the effective preset is exactly `danger-full-access` (完全权限) the call proceeds without asking;
+  in every other mode it asks the Host `approval` service once (`allowed-once` proceeds; `rejected`,
+  `cancelled` and `unavailable` fail the call with a clear reason). With no approval service, no
+  permission service, or no agent on the execution, the call is denied — never silently allowed.
+- `toolCache` is written by the Host when a connected server answers `tools/list` (and when the page
+  reads the tool list), so the tools tab can still show the last known list while the server is
+  disconnected. It carries descriptors only, never credentials.
+- Tool settings and the cache are not accepted in save drafts; they change only through the tool
+  endpoints in §3. A new server starts with `{}` / `null`.
+
 ## 3. Host HTTP API
 
 Base: `/better-mcp-manager/api`, same-origin only. `kind: 'prefix'` route on `ctx.webServer`.
@@ -189,6 +230,8 @@ Base: `/better-mcp-manager/api`, same-origin only. `kind: 'prefix'` route on `ct
 | POST | `/servers/test` | full server draft (not stored) | `{ ok, status }` — 15s cap, always answers 200 unless the body is invalid |
 | GET | `/servers/:id/icon` | — | image bytes with their `Content-Type`, `ETag` and `Cache-Control: private, max-age=300`; `304` on matching `If-None-Match`; JSON 404 when there is no icon |
 | POST | `/servers/:id/icon` | `{ dataUrl: "data:image/png;base64,..." }` | `{ ok, server }`; stores the decoded image and sets `icon.kind = "upload"` |
+| GET | `/servers/:id/tools` | — | `{ ok, connected, cachedAt, tools }` — live descriptors when connected, otherwise the record cache; each tool carries `name`, `publicName`, `description`, `params`, `enabled`, `approval` |
+| PUT | `/servers/:id/tools` | `{ tools: [{ name, enabled, approval }] }` | `{ ok, server }`; stores only non-default overrides and rebinds live agents |
 | DELETE | `/servers/:id/icon` | — | `{ ok, server }`; deletes the stored file and resets `icon = { kind: "auto" }` |
 | GET | `/presets` | — | `{ ok, presets: [Preset] }` where `Preset = { id, name, description, order }` |
 | GET | `/agents` | — | `{ ok, agents: [{ sessionId, preset, servers: [key], tools: [publicName] }] }` — live exposure diagnostics |
@@ -227,12 +270,12 @@ Page (dark and light theme, tokens only — no literal colors outside artwork):
 
 1. Header: title 管理 / MCP 管理 + subtitle count; primary `+ 添加 MCP` button.
 2. Server cards grouped by `group` (ungrouped shown last as 其他（未分组）). Each card:
-   icon tile (color + image from `iconUrl`, falling back to the name’s first letter), name, status line (`已连接 · HTTP · 工具 19/19`,
+   icon tile (color + image from `iconUrl`, falling back to the name’s first letter), name, status line (`已连接 · HTTP · 工具 17/19` (enabled/discovered),
    `连接失败 · HTTP · 工具 0`, `已停用 · SSE`), status dot (green/red/gray/amber), `···` menu
    (编辑, 测试连接, 重新连接, 删除), and for errors an inline error bubble with the first 2 lines
    of the message and a 详情 link that opens a dialog with message + detail.
-3. Add/edit form (a right-hand sheet or full page level; both are fine): 是否启用 switch;
-   服务器图标 (preview + 上传图标 file picker + 恢复自动; no emoji palette) and color; 分组 select (existing groups + free text); 名称; 传输类型
+3. Add/edit form with two tabs, 基础设置 and 工具 (a right-hand sheet or full page level; both are fine).
+   基础设置: 是否启用 switch; 服务器图标 (preview + 上传图标 file picker + 恢复自动; no emoji palette) and color; 分组 select (existing groups + free text); 名称; 传输类型
    segmented HTTP / SSE / 内置(stdio); 服务器地址 (or 命令 + 参数 + 环境变量 for stdio);
    OAuth 设置 dialog (mode none/bearer/client_credentials); 自定义请求头 rows (name, value,
    delete, `+ 添加请求头`); 预设 section (radio: 全部预设 / 指定预设, then preset checkboxes);

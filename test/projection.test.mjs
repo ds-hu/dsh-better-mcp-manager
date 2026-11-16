@@ -128,7 +128,14 @@ test('projection: createOutput advertises the canonical schema and renders text'
  * @param {object} options - call/validator/host options.
  * @returns {object} the executor, projections map and recorded calls.
  */
-function executorHarness({ rawResult, validate = (raw) => ({ value: raw }), hostCtx = bareHostCtx(), taskRequired = false } = {}) {
+function executorHarness({
+  rawResult,
+  validate = (raw) => ({ value: raw }),
+  hostCtx = bareHostCtx(),
+  taskRequired = false,
+  requiresApproval = false,
+  publicName = 'mcp__my-key__echo',
+} = {}) {
   const calls = [];
   const projections = new WeakMap();
   const call = async (args, execution) => {
@@ -137,7 +144,9 @@ function executorHarness({ rawResult, validate = (raw) => ({ value: raw }), host
   };
   const execute = createExecutor(hostCtx, {
     rawName: 'echo',
+    publicName,
     taskRequired,
+    requiresApproval,
     call,
     validateResult: validate,
   }, projections);
@@ -412,4 +421,147 @@ test('tool definition: projectContent declines when the value or content was rew
   const value = await definition.execute({}, exec);
   assert.equal(definition.projectContent(exec, { isError: true, value, content: [] }), undefined);
   assert.equal(definition.projectContent(exec, { isError: false, value: { content: [] }, content: [] }), undefined);
+});
+
+/* ---------------------------------------------------------------- */
+/* 0.3.0 approval gate (contract §2.7)                              */
+/* ---------------------------------------------------------------- */
+
+/** A host context with the permission preset and/or approval channel mounted. */
+function approvalHostCtx({ preset, respond = 'allowed-once', approval } = {}) {
+  const requests = [];
+  const services = {
+    permissionPresets: preset === undefined
+      ? undefined
+      : { current: (session) => (typeof preset === 'function' ? preset(session) : preset) },
+    approval: approval === undefined
+      ? {
+        request: async (input) => {
+          requests.push(input);
+          return typeof respond === 'function' ? respond(input) : respond;
+        },
+      }
+      : approval,
+  };
+  return {
+    requests,
+    get: (name) => services[name],
+  };
+}
+
+/** One execution context for a session with an agent and a call id. */
+function execution({ agent = { session: { id: 'sess-1' } }, name = 'mcp__my-key__echo', callId = 'call-42', signal = new AbortController().signal } = {}) {
+  return { agent, name, callId, signal };
+}
+
+test('projection approval: gated tools request approval once and only allowed-once proceeds', async () => {
+  const hostCtx = approvalHostCtx();
+  const exec = execution();
+  const { execute, calls } = executorHarness({ rawResult: { content: [{ type: 'text', text: 'ran' }] }, hostCtx, requiresApproval: true });
+  const value = await execute({}, exec);
+  assert.deepEqual(value.content, [{ type: 'text', text: 'ran' }]);
+  assert.equal(calls.length, 1, 'the MCP call happens after the approval');
+  assert.equal(hostCtx.requests.length, 1, 'approval is requested exactly once');
+  const [request] = hostCtx.requests;
+  assert.equal(request.agent, exec.agent);
+  assert.equal(request.toolName, 'mcp__my-key__echo');
+  assert.equal(request.callId, 'call-42');
+  assert.equal(request.signal, exec.signal);
+  assert.equal(request.reason, 'MCP 工具 "mcp__my-key__echo" 需要审批（当前不是完全权限）');
+
+  const noGate = executorHarness({ rawResult: { content: [{ type: 'text', text: 'ok' }] }, hostCtx: approvalHostCtx() });
+  await noGate.execute({}, exec);
+  assert.equal(noGate.calls.length, 1, 'an ungated tool does not consult approval');
+});
+
+test('projection approval: danger-full-access skips the channel, other presets ask', async () => {
+  const direct = executorHarness({ rawResult: { content: [{ type: 'text', text: 'ok' }] }, hostCtx: approvalHostCtx({ preset: 'danger-full-access' }), requiresApproval: true });
+  await direct.execute({}, execution());
+  assert.equal(direct.calls.length, 1);
+  assert.equal(direct.hostCtxRequests?.length, undefined);
+
+  const asked = approvalHostCtx({ preset: 'standard' });
+  const gated = executorHarness({ rawResult: { content: [{ type: 'text', text: 'ok' }] }, hostCtx: asked, requiresApproval: true });
+  await gated.execute({}, execution());
+  assert.equal(asked.requests.length, 1, 'a restricted preset must ask');
+  assert.equal(gated.calls.length, 1);
+});
+
+test('projection approval: rejected, cancelled and unavailable fail before the MCP call', async () => {
+  for (const [respond, pattern] of [
+    ['rejected', /the user rejected tool "mcp__my-key__echo"/u],
+    ['cancelled', /approval for tool "mcp__my-key__echo" was cancelled/u],
+    ['unavailable', /requires approval, but no approval channel is available/u],
+    ['weird-outcome', /requires approval, but no approval channel is available/u],
+  ]) {
+    const hostCtx = approvalHostCtx({ respond });
+    const { execute, calls } = executorHarness({ rawResult: { content: [{ type: 'text', text: 'should not run' }] }, hostCtx, requiresApproval: true });
+    const exec = execution();
+    await assert.rejects(() => execute({}, exec), pattern);
+    assert.equal(calls.length, 0, 'a denied call must never reach the MCP server');
+    assert.equal(hostCtx.requests.length, 1);
+  }
+});
+
+test('projection approval: missing channel, missing agent, missing exec and failures deny instead of allowing', async () => {
+  const noChannel = { get: (name) => (name === 'permissionPresets' ? { current: () => 'standard' } : undefined) };
+  const missingChannel = executorHarness({ rawResult: { content: [] }, hostCtx: noChannel, requiresApproval: true });
+  await assert.rejects(() => missingChannel.execute({}, execution()), /requires approval outside full access, but no approval channel is available/u);
+  assert.equal(missingChannel.calls.length, 0);
+
+  const noPresetsService = executorHarness({ rawResult: { content: [] }, hostCtx: bareHostCtx(), requiresApproval: true });
+  await assert.rejects(() => noPresetsService.execute({}, execution()), /no approval channel is available/u);
+  assert.equal(noPresetsService.calls.length, 0);
+
+  const agentless = executorHarness({ rawResult: { content: [] }, hostCtx: approvalHostCtx(), requiresApproval: true });
+  await assert.rejects(() => agentless.execute({}, { name: 'x' }), /requires approval, but the call is not attached to an agent/u);
+  assert.equal(agentless.calls.length, 0);
+
+  const naked = executorHarness({ rawResult: { content: [] }, hostCtx: approvalHostCtx(), requiresApproval: true });
+  await assert.rejects(() => naked.execute({}, undefined), /requires approval, but the call has no execution context/u);
+  assert.equal(naked.calls.length, 0);
+
+  const broken = approvalHostCtx({ approval: { request: async () => { throw new Error('dialog exploded'); } } });
+  const brokenRequest = executorHarness({ rawResult: { content: [] }, hostCtx: broken, requiresApproval: true });
+  await assert.rejects(() => brokenRequest.execute({}, execution()), /requires approval, but the request failed: dialog exploded/u);
+  assert.equal(brokenRequest.calls.length, 0);
+});
+
+test('projection approval: optional request fields are omitted and exec.name falls back to the tool name', async () => {
+  const hostCtx = approvalHostCtx();
+  const { execute } = executorHarness({ rawResult: { content: [{ type: 'text', text: 'ok' }] }, hostCtx, requiresApproval: true });
+  await execute({}, { agent: { } });
+  const [request] = hostCtx.requests;
+  assert.equal(request.toolName, 'mcp__my-key__echo', 'the display name is the fallback');
+  assert.equal('callId' in request, false);
+  assert.equal('signal' in request, false);
+  assert.match(request.reason, /mcp__my-key__echo/u);
+});
+
+test('tool definition: approvalRequired gates the definition execution', async () => {
+  const hostCtx = approvalHostCtx();
+  const calls = [];
+  const definition = createMcpToolDefinition({
+    hostCtx,
+    server: server(),
+    tool: liveTool(),
+    approvalRequired: true,
+    call: async () => {
+      calls.push('called');
+      return { content: [{ type: 'text', text: 'ok' }] };
+    },
+  });
+  await definition.execute({}, execution());
+  assert.equal(hostCtx.requests.length, 1, 'the definition passes approvalRequired into the executor');
+  assert.equal(calls.length, 1);
+
+  const direct = approvalHostCtx();
+  const ungated = createMcpToolDefinition({
+    hostCtx: direct,
+    server: server(),
+    tool: liveTool(),
+    call: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
+  });
+  await ungated.execute({}, execution());
+  assert.equal(direct.requests.length, 0, 'approvalRequired defaults to false');
 });

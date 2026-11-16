@@ -92,6 +92,17 @@ if (source !== '') {
     assert.match(source, /\/icon"/u, 'the client must call the icon endpoint');
   });
 
+  check('the tools tab carries the agreed test hooks', () => {
+    const testIds = [
+      'form-tab-basic', 'form-tab-tools', 'tools-panel', 'tools-loading', 'tools-error', 'tools-retry',
+      'tools-cached', 'tools-count', 'tools-empty', 'tools-save-first', 'tool-card', 'tool-name',
+      'tool-desc', 'tool-param', 'tool-enabled', 'tool-approval', 'tools-save', 'tools-enable-all', 'tools-disable-all',
+    ];
+    for (const testId of testIds) assert.ok(source.includes(`"${testId}"`), `lib/client.js is missing the "${testId}" hook`);
+    assert.match(source, /\/tools"/u, 'the client must call the /servers/:id/tools endpoint');
+    assert.match(source, /enabledToolCount/u, 'the card count must read enabledToolCount (contract §2.3)');
+  });
+
   check('the browser half never imports a Harness package', () => {
     assert.doesNotMatch(source, /import\s[^;]*?from\s+['"]@deepseek-ai\//u, 'lib/client.js imports an @deepseek-ai/ package');
     assert.doesNotMatch(source, /require\(\s*['"]@deepseek-ai\//u, 'lib/client.js requires an @deepseek-ai/ package');
@@ -483,6 +494,33 @@ check('the dictionaries carry every label the panel needs', () => {
     { topic: 'icon upload failure', exact: 'icon.uploadFailed' },
     { topic: 'icon removed', exact: 'icon.removed' },
     { topic: 'icon automatic label', exact: 'icon.autoLabel' },
+    { topic: 'form basic tab', exact: 'form.tabBasic' },
+    { topic: 'form tools tab', exact: 'form.tabTools' },
+    { topic: 'form tabs label', exact: 'form.tabsLabel' },
+    { topic: 'tools title', exact: 'tools.title' },
+    { topic: 'tools hint', exact: 'tools.hint' },
+    { topic: 'tools loading', exact: 'tools.loading' },
+    { topic: 'tools retry', exact: 'tools.retry' },
+    { topic: 'tools empty', exact: 'tools.empty' },
+    { topic: 'tools offline', exact: 'tools.offline' },
+    { topic: 'tools cached', exact: 'tools.cached' },
+    { topic: 'tools cachedAt', exact: 'tools.cachedAt' },
+    { topic: 'tools save', exact: 'tools.save' },
+    { topic: 'tools saved', exact: 'tools.saved' },
+    { topic: 'tools save failure', exact: 'tools.saveFailed' },
+    { topic: 'tools load failure', exact: 'tools.loadFailed' },
+    { topic: 'tools enable all', exact: 'tools.enableAll' },
+    { topic: 'tools disable all', exact: 'tools.disableAll' },
+    { topic: 'tools approval', exact: 'tools.approval' },
+    { topic: 'tools approval hint', exact: 'tools.approvalHint' },
+    { topic: 'tools params', exact: 'tools.params' },
+    { topic: 'tools required', exact: 'tools.required' },
+    { topic: 'tools optional', exact: 'tools.optional' },
+    { topic: 'tools no params', exact: 'tools.noParams' },
+    { topic: 'tools disabled note', exact: 'tools.disabledNote' },
+    { topic: 'tools count', exact: 'tools.count' },
+    { topic: 'tools save first', exact: 'tools.saveFirst' },
+    { topic: 'tools footer hint', exact: 'tools.footHint' },
     { topic: 'presets', pattern: /(^|\.)presets(?:\.|$)/u },
     { topic: 'status.connected', exact: 'status.connected' },
     { topic: 'status.error', exact: 'status.error' },
@@ -541,12 +579,63 @@ check('the client exposes the icon helpers, not an emoji glyph helper', () => {
   assert.equal(api.iconUrlOf({ iconUrl: 42 }), '');
 });
 
-check('save drafts never carry an icon field', () => {
+check('the tools approval hint matches the restricted-permission wording', () => {
+  const loaded = bundleOrFail();
+  const { zh, en } = loaded.log.locale[0].dictionary;
+  assert.equal(zh['tools.approvalHint'], '非完全权限时会要求你批准');
+  assert.equal(en['tools.approvalHint'], 'Asks when the session is not in full access');
+  assert.equal(zh['tools.count'].includes('{enabled}'), true, 'tools.count is a {enabled}/{total} template');
+  assert.equal(zh['tools.count'].includes('{total}'), true);
+});
+
+check('the client exposes the 0.3.0 tool helpers and components', () => {
+  const loaded = bundleOrFail();
+  const api = loaded.exports.__mcpTest;
+  assert.equal(typeof api.ToolsPanel, 'function', 'ToolsPanel must be exported for SSR-level checks');
+  assert.equal(typeof api.ToolCard, 'function', 'ToolCard must be exported for SSR-level checks');
+  assert.equal(typeof api.toolCounts, 'function');
+  assert.equal(typeof api.normalizeToolList, 'function');
+  assert.equal(typeof api.toolSettingsOf, 'function');
+  assert.equal(typeof api.toolSettingsKey, 'function');
+
+  const counts = api.toolCounts({ toolCount: 19, enabledToolCount: 17 });
+  assert.equal(counts.enabled, 17);
+  assert.equal(counts.total, 19);
+  const fallback = api.toolCounts({ toolCount: 19 });
+  assert.equal(fallback.enabled, 19, 'without enabledToolCount the enabled count falls back to the discovered count');
+  assert.equal(fallback.total, 19);
+  assert.equal(api.toolCounts({}).total, 0);
+  assert.equal(api.toolCounts(undefined).enabled, 0);
+
+  const normalized = api.normalizeToolList([
+    { name: 'zeta', description: 'Z', enabled: false, params: [{ name: 'p', required: true }, { name: 'q' }, null] },
+    null,
+    { name: '' },
+    { name: 'alpha', publicName: 'mcp__k__alpha', approval: true },
+  ]);
+  assert.equal(JSON.stringify(normalized), JSON.stringify([
+    { name: 'alpha', publicName: 'mcp__k__alpha', description: '', params: [], enabled: true, approval: true },
+    { name: 'zeta', publicName: 'zeta', description: 'Z', params: [{ name: 'p', required: true }, { name: 'q', required: false }], enabled: false, approval: false },
+  ]), 'rows are normalized and sorted by raw name');
+  assert.equal(JSON.stringify(api.normalizeToolList('nope')), '[]');
+
+  const settings = api.toolSettingsOf(normalized);
+  assert.equal(JSON.stringify(settings), JSON.stringify([
+    { name: 'alpha', enabled: true, approval: true },
+    { name: 'zeta', enabled: false, approval: false },
+  ]), 'the PUT body is the full sorted settings list');
+  assert.equal(api.toolSettingsKey(normalized), api.toolSettingsKey([...normalized].reverse()), 'the fingerprint is order-independent');
+  assert.notEqual(api.toolSettingsKey(normalized), api.toolSettingsKey([{ ...normalized[0], enabled: false }, normalized[1]]), 'a toggle changes the fingerprint');
+  assert.equal(JSON.stringify(api.toolSettingsKey([])), JSON.stringify('[]'));
+});
+
+check('save drafts never carry an icon or tool-settings field', () => {
   const loaded = bundleOrFail();
   const api = loaded.exports.__mcpTest;
   const body = api.bodyFromDraft(api.blankDraft());
-  assert.equal(Object.hasOwn(body, 'icon'), false, 'the icon is changed only through its endpoints (contract §2.1)');
-  assert.equal(Object.hasOwn(body, 'iconUrl'), false);
+  for (const field of ['icon', 'iconUrl', 'toolOverrides', 'toolCache']) {
+    assert.equal(Object.hasOwn(body, field), false, `${field} is changed through its own endpoint, not a save draft`);
+  }
 });
 
 check('every dictionary value is a non-empty string', () => {

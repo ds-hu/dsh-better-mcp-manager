@@ -548,6 +548,193 @@ async function main() {
       reporter.check('deleting the no-icon server leaves no icon file', (await iconFilesForId(fallbackId)).length === 0 && (await iconsDirListing()).entries.length === 0);
     });
 
+    await reporter.step('tools tab: cards, params, disable fail and per-tool approval persist', async () => {
+      if (stdioId === undefined || serverKey === undefined) throw new Error('no stdio server id/key captured for the tools phase');
+      const publicName = (name) => `mcp__${serverKey}__${name}`;
+      await ui.openEditToolsTab(page, stdioName);
+      const countText = await ui.waitToolsCount(page, '已启用 2/2');
+      reporter.check('tools tab opens with 已启用 2/2 and both fixture tools listed', countText.includes('已启用 2/2'), countText);
+      const echoCard = await ui.toolCardState(page, 'echo');
+      const failCard = await ui.toolCardState(page, 'fail');
+      reporter.check(
+        'echo card carries its MCP description, is enabled and marks text as required',
+        echoCard.enabled === 'true' && echoCard.approval === 'false' && echoCard.description.includes('Echo the given text back') && echoCard.params.some((param) => param.text.includes('text') && param.required === 'true'),
+        JSON.stringify({ echo: echoCard.description, params: echoCard.params }),
+      );
+      reporter.check(
+        'fail card carries its MCP description and marks message as optional',
+        failCard.enabled === 'true' && failCard.description.includes('Always answer with an MCP tool error') && failCard.params.some((param) => param.text.includes('message') && param.required === 'false'),
+        JSON.stringify({ fail: failCard.description, params: failCard.params }),
+      );
+      screenshotArtifacts.push(await ui.screenshotToolsTab(page, join(ARTIFACT_DIR, 'mcp-manager-form-tools.png')));
+
+      const liveTools = await api.tools(stdioId);
+      reporter.check(
+        'GET /servers/:id/tools returns live descriptors with the default settings',
+        liveTools.ok === true && liveTools.connected === true && Array.isArray(liveTools.tools) && liveTools.tools.length === 2 &&
+          liveTools.tools.every((tool) => tool.enabled === true && tool.approval === false) &&
+          liveTools.tools.some((tool) => tool.name === 'echo' && tool.publicName === publicName('echo') && tool.params.some((param) => param.name === 'text' && param.required === true)),
+        redact(JSON.stringify(liveTools).slice(0, 320)),
+      );
+
+      await ui.setToolSwitch(page, 'fail', 'tool-enabled', false);
+      await ui.saveTools(page);
+      await ui.waitToolsCount(page, '已启用 1/2');
+      const disabledTools = await api.tools(stdioId);
+      const storedDisabled = JSON.parse(await readFile(join(DATA_DIR, 'servers.json'), 'utf8')).servers.find((server) => server.id === stdioId);
+      const disabledStatus = (await api.servers()).servers.find((server) => server.id === stdioId)?.status;
+      reporter.check(
+        'disabling fail persists toolOverrides.fail.enabled=false in the store and the counter drops to 已启用 1/2',
+        storedDisabled?.toolOverrides?.fail?.enabled === false && disabledStatus?.enabledToolCount === 1 && disabledStatus?.toolCount === 2 && disabledTools.tools.find((tool) => tool.name === 'fail')?.enabled === false,
+        redact(JSON.stringify({ overrides: storedDisabled?.toolOverrides, status: disabledStatus, tools: (disabledTools.tools ?? []).map((tool) => `${tool.name}:${tool.enabled}`) })),
+      );
+      await ui.closeFormViaBack(page);
+      const cardText = await ui.waitCardText(page, stdioName, '工具 1/2');
+      reporter.check('the card status line reflects the disabled tool as 工具 1/2', cardText.includes('工具 1/2'), cardText.replaceAll('\n', ' '));
+
+      // A standard-preset model request must no longer advertise the disabled tool.
+      await fixtures.reset();
+      const disabledMarker = `E2E-DISABLED-${RUN_ID}`;
+      await fixtures.configure({
+        defaultText: `fixture-llm: reply-${RUN_ID}`,
+        afterToolText: `fixture-llm: tool-result-${RUN_ID}`,
+        markers: [{ match: disabledMarker, reply: { kind: 'text', text: `fixture-llm: disabled-${RUN_ID}` } }],
+      });
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'standard');
+      await ui.sendMessage(page, `${disabledMarker} 禁用工具后的请求`);
+      const disabledRequest = await waitFor(
+        async () => {
+          const state = await fixtures.state();
+          const matches = requestsForMarker(state, disabledMarker);
+          return matches.length > 0 ? matches[0] : undefined;
+        },
+        { timeoutMs: 90_000, intervalMs: 500, label: 'standard-preset request after disabling fail' },
+      );
+      reporter.check(
+        'a disabled tool disappears from the standard-preset model catalog',
+        disabledRequest.tools.includes(publicName('echo')) && !disabledRequest.tools.includes(publicName('fail')),
+        disabledRequest.tools.filter((name) => name.startsWith(`mcp__${serverKey}__`)).join(', '),
+      );
+      await ui.waitForBodyText(page, `fixture-llm: disabled-${RUN_ID}`);
+
+      // Re-enable fail and turn approval on for echo.
+      await ui.openMcpPage(page);
+      await ui.openEditToolsTab(page, stdioName);
+      await ui.setToolSwitch(page, 'fail', 'tool-enabled', true);
+      await ui.setToolSwitch(page, 'echo', 'tool-approval', true);
+      await ui.saveTools(page);
+      await ui.waitToolsCount(page, '已启用 2/2');
+      const storedApproval = JSON.parse(await readFile(join(DATA_DIR, 'servers.json'), 'utf8')).servers.find((server) => server.id === stdioId);
+      const approvalTools = await api.tools(stdioId);
+      reporter.check(
+        're-enabling fail and toggling echo 需要审批 stores exactly the non-default echo override',
+        storedApproval?.toolOverrides?.echo?.approval === true && storedApproval?.toolOverrides?.fail === undefined && Object.keys(storedApproval?.toolOverrides ?? {}).length === 1 &&
+          approvalTools.tools.find((tool) => tool.name === 'echo')?.approval === true && approvalTools.tools.find((tool) => tool.name === 'fail')?.enabled === true,
+        redact(JSON.stringify({ overrides: storedApproval?.toolOverrides, tools: (approvalTools.tools ?? []).map((tool) => `${tool.name}:enabled=${tool.enabled},approval=${tool.approval}`) })),
+      );
+      await ui.closeFormViaBack(page);
+      const restored = await ui.waitCardText(page, stdioName, '工具 2/2');
+      reporter.check('the card status line returns to 工具 2/2 after re-enabling fail', restored.includes('工具 2/2'), restored.replaceAll('\n', ' '));
+    });
+
+    await reporter.step('approval-gated tool asks in a restricted session and runs after 允许一次', async () => {
+      if (serverKey === undefined) throw new Error('no stdio server key captured for the approval phase');
+      const marker = `E2E-APPROVE-${RUN_ID}`;
+      const echoArgument = `approval-echo-${RUN_ID}`;
+      await fixtures.reset();
+      await fixtures.configure({
+        defaultText: `fixture-llm: reply-${RUN_ID}`,
+        afterToolText: `fixture-llm: tool-result-${RUN_ID}`,
+        markers: [{ match: marker, reply: { kind: 'tool', toolName: `mcp__${serverKey}__echo`, arguments: { text: echoArgument } } }],
+      });
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'standard');
+      const restrictedLabel = await ui.currentPermission(page);
+      reporter.check('a fresh session starts outside 完全权限 so approval applies', restrictedLabel !== '完全权限', `permission: ${restrictedLabel}`);
+      await ui.sendMessage(page, `${marker} 请调用需要审批的 MCP echo 工具`);
+      const prompt = await ui.waitApprovalPrompt(page, { timeoutMs: 120_000 });
+      reporter.check(
+        'the approval composer shows 等待审批 with the MCP tool reason',
+        prompt.text.includes('等待审批') && prompt.text.includes('需要审批') && prompt.text.includes(`mcp__${serverKey}__echo`),
+        redact(prompt.text.replaceAll('\n', ' ').slice(0, 320)),
+      );
+      const pendingState = await fixtures.state();
+      reporter.check(
+        'the tool has not run while the approval is pending',
+        requestsForMarker(pendingState, marker).every((request) => (request.toolResultTexts ?? []).length === 0),
+        `requests: ${requestsForMarker(pendingState, marker).length}`,
+      );
+      await ui.answerApproval(page, 'allow');
+      const followUp = await waitFor(
+        async () => {
+          const state = await fixtures.state();
+          const matches = requestsForMarker(state, marker);
+          return matches.find((request) => (request.toolResultTexts ?? []).some((text) => text.includes(`echo: ${echoArgument}`)));
+        },
+        { timeoutMs: 120_000, intervalMs: 500, label: 'the model request containing the approved echo result' },
+      );
+      reporter.check(
+        '允许一次 lets the approval-gated tool run and return its result to the model',
+        followUp.toolResultTexts.some((text) => text.includes(`echo: ${echoArgument}`)),
+        followUp.toolResultTexts.map((text) => text.slice(0, 60)).join(' | '),
+      );
+      await ui.waitForBodyText(page, `fixture-llm: tool-result-${RUN_ID}`);
+      reporter.check('the approval composer is gone after the decision', (await ui.approvalPromptCount(page)) === 0);
+    });
+
+    await reporter.step('a 完全权限 session runs the approval-gated tool without asking', async () => {
+      if (serverKey === undefined) throw new Error('no stdio server key captured for the full-access phase');
+      const marker = `E2E-FULLACCESS-${RUN_ID}`;
+      const echoArgument = `full-access-echo-${RUN_ID}`;
+      const state = await fixtures.state();
+      await fixtures.configure({
+        ...state.config,
+        markers: [
+          ...(state.config.markers ?? []).filter((rule) => !String(rule.match).includes(marker)),
+          { match: marker, reply: { kind: 'tool', toolName: `mcp__${serverKey}__echo`, arguments: { text: echoArgument } } },
+        ],
+      });
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'standard');
+      const label = await ui.switchPermission(page, '完全权限');
+      reporter.check('the new session runs in 完全权限', label === '完全权限', `permission: ${label}`);
+      await ui.sendMessage(page, `${marker} 请调用 MCP echo 工具`);
+      const followUp = await waitFor(
+        async () => {
+          const current = await fixtures.state();
+          const matches = requestsForMarker(current, marker);
+          return matches.find((request) => (request.toolResultTexts ?? []).some((text) => text.includes(`echo: ${echoArgument}`)));
+        },
+        { timeoutMs: 120_000, intervalMs: 500, label: 'the model request containing the full-access echo result' },
+      );
+      reporter.check(
+        '完全权限 skips approval and the tool runs directly',
+        followUp.toolResultTexts.some((text) => text.includes(`echo: ${echoArgument}`)),
+        followUp.toolResultTexts.map((text) => text.slice(0, 60)).join(' | '),
+      );
+      const body = await page.locator('body').innerText();
+      reporter.check('no approval composer is rendered in 完全权限', (await ui.approvalPromptCount(page)) === 0 && !body.includes('等待审批'));
+      await ui.waitForBodyText(page, `fixture-llm: tool-result-${RUN_ID}`);
+    });
+
+    await reporter.step('restore echo approval off through the tools tab', async () => {
+      if (stdioId === undefined) throw new Error('no stdio server id captured for restoring tool settings');
+      await ui.openMcpPage(page);
+      await ui.openEditToolsTab(page, stdioName);
+      await ui.setToolSwitch(page, 'echo', 'tool-approval', false);
+      await ui.saveTools(page);
+      await ui.waitToolsCount(page, '已启用 2/2');
+      const storedRestored = JSON.parse(await readFile(join(DATA_DIR, 'servers.json'), 'utf8')).servers.find((server) => server.id === stdioId);
+      const tools = await api.tools(stdioId);
+      reporter.check(
+        'turning 需要审批 back off normalizes the override away',
+        storedRestored?.toolOverrides?.echo === undefined && Object.keys(storedRestored?.toolOverrides ?? {}).length === 0 && tools.tools.find((tool) => tool.name === 'echo')?.approval === false,
+        redact(JSON.stringify({ overrides: storedRestored?.toolOverrides, tools: (tools.tools ?? []).map((tool) => `${tool.name}:approval=${tool.approval}`) })),
+      );
+      await ui.closeFormViaBack(page);
+    });
+
     await reporter.step('preset scoping: standard sees the MCP tools, minimal does not', async () => {
       if (serverKey === undefined) throw new Error('no stdio server key available for the scoping phase');
       const standardMarker = `E2E-STD-${RUN_ID}`;
@@ -714,7 +901,7 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
   // Publish screenshots only from a fully successful UI pass (the caller has
   // already recorded failures; a missing artifact is a failure, not silence).
   await reporter.step('publish sanitized screenshots to docs/screenshots', async () => {
-    const wanted = ['mcp-manager-list.png', 'mcp-manager-sidebar.png', 'mcp-manager-error-detail.png', 'mcp-manager-form-presets.png', 'mcp-manager-form-icon.png'];
+    const wanted = ['mcp-manager-list.png', 'mcp-manager-sidebar.png', 'mcp-manager-error-detail.png', 'mcp-manager-form-presets.png', 'mcp-manager-form-icon.png', 'mcp-manager-form-tools.png'];
     const published = [];
     for (const name of wanted) {
       const source = screenshotArtifacts.find((file) => basename(file) === name);
@@ -726,7 +913,7 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
       await copyFile(source, target);
       published.push(`${name} (${formatBytes(size)})`);
     }
-    reporter.check('five sanitized screenshots published under docs/screenshots', published.length === 5, published.join(', '));
+    reporter.check('six sanitized screenshots published under docs/screenshots', published.length === 6, published.join(', '));
   });
 
   if (clean) {

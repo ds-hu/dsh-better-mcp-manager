@@ -382,6 +382,7 @@ test('mcp manager: an unknown server has the contract disabled snapshot', async 
     assert.equal(snapshot.state, 'disabled');
     assert.equal(snapshot.transportLabel, 'HTTP');
     assert.equal(snapshot.toolCount, 0);
+    assert.equal(snapshot.enabledToolCount, 0, 'a disabled placeholder exposes no enabled tools');
     assert.equal(snapshot.discoveredCount, 0);
     assert.equal(snapshot.instructionsBytes, 0);
     assert.equal(snapshot.error, null);

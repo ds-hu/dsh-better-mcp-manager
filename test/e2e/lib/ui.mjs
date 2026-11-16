@@ -230,17 +230,28 @@ export async function cardText(page, name) {
  */
 export async function cardIcon(page, name) {
   const locator = card(page, name);
-  const image = locator.locator('[data-testid="server-icon"]');
-  const fallback = locator.locator('[data-testid="server-icon-fallback"], .mm-tileLetter');
-  const imageCount = await image.count();
-  const fallbackCount = await fallback.count();
+  // One DOM snapshot instead of count-then-read: the card swaps the <img> for
+  // the first-letter fallback when the icon request 404s, so a per-locator read
+  // can race the re-render. evaluateAll never waits for the element to exist.
+  const images = await locator
+    .locator('[data-testid="server-icon"]')
+    .evaluateAll((elements) => elements.map((element) => ({
+      src: element.getAttribute('src'),
+      naturalWidth: element.naturalWidth,
+      complete: element.complete,
+    })))
+    .catch(() => []);
+  const fallbacks = await locator
+    .locator('[data-testid="server-icon-fallback"], .mm-tileLetter')
+    .evaluateAll((elements) => elements.map((element) => element.textContent ?? ''))
+    .catch(() => []);
   return {
-    imageCount,
-    fallbackCount,
-    src: imageCount > 0 ? await image.first().getAttribute('src') : undefined,
-    naturalWidth: imageCount > 0 ? await image.first().evaluate((element) => element.naturalWidth).catch(() => 0) : 0,
-    complete: imageCount > 0 ? await image.first().evaluate((element) => element.complete).catch(() => false) : false,
-    fallbackText: fallbackCount > 0 ? await fallback.first().innerText().catch(() => '') : undefined,
+    imageCount: images.length,
+    fallbackCount: fallbacks.length,
+    src: images[0]?.src,
+    naturalWidth: images[0]?.naturalWidth ?? 0,
+    complete: images[0]?.complete ?? false,
+    fallbackText: fallbacks[0],
   };
 }
 
@@ -541,4 +552,185 @@ export async function screenshotViewport(page, path) {
   await mkdir(dirname(path), { recursive: true });
   await page.screenshot({ path, animations: 'disabled' });
   return path;
+}
+
+// ── management page: 工具 tab (0.3.0) ───────────────────────────────────────
+
+/** Open one server's edit form and switch it to the 工具 tab. */
+export async function openEditToolsTab(page, name) {
+  await editServer(page, name);
+  const tab = page.locator('[data-testid="form-tab-tools"]');
+  await tab.waitFor({ state: 'visible', timeout: 15_000 });
+  await tab.click();
+  await sleep(350);
+  await page.locator('[data-testid="tools-panel"]').waitFor({ state: 'visible', timeout: 20_000 });
+  await page.locator('[data-testid="tools-count"]').waitFor({ state: 'visible', timeout: 20_000 });
+}
+
+/** One tool card in the 工具 tab, selected by its exact raw name. */
+export function toolCard(page, name) {
+  return page
+    .locator('[data-testid="tool-card"]')
+    .filter({ has: page.locator(`[data-testid="tool-name"]:text-is(${JSON.stringify(name)})`) })
+    .first();
+}
+
+/** Read one tool card's switch states, params and copy. */
+export async function toolCardState(page, name) {
+  const card = toolCard(page, name);
+  await card.waitFor({ state: 'visible', timeout: 15_000 });
+  const enabled = card.locator('[data-testid="tool-enabled"]');
+  const approval = card.locator('[data-testid="tool-approval"]');
+  const params = await card
+    .locator('[data-testid="tool-param"]')
+    .evaluateAll((elements) => elements.map((element) => ({ text: element.textContent ?? '', required: element.getAttribute('data-required') })));
+  return {
+    name,
+    enabled: await enabled.getAttribute('aria-checked'),
+    enabledDisabled: await enabled.isDisabled(),
+    approval: await approval.getAttribute('aria-checked'),
+    approvalDisabled: await approval.isDisabled(),
+    description: (await card.locator('[data-testid="tool-desc"]').innerText().catch(() => '')) ?? '',
+    params,
+    text: await card.innerText(),
+  };
+}
+
+/** Flip one tool card switch and wait for its aria-checked state. */
+export async function setToolSwitch(page, name, switchTestId, on) {
+  const card = toolCard(page, name);
+  const control = card.locator(`[data-testid="${switchTestId}"]`);
+  await control.waitFor({ state: 'visible', timeout: 10_000 });
+  if ((await control.getAttribute('aria-checked')) !== (on ? 'true' : 'false')) await control.click();
+  await waitFor(async () => ((await control.getAttribute('aria-checked')) === (on ? 'true' : 'false') ? true : undefined), {
+    timeoutMs: 10_000,
+    intervalMs: 100,
+    label: `tool ${name} ${switchTestId} to become ${on}`,
+  });
+}
+
+/** Click 保存工具设置 and wait for the saved notice (or an error banner). */
+export async function saveTools(page) {
+  await page.locator('[data-testid="tools-save"]').click();
+  const panel = page.locator('[data-testid="tools-panel"]');
+  return waitFor(
+    async () => {
+      const text = await panel.innerText().catch(() => '');
+      if (text.includes('工具设置已保存')) return text;
+      if (text.includes('保存工具设置失败')) throw new Error(text.slice(0, 400));
+      return undefined;
+    },
+    { timeoutMs: 30_000, intervalMs: 200, label: 'tools settings to save' },
+  );
+}
+
+/** Wait until the 已启用 x/y counter shows `text`. */
+export async function waitToolsCount(page, text) {
+  return waitFor(
+    async () => {
+      const counter = await page.locator('[data-testid="tools-count"]').innerText().catch(() => '');
+      return counter.includes(text) ? counter : undefined;
+    },
+    { timeoutMs: 20_000, intervalMs: 200, label: `tools count ${JSON.stringify(text)}` },
+  );
+}
+
+/** Read the tools panel meta/cards (names, count, cached/connected notice). */
+export async function toolsPanelInfo(page) {
+  const panel = page.locator('[data-testid="tools-panel"]');
+  return {
+    count: (await page.locator('[data-testid="tools-count"]').innerText().catch(() => '')) ?? '',
+    names: await panel.locator('[data-testid="tool-name"]').evaluateAll((elements) => elements.map((element) => element.textContent ?? '')),
+    cached: (await panel.innerText().catch(() => '')).includes('显示上次连接时的工具列表'),
+    offline: (await panel.innerText().catch(() => '')).includes('连接后才能读取实时工具列表'),
+    text: (await panel.innerText().catch(() => '')) ?? '',
+  };
+}
+
+/** Leave the form without saving basic fields (back button). */
+export async function closeFormViaBack(page) {
+  const back = page.locator('[data-testid="form-cancel"]');
+  await back.click();
+  await waitFor(async () => ((await page.locator('[data-testid="form-name"]').count()) === 0 ? true : undefined), {
+    timeoutMs: 15_000,
+    label: 'form to close via back',
+  });
+}
+
+/** Screenshot the form's 工具 tab (tabs + tool list + save button). */
+export async function screenshotToolsTab(page, path) {
+  const pageSurface = page.locator('.mm-page').first();
+  await pageSurface.waitFor({ state: 'visible', timeout: 10_000 });
+  return screenshotElement(pageSurface, path);
+}
+
+// ── DSH permission preset + approval composer ──────────────────────────────
+
+/** The current-session 访问模式 trigger rendered into the composer. */
+export async function permissionTrigger(page) {
+  const buttons = page.getByRole('button', { name: /^访问模式，当前：/ });
+  const count = await buttons.count();
+  for (let index = 0; index < count; index += 1) {
+    if (await buttons.nth(index).isVisible().catch(() => false)) return buttons.nth(index);
+  }
+  throw new Error('no visible 访问模式 button found in the composer');
+}
+
+/** Current permission preset label, e.g. 工作区内修改 / 完全权限. */
+export async function currentPermission(page) {
+  const trigger = await permissionTrigger(page);
+  const label = (await trigger.getAttribute('aria-label')) ?? '';
+  const match = label.match(/当前：(.*)$/);
+  return (match?.[1] ?? label).trim();
+}
+
+/**
+ * Switch the current session's permission preset through the composer popup.
+ * Selecting 完全权限 goes through the shipped risk-confirmation dialog.
+ */
+export async function switchPermission(page, label) {
+  if ((await currentPermission(page)) === label) return label;
+  const trigger = await permissionTrigger(page);
+  await trigger.click();
+  await sleep(300);
+  const option = page.getByRole('menuitem', { name: new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}$`) }).first();
+  await option.waitFor({ state: 'visible', timeout: 10_000 });
+  await option.click();
+  await sleep(250);
+  if (label === '完全权限') {
+    const dialog = page.locator('[role="dialog"]').filter({ hasText: '确认启用完全权限？' }).first();
+    await dialog.waitFor({ state: 'visible', timeout: 10_000 });
+    await dialog.locator('input[type="checkbox"]').first().check();
+    await dialog.getByRole('button', { name: '启用完全权限' }).click();
+    await dialog.waitFor({ state: 'detached', timeout: 15_000 }).catch(() => {});
+  }
+  return waitFor(
+    async () => {
+      const current = await currentPermission(page).catch(() => '');
+      return current === label ? current : undefined;
+    },
+    { timeoutMs: 20_000, intervalMs: 250, label: `permission preset to become ${label}` },
+  );
+}
+
+/** Wait for the DSH approval composer takeover and return its copy. */
+export async function waitApprovalPrompt(page, { timeoutMs = 120_000 } = {}) {
+  const panel = page.locator('[data-approval-key]').first();
+  await panel.waitFor({ state: 'visible', timeout: timeoutMs });
+  const text = await panel.innerText();
+  return { panel, text };
+}
+
+/** Answer the approval composer: allow once or reject. */
+export async function answerApproval(page, outcome, { timeoutMs = 15_000 } = {}) {
+  const panel = page.locator('[data-approval-key]').first();
+  await panel.waitFor({ state: 'visible', timeout: timeoutMs });
+  const button = outcome === 'allow' ? panel.getByRole('button', { name: '允许一次' }) : panel.getByRole('button', { name: '拒绝' });
+  await button.click();
+  await panel.waitFor({ state: 'detached', timeout: timeoutMs }).catch(() => {});
+}
+
+/** How many pending approval composers are on screen right now. */
+export async function approvalPromptCount(page) {
+  return page.locator('[data-approval-key]').count();
 }

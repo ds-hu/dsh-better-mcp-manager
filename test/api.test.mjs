@@ -76,11 +76,15 @@ async function harness(t, { roster, bare = false, connection, autoIcon } = {}) {
     connections,
     status(id) {
       const live = connections.get(id);
-      return live?.snapshot ?? {
+      const snapshot = live === undefined
+        ? undefined
+        : (typeof live.snapshot === 'function' ? live.snapshot() : live.snapshot);
+      return snapshot ?? {
         serverId: id,
         state: 'disabled',
         transportLabel: 'HTTP',
         toolCount: 0,
+        enabledToolCount: 0,
         discoveredCount: 0,
         instructionsBytes: 0,
         error: null,
@@ -800,4 +804,211 @@ test('api: save drafts ignore an icon field; uploads survive unrelated edits', a
     body: JSON.stringify(validDraft({ name: 'Renamed', icon: { kind: 'auto' } })),
   });
   assert.equal(reset.body.server.icon.kind, 'upload', 'the icon changes only through its own endpoint');
+});
+
+/* ---------------------------------------------------------------- */
+/* 0.3.0 per-tool settings and tool cache (contract §2.7/§3)          */
+/* ---------------------------------------------------------------- */
+
+/** One live tool descriptor as the connection exposes it. */
+function liveTool(rawName, overrides = {}) {
+  return {
+    rawName,
+    publicName: `mcp__my-mcp__${rawName}`,
+    description: `${rawName} description`,
+    inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+    outputSchema: undefined,
+    taskRequired: false,
+    ...overrides,
+  };
+}
+
+/** One fake connected supervisor for the harness manager. */
+function liveConnection(id, tools) {
+  const snapshot = {
+    serverId: id,
+      state: 'connected',
+      transportLabel: 'HTTP',
+      toolCount: tools.length,
+      enabledToolCount: tools.length,
+      discoveredCount: tools.length,
+      instructionsBytes: 20,
+      error: null,
+      attempts: 0,
+      connectedAt: '2026-11-16T10:00:00.000Z',
+      lastAttemptAt: '2026-11-16T10:00:00.000Z',
+    nextRetryAt: null,
+  };
+  return {
+    id,
+    snapshot: () => snapshot,
+    tools: () => tools,
+  };
+}
+
+/** Create one server through the API and return its id. */
+async function createServer(call) {
+  const created = await call({ method: 'POST', path: '/servers', headers: JSON_HEADERS, body: JSON.stringify(validDraft()) });
+  assert.equal(created.status, 201);
+  return created.body.server.id;
+}
+
+test('api: GET /servers/:id/tools serves the live list, persists the cache and falls back when offline', async (t) => {
+  const { call, store, manager, dir } = await harness(t);
+  const id = await createServer(call);
+
+  const empty = await call({ path: `/servers/${id}/tools` });
+  assert.equal(empty.status, 200);
+  assert.deepEqual(empty.body, { ok: true, connected: false, cachedAt: null, tools: [] });
+
+  const tools = [liveTool('alpha'), liveTool('beta', { description: 'Beta tool' })];
+  manager.connections.set(id, liveConnection(id, tools));
+
+  const live = await call({ path: `/servers/${id}/tools` });
+  assert.equal(live.status, 200, `live tools failed: ${live.raw}`);
+  assert.equal(live.body.ok, true);
+  assert.equal(live.body.connected, true);
+  assert.equal(live.body.cachedAt, '2026-11-16T10:00:00.000Z');
+  assert.deepEqual(live.body.tools, [
+    { name: 'alpha', publicName: 'mcp__my-mcp__alpha', description: 'alpha description', params: [{ name: 'query', required: true }], enabled: true, approval: false },
+    { name: 'beta', publicName: 'mcp__my-mcp__beta', description: 'Beta tool', params: [{ name: 'query', required: true }], enabled: true, approval: false },
+  ]);
+  assert.deepEqual(store.get(id).toolCache, {
+    at: '2026-11-16T10:00:00.000Z',
+    tools: [
+      { name: 'alpha', publicName: 'mcp__my-mcp__alpha', description: 'alpha description', params: [{ name: 'query', required: true }] },
+      { name: 'beta', publicName: 'mcp__my-mcp__beta', description: 'Beta tool', params: [{ name: 'query', required: true }] },
+    ],
+  }, 'reading the live list refreshes the offline cache');
+
+  // Settings stored through the endpoint are reflected in both live and cached lists.
+  const saved = await call({
+    method: 'PUT',
+    path: `/servers/${id}/tools`,
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ tools: [{ name: 'alpha', enabled: false, approval: false }, { name: 'beta', enabled: true, approval: true }] }),
+  });
+  assert.equal(saved.status, 200);
+  const liveAfter = await call({ path: `/servers/${id}/tools` });
+  assert.equal(liveAfter.body.tools[0].enabled, false);
+  assert.equal(liveAfter.body.tools[1].approval, true);
+
+  // Disconnect: the tools tab keeps working from the persisted cache.
+  manager.connections.delete(id);
+  const offline = await call({ path: `/servers/${id}/tools` });
+  assert.equal(offline.body.connected, false);
+  assert.equal(offline.body.cachedAt, '2026-11-16T10:00:00.000Z');
+  assert.deepEqual(offline.body.tools.map((tool) => [tool.name, tool.enabled, tool.approval]), [
+    ['alpha', false, false],
+    ['beta', true, true],
+  ]);
+  assert.deepEqual(offline.body.tools[0].params, [{ name: 'query', required: true }]);
+  assert.deepEqual(await readdir(dir), ['servers.json'], 'the tool cache lives in the store file, not in side files');
+
+  const missing = await call({ path: '/servers/srv_missing/tools' });
+  assertError(missing, 404, 'not-found');
+});
+
+test('api: PUT /servers/:id/tools stores only non-default overrides and rebinds agents', async (t) => {
+  const { call, store, state, clock, manager } = await harness(t);
+  const id = await createServer(call);
+  manager.connections.set(id, liveConnection(id, [liveTool('alpha'), liveTool('beta')]));
+  await call({ path: `/servers/${id}/tools` }); // persist a cache first
+  const cached = store.get(id).toolCache;
+  const refreshesBefore = state.refreshes;
+
+  clock.value += 5_000;
+  const saved = await call({
+    method: 'PUT',
+    path: `/servers/${id}/tools`,
+    headers: JSON_HEADERS,
+    body: JSON.stringify({
+      tools: [
+        { name: 'alpha', enabled: false, approval: true, ignored: 'x' },
+        { name: 'beta', enabled: true, approval: false },
+      ],
+    }),
+  });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.body.ok, true);
+  assert.equal(saved.body.server.id, id);
+  assert.equal('toolOverrides' in saved.body.server, false, 'the settings surface is the tools endpoint');
+  assert.equal('toolCache' in saved.body.server, false);
+  assert.equal(saved.body.server.updatedAt, '2026-11-16T10:00:05.000Z', 'a settings save bumps updatedAt');
+  assert.ok(state.refreshes > refreshesBefore, 'live agents are rebound');
+  assert.deepEqual(store.get(id).toolOverrides, { alpha: { enabled: false, approval: true } }, 'default restatements are not stored');
+  assert.deepEqual(store.get(id).toolCache, cached, 'saving settings never drops the cached list');
+
+  const reset = await call({
+    method: 'PUT',
+    path: `/servers/${id}/tools`,
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ tools: [{ name: 'alpha', enabled: true, approval: false }, { name: 'beta', enabled: true, approval: false }] }),
+  });
+  assert.equal(reset.status, 200);
+  assert.deepEqual(store.get(id).toolOverrides, {}, 'returning to defaults clears the overrides');
+});
+
+test('api: PUT /servers/:id/tools validates the batch and the request', async (t) => {
+  const { call, store } = await harness(t);
+  const id = await createServer(call);
+  const put = (body) => call({ method: 'PUT', path: `/servers/${id}/tools`, headers: JSON_HEADERS, body: JSON.stringify(body) });
+  const validRow = { name: 'alpha', enabled: true, approval: false };
+
+  const emptyBatch = await put({ tools: [] });
+  assert.equal(emptyBatch.status, 200);
+
+  for (const body of [
+    {},
+    { tools: null },
+    { tools: 'nope' },
+    { tools: [null] },
+    { tools: ['nope'] },
+    { tools: [{ name: 'bad name', enabled: true, approval: false }] },
+    { tools: [{ name: '', enabled: true, approval: false }] },
+    { tools: [{ name: 'a', enabled: true }] },
+    { tools: [{ name: 'a', enabled: 1, approval: false }] },
+    { tools: [{ name: 'a', enabled: true, approval: 'true' }] },
+    { tools: [validRow, { ...validRow }] },
+    { tools: Array.from({ length: 501 }, (_, index) => ({ name: `t${index}`, enabled: true, approval: false })) },
+  ]) {
+    const result = await put(body);
+    assert.equal(result.status, 400, `${JSON.stringify(body).slice(0, 80)} must be a 400: ${JSON.stringify(result.body)}`);
+    assert.equal(result.body.ok, false);
+    assert.ok(['invalid-tools', 'invalid-tool-name'].includes(result.body.code), `unexpected code ${result.body.code}`);
+    assert.equal(result.body.field, 'tools');
+  }
+  assert.deepEqual(store.get(id).toolOverrides, {}, 'rejected batches never change the settings');
+
+  const malformedJson = await call({ method: 'PUT', path: `/servers/${id}/tools`, headers: JSON_HEADERS, body: '{ nope' });
+  assertError(malformedJson, 400, 'invalid-json');
+  const noJson = await call({ method: 'PUT', path: `/servers/${id}/tools`, body: JSON.stringify({ tools: [] }) });
+  assertError(noJson, 415, 'unsupported-media-type');
+  const crossSite = await call({
+    method: 'PUT',
+    path: `/servers/${id}/tools`,
+    headers: { ...JSON_HEADERS, origin: 'https://evil.example' },
+    body: JSON.stringify({ tools: [] }),
+  });
+  assertError(crossSite, 403, 'cross-origin');
+  const missing = await call({ method: 'PUT', path: '/servers/srv_missing/tools', headers: JSON_HEADERS, body: JSON.stringify({ tools: [] }) });
+  assertError(missing, 404, 'not-found');
+  for (const method of ['POST', 'PATCH', 'DELETE']) {
+    const wrong = await call({ method, path: `/servers/${id}/tools`, headers: JSON_HEADERS, body: JSON.stringify({ tools: [] }) });
+    assertError(wrong, 405, 'method-not-allowed');
+  }
+});
+
+test('api: server views report enabledToolCount from the live status', async (t) => {
+  const { call, manager } = await harness(t);
+  const id = await createServer(call);
+  const createdFallback = await call({ path: `/servers/${id}` });
+  assert.equal(createdFallback.body.server.status.enabledToolCount, 0);
+
+  const connection = liveConnection(id, [liveTool('alpha'), liveTool('beta')]);
+  connection.snapshot().enabledToolCount = 1;
+  manager.connections.set(id, connection);
+  const list = await call({ path: '/servers' });
+  assert.equal(list.body.servers[0].status.toolCount, 2);
+  assert.equal(list.body.servers[0].status.enabledToolCount, 1);
 });

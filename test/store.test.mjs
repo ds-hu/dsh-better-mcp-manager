@@ -117,7 +117,7 @@ test('store: the write is atomic, mode 0600, and leaves no temporary file', asyn
   assert.equal(dirMode, 0o700, `data directory mode must be 0700, got 0${dirMode.toString(8)}`);
 
   const raw = JSON.parse(await readFile(join(dir, STORE_FILE), 'utf8'));
-  assert.equal(STORE_VERSION, 2, '0.2.0 stores icon objects, so the schema moved to version 2');
+  assert.equal(STORE_VERSION, 3, '0.3.0 adds per-tool settings and the tool cache, so the schema moved to version 3');
   assert.equal(raw.version, STORE_VERSION);
   assert.equal(raw.servers.length, 1);
   assert.equal(raw.servers[0].name, 'Atomic');
@@ -149,6 +149,8 @@ test('store: a 0.1.0 (version 1) store migrates every emoji icon to auto', async
   assert.equal(summary.migrated, true, 'a version 1 file is migrated on load');
   assert.equal(summary.quarantined, undefined, 'a readable old version must not be quarantined');
   assert.deepEqual(store.list().map((server) => server.icon), [{ kind: 'auto' }, { kind: 'auto' }]);
+  assert.deepEqual(store.list().map((server) => server.toolOverrides), [{}, {}], 'a migrated record gets empty tool settings');
+  assert.deepEqual(store.list().map((server) => server.toolCache), [null, null], 'a migrated record gets no tool cache');
   assert.deepEqual(store.list().map((server) => server.name), ['Legacy A', 'Legacy B']);
   assert.ok(warnings.some(([level, message]) => level === 'warn' && message.includes('migrated') && message.includes('schema version 1')));
 
@@ -159,6 +161,49 @@ test('store: a 0.1.0 (version 1) store migrates every emoji icon to auto', async
   const raw = JSON.parse(await readFile(join(dir, STORE_FILE), 'utf8'));
   assert.equal(raw.version, STORE_VERSION);
   assert.deepEqual(raw.servers.map((server) => server.icon), [{ kind: 'auto' }, { kind: 'auto' }]);
+  assert.deepEqual(raw.servers.map((server) => server.toolOverrides), [{}, {}]);
+  assert.equal(raw.version, 3);
+});
+
+test('store: a 0.2 store (version 2) migrates its icon object and gains tool defaults', async (t) => {
+  const dir = await tempDir(t);
+  const record = draft('Zero two');
+  record.icon = { kind: 'upload', file: 'srv_1f3c9a2b70.png', mimeType: 'image/png', updatedAt: '2026-11-16T10:00:00.000Z' };
+  await writeFile(join(dir, STORE_FILE), JSON.stringify({ version: 2, servers: [record] }), { mode: 0o600 });
+
+  const warnings = [];
+  const store = createStore({ dir, logger: (level, message) => warnings.push([level, message]) });
+  const summary = await store.load();
+  assert.equal(summary.loaded, 1);
+  assert.equal(summary.migrated, true);
+  assert.deepEqual(store.get(record.id).icon, record.icon, 'the 0.2 upload icon is preserved');
+  assert.deepEqual(store.get(record.id).toolOverrides, {});
+  assert.equal(store.get(record.id).toolCache, null);
+  assert.ok(warnings.some(([level, message]) => level === 'warn' && message.includes('schema version 2')));
+  await store.close();
+});
+
+test('store: invalid tool settings in a version 3 store are normalized per record', async (t) => {
+  const dir = await tempDir(t);
+  const bad = { ...draft('Bad tools'), toolOverrides: 'nope', toolCache: { at: 1, tools: [] } };
+  const forged = { ...draft('Forged'), toolOverrides: { echo: { enabled: true }, share: { approval: true } }, toolCache: null };
+  const good = {
+    ...draft('Good tools'),
+    toolOverrides: { echo: { enabled: false } },
+    toolCache: { at: '2026-11-16T21:00:00.000Z', tools: [{ name: 'echo', publicName: 'mcp__k__echo', description: '', params: [] }] },
+  };
+  await writeFile(join(dir, STORE_FILE), JSON.stringify({ version: STORE_VERSION, servers: [bad, forged, good] }), { mode: 0o600 });
+
+  const store = createStore({ dir });
+  const summary = await store.load();
+  assert.equal(summary.loaded, 3, 'damaged tool fields never drop the record');
+  assert.equal(summary.migrated, false);
+  assert.deepEqual(store.get(bad.id).toolOverrides, {});
+  assert.equal(store.get(bad.id).toolCache, null);
+  assert.deepEqual(store.get(forged.id).toolOverrides, { share: { approval: true } }, 'default restatements are normalized away');
+  assert.deepEqual(store.get(good.id).toolOverrides, { echo: { enabled: false } });
+  assert.deepEqual(store.get(good.id).toolCache, good.toolCache);
+  await store.close();
 });
 
 test('store: invalid or missing icons in a version 2 store reset to auto', async (t) => {
@@ -286,4 +331,39 @@ test('store: a write failure is reported to the caller, not swallowed', async (t
   await writeFile(blocker, 'x');
   const store = createStore({ dir: join(blocker, 'inside') });
   await assert.rejects(() => store.load(), 'a data directory that cannot be created must fail loudly');
+});
+
+test('store: patch is a serialized read-modify-write that reports what happened', async (t) => {
+  const dir = await tempDir(t);
+  const store = createStore({ dir });
+  await store.load();
+  const first = draft('Patch A');
+  const second = draft('Patch B');
+  await store.put(first);
+  await store.put(second);
+
+  assert.equal(await store.patch(first.id, (latest) => ({ ...latest, name: 'Patched' })), true);
+  assert.equal(store.get(first.id).name, 'Patched');
+  assert.equal(store.get(second.id).name, 'Patch B', 'other records are untouched');
+
+  assert.equal(await store.patch('srv_missing', (latest) => latest), false, 'an unknown id reports false');
+  assert.equal(await store.patch(first.id, () => undefined), false, 'an updater that declines reports false');
+  assert.equal(store.get(first.id).name, 'Patched', 'a declined patch changes nothing');
+
+  // Concurrent patches must not clobber each other: each updater sees the
+  // previous patch's result because the read-modify-write runs in queue order.
+  const results = await Promise.all(
+    Array.from({ length: 5 }, () => store.patch(second.id, (latest) => ({ ...latest, mark: (latest.mark ?? 0) + 1 }))),
+  );
+  assert.deepEqual(results, [true, true, true, true, true]);
+  assert.equal(store.get(second.id).mark, 5, 'every concurrent patch was applied');
+  await store.close();
+
+  const raw = JSON.parse(await readFile(join(dir, STORE_FILE), 'utf8'));
+  assert.equal(raw.servers.find((server) => server.id === second.id).mark, 5, 'the accumulated result was persisted');
+  assert.equal(raw.servers.find((server) => server.id === first.id).name, 'Patched');
+  const reopened = createStore({ dir });
+  await reopened.load();
+  assert.equal(reopened.get(second.id).mark, 5);
+  await reopened.close();
 });

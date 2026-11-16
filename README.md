@@ -25,7 +25,9 @@ failed when it did.
 The part that is not just a form: **each server chooses which agent presets receive its tools**.
 A database MCP server can be given to a backend preset, a browser server to a research preset, and
 nothing at all to presets that should not have them — without editing preset YAML, and the change
-applies to live agents as soon as you save.
+applies to live agents as soon as you save. The same page also manages **individual tools**: hide
+one tool from every agent while keeping the rest, and make a tool ask for your approval before it
+runs outside full-access sessions.
 
 ## Features
 
@@ -39,10 +41,14 @@ applies to live agents as soon as you save.
 - **Icons and groups**: a card shows the icon its MCP server declares, falls back to the name's
   first letter, or uses your own uploaded PNG/JPEG/WebP/GIF (≤512 KiB) — there is no built-in emoji
   palette. Ungrouped servers are shown last as 其他（未分组）.
-- **Live status**: Connected / Connecting / Retrying / Connection failed / Disabled, tool count, last
-  error with a 详情 dialog containing the full message and detail.
+- **Live status**: Connected / Connecting / Retrying / Connection failed / Disabled, enabled and
+  discovered tool counts, last error with a 详情 dialog containing the full message and detail.
 - **Per-server preset exposure**: 全部预设 or 指定预设 with checkboxes for the presets the Host
   offers.
+- **Per-tool settings**: the edit sheet's **工具** tab lists each discovered tool with its
+  description and parameters; enable or disable it, and turn on **需要审批** to ask before every
+  call outside 完全权限 sessions. The card shows enabled/discovered counts, and the tab still shows
+  the last known list while the server is offline.
 - **Test connection** on an unsaved draft before saving it.
 - **Per-server tool timeout**, default 60 seconds.
 
@@ -114,7 +120,19 @@ started its first turn yet is re-bound when it selects another preset.
 The public tool name is `mcp__<key>__<tool>`; the key is allocated from the server name once and
 never changes, so tool names stay stable across renames.
 
-### 4. Watch the status
+### 4. Choose which tools are exposed
+
+Open a saved server for editing and switch to the **工具** tab. It lists every tool the server
+discovered, with its description and parameter names, plus an enable switch per tool and a
+**需要审批** switch. **全部开启** / **全部关闭** flip the whole list; **保存工具设置** applies the
+changes to live agents immediately. The card's status line shows the **enabled / discovered** tool
+counts (for example `工具 1/2` after disabling one of two tools).
+
+The tab keeps a cached copy of the last discovered tool list, so it still shows the tools with
+**更新于 …** while the server is disconnected; a brand-new server asks you to save and connect it
+first. See [Tools](#tools) for what enable and approval actually do.
+
+### 5. Watch the status
 
 The card's status line updates every 2.5 seconds while the page is open:
 
@@ -124,9 +142,9 @@ The card's status line updates every 2.5 seconds while the page is open:
 已停用 · SSE
 ```
 
-If a server fails, the card shows the first two lines of the error; **详情** opens the full message
-and transport detail. **重新连接** starts a fresh attempt immediately; **测试连接** probes the
-saved server again.
+The two numbers are **enabled / discovered** tools. If a server fails, the card shows the first two
+lines of the error; **详情** opens the full message and transport detail. **重新连接** starts a fresh
+attempt immediately; **测试连接** probes the saved server again.
 
 ## Icons
 
@@ -148,6 +166,34 @@ icon set. It comes from exactly two places.
   <img src="docs/screenshots/mcp-manager-form-icon.png" alt="The server form's 服务器图标 row: the live MCP server icon in the preview, 上传图标 and 恢复自动 buttons, the automatic-icon hint and color swatches" width="760">
 </p>
 
+## Tools
+
+Every saved server has a **工具** tab next to **基础设置**. It is the only place that decides what
+happens to the tools the server discovered; the saved server record keeps those decisions, so they
+survive reconnects and restarts.
+
+- **Enable / disable a tool.** A disabled tool is never registered for any agent or preset — it is
+  absent from the model's tool list entirely, not just hidden in the page. Disabling does not stop
+  the server from refreshing its tool list; it only controls exposure. A server whose tools are all
+  disabled contributes neither tools nor its system-prompt instruction section to an agent.
+- **Require approval per tool.** **需要审批** means "ask me before this runs, unless the session is
+  in **完全权限**". The decision is made per call from the calling session's permission preset: in
+  完全权限 (`danger-full-access`) the tool runs directly; in every other mode DSH shows its
+  **等待审批** composer with the reason and **拒绝 / 允许一次** buttons. The MCP server is only
+  called after **允许一次**; rejecting, cancelling, closing the prompt or having no approval channel
+  makes the tool call fail with a readable error and never reaches the server. This is a per-call
+  confirmation, not a sandbox: the Host's own permission system still applies.
+- **Offline editing.** The tab works from the last known tool list when the server is disconnected
+  (it says **更新于 …**). The list is refreshed whenever the server connects or when the tab is
+  opened for a connected server; a tool added on the server side appears after that refresh.
+- **Saving.** **保存工具设置** stores only deviations from the defaults (a disabled tool, an
+  approval-required tool), re-binds every live agent immediately and updates the card counts. The
+  page stays on the tab and confirms **工具设置已保存** or shows the failure.
+
+<p align="center">
+  <img src="docs/screenshots/mcp-manager-form-tools.png" alt="The 工具 tab: 工具列表 with 已启用 2/2, 全部开启/全部关闭, per-tool switches and 需要审批, parameter chips and 保存工具设置" width="820">
+</p>
+
 ## Data and security
 
 - All plugin state is one JSON file, `$DSH_HOME/better-mcp-manager/servers.json` (mode `0600`, inside
@@ -155,7 +201,9 @@ icon set. It comes from exactly two places.
   each file `0600`). Nothing is written to the profile, to preset YAML or to the sessions directory.
   Mounting the plugin creates the data directory; the JSON file appears when you save the first
   server. Server-declared HTTP icons are fetched by the Host and cached in memory only — they are
-  never written to disk.
+  never written to disk. Per-tool enable/approval choices and the cached tool descriptors (name,
+  public name, description, parameter names, timestamps) are stored in the same JSON file; the cache
+  never contains headers, tokens or other credentials.
 - **Secrets are stored in that file in plaintext**: custom header values, a bearer token and a
   `client_credentials` secret. Protect the machine and the file; do not commit it, paste it into an
   issue, or copy it to a shared host.
@@ -175,7 +223,8 @@ and the icons, or delete it with the clean CLI (below) to remove every trace.
 
 ## Uninstall
 
-Remove the bundle, then delete the one data directory (server list and uploaded icons):
+Remove the bundle, then delete the one data directory (server list, per-tool settings and uploaded
+icons):
 
 ```bash
 # 1. remove the bundle — CLI, Plugins page (Remove), or plugin_manager remove_bundle
@@ -200,14 +249,19 @@ prints the data directory. Both only read.
 
 ## Compatibility and limitations
 
-- **Tools and server instructions only.** 0.2.0 does not expose MCP resources, resource templates,
+- **Tools and server instructions only.** 0.3.0 does not expose MCP resources, resource templates,
   prompt templates or sampling. A server that offers only resources has nothing to show here.
 - **One connection per enabled server**, shared by every agent the server is exposed to. Tools are
-  registered per agent preset, not per session and not per tool: the whole tool set follows the
-  server.
-- **No per-tool enable/disable**, and no per-tool preset rules.
+  registered per agent preset and per tool: only the enabled tools of an allowed server reach an
+  agent.
+- **Per-tool settings are enable and approval only.** There are no per-tool preset rules, no
+  per-tool timeout and no per-tool schema override, and approval is a per-call confirmation, not a
+  replacement for the Host's permission system.
+- **Approval is skipped exactly in 完全权限.** In the `danger-full-access` permission preset a
+  **需要审批** tool runs without asking; every other preset asks. If the Host exposes no approval
+  service (or the call has no agent), an approval-required tool is denied rather than allowed.
 - **OAuth settings are bearer or client-credentials only.** There is no authorization-code/PKCE
-  flow, so a server that requires an interactive browser login cannot be connected.
+  flow, so a server that requires an interactive browser login cannot be connected in 0.3.0.
 - **No YAML import or migration.** MCP servers configured through the built-in
   `@deepseek-ai/dsh-mcp-client` rows keep working untouched; this page does not show them, and
   deleting a row here never touches them.
@@ -221,6 +275,9 @@ prints the data directory. Both only read.
 - **Uploads are raster only.** PNG, JPEG, WebP and GIF up to 512 KiB; SVG is rejected on purpose.
 - **Preset selection is fixed once a session's first turn starts.** Choose the preset before the
   conversation begins; the binder re-binds a blank session when it selects another preset.
+- **The tool list in the 工具 tab can be stale while offline.** It shows the descriptors cached from
+  the last `tools/list`; reconnect (or open the tab on a connected server) to refresh it. Tool
+  settings themselves are always current.
 - The server list lives per `$DSH_HOME`, not per profile: profiles under the same DSH home share
   it. Use a separate `$DSH_HOME` if you need an isolated list.
 
@@ -231,18 +288,22 @@ prints the data directory. Both only read.
 | **连接失败** with a connection error | Is the server running and reachable from the DSH host? Is the URL the MCP endpoint (usually `…/mcp`)? HTTP and SSE are different transports — use the one the server documents. |
 | **连接失败** with an auth error | Does the server expect a header or OAuth? A custom `Authorization` header wins over a bearer token. Client-credentials fields must match the identity provider. |
 | **连接失败** for a stdio server | Is the command on the Host's `PATH`? Do the arguments exist? Open **详情**; a command-not-found or exit error is in the detail. |
-| Tools do not appear in a session | Is the server **已连接**? Is the session's preset in the server's **指定预设** list? Did the session start before the server was added — save again or open a new session to re-bind it. |
+| Tools do not appear in a session | Is the server **已连接**? Is the session's preset in the server's **指定预设** list? Is the tool enabled in the edit sheet's **工具** tab? Did the session start before the server was added — save again or open a new session to re-bind it. |
+| A **需要审批** tool runs without asking | The session is in **完全权限** (`danger-full-access`): approval is deliberately skipped there. Switch the session's permission preset to ask again. |
+| An approval-required tool call fails without a prompt | The Host exposed no approval channel, the call had no agent, or the prompt was rejected/cancelled. The tool is denied before the MCP server is called; start the call from a normal session. |
 | Tools from two servers collide | Public tool names are namespaced by each server's immutable key. If a name still clashes, the two servers' raw tool names collide after normalisation — delete and re-add one server (which allocates a new key) or remove the colliding tool. |
 | A card shows a letter instead of the server's icon | The MCP server declares no icon, or its icon could not be fetched within 5 s / 512 KiB / a supported raster type. The letter is the documented fallback; upload an icon to override it. |
 | Uploading an icon fails | Only PNG/JPEG/WebP/GIF up to 512 KiB are accepted (SVG is not); the form validates the file before upload and shows the reason. |
 | Save answers `403` | A reverse proxy that rewrites the `Host` header breaks the same-origin check. Preserve the original `Host` for the DSH web port. |
+| **保存工具设置** fails | The server record was deleted in another window, or the Host restarted. Reload the page and reopen the tab; the previous settings are untouched. |
+| The **工具** tab shows an old tool list | The server is disconnected and the tab is showing **更新于 …** from the last discovery. Reconnect the server (or reopen the tab on a connected one) to refresh. |
 | The page shows an empty list with no error | The Host half is not running: check that the bundle is enabled and `GET /better-mcp-manager/api/health` answers. |
 
 ## Documentation
 
 | Document | What is in it |
 |---|---|
-| [docs/TECHNICAL.md](docs/TECHNICAL.md) | Architecture, icon model, data model, HTTP API, security, lifecycle, uninstall, testing |
+| [docs/TECHNICAL.md](docs/TECHNICAL.md) | Architecture, icon model, tool management, approval seam, data model, HTTP API, security, lifecycle, uninstall, testing |
 | [CONTEXT.md](CONTEXT.md) | The vocabulary and invariants this plugin is built on |
 | [docs/adr](docs/adr) | Why the design is what it is |
 | [docs/API-CONTRACT.md](docs/API-CONTRACT.md) | The frozen Host/Client/data contract |

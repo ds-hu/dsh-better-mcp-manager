@@ -352,10 +352,10 @@ check('every write target is computed from the data directory', () => {
 check('the shared constants match package.json and the contract', () => {
   if (versionModule.error) throw new Error(`lib/version.js could not be imported: ${versionModule.error.message}`);
   const constants = versionModule.module;
-  assert.equal(manifest.version, '0.2.0', 'this is the 0.2.0 icon release (docs/API-CONTRACT.md is frozen for 0.2.0)');
+  assert.equal(manifest.version, '0.3.0', 'this is the 0.3.0 per-tool settings release (docs/API-CONTRACT.md is frozen for 0.3.0)');
   assert.equal(constants.PLUGIN_VERSION, manifest.version, 'PLUGIN_VERSION must equal package.json version');
   const contract = read('docs/API-CONTRACT.md');
-  assert.match(contract, /frozen for 0\.2\.0/u, 'docs/API-CONTRACT.md must be frozen for 0.2.0');
+  assert.match(contract, /frozen for 0\.3\.0/u, 'docs/API-CONTRACT.md must be frozen for 0.3.0');
   assert.equal(constants.DATA_DIR_NAME, 'better-mcp-manager', 'DATA_DIR_NAME must be the frozen data directory name');
   assert.equal(constants.API_PREFIX, '/better-mcp-manager/api', 'API_PREFIX must match the frozen API base');
   assert.equal(constants.PANEL_ID, 'mcp-manager', 'PANEL_ID must be the frozen sidebar id');

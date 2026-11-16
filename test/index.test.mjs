@@ -199,7 +199,7 @@ test('index: mounting a 0.1.0 store migrates the emoji icons and logs it', async
   await new Promise((resolve) => setTimeout(resolve, 50));
 
   assert.ok(
-    logs.some(([level, message]) => level === 'warn' && message.includes('migrated the store to schema version 2')),
+    logs.some(([level, message]) => level === 'warn' && message.includes('migrated the store to schema version 3')),
     `the mount must log the store migration, got ${JSON.stringify(logs)}`,
   );
   assert.equal(routes.length, 1);

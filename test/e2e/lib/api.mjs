@@ -147,6 +147,14 @@ export class InstanceApi {
     };
   }
 
+  async tools(id) {
+    return (await this.get(`/better-mcp-manager/api/servers/${encodeURIComponent(id)}/tools`)).payload;
+  }
+
+  async putTools(id, tools) {
+    return (await this.put(`/better-mcp-manager/api/servers/${encodeURIComponent(id)}/tools`, { tools })).payload;
+  }
+
   async uploadIcon(id, dataUrl) {
     return (await this.post(`/better-mcp-manager/api/servers/${encodeURIComponent(id)}/icon`, { dataUrl })).payload;
   }

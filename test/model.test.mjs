@@ -7,20 +7,31 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
   allocateKey,
+  applyToolSettings,
   AUTO_ICON,
+  buildToolCache,
   createServerId,
   DEFAULT_TIMEOUT_MS,
   ICON_MIME_EXT,
   InputError,
   keyFromName,
+  MAX_CACHED_DESCRIPTION,
+  MAX_CACHED_PARAMS,
+  MAX_CACHED_TOOLS,
   MAX_ICON_BYTES,
   MAX_ICON_JSON_BYTES,
+  MAX_TOOL_OVERRIDES,
   normalizeDraft,
   normalizeStoredIcon,
+  normalizeToolCache,
+  normalizeToolOverrides,
   presetAllows,
   publicToolName,
   SERVER_COLORS,
   serverView,
+  toolEnabled,
+  toolNeedsApproval,
+  toolParameters,
   TRANSPORTS,
   transportLabel,
 } from '../lib/model.js';
@@ -473,4 +484,161 @@ test('model: presetAllows implements the contract exposure rule', () => {
   assert.equal(presetAllows({ presets: ['standard'] }, 'unknown-preset'), false);
   assert.equal(presetAllows({ presets: 'garbage' }, 'standard'), false, 'a corrupt record must not leak tools');
   assert.equal(presetAllows({ presets: 'garbage' }, undefined), false);
+});
+
+/* ---------------------------------------------------------------- */
+/* 0.3.0 per-tool settings and offline cache                         */
+/* ---------------------------------------------------------------- */
+
+test('model: tool-settings constants and override normalization follow the contract', () => {
+  assert.equal(MAX_TOOL_OVERRIDES, 500);
+  assert.equal(MAX_CACHED_TOOLS, 300);
+  assert.equal(MAX_CACHED_DESCRIPTION, 2000);
+  assert.equal(MAX_CACHED_PARAMS, 64);
+
+  assert.deepEqual(normalizeToolOverrides(undefined), {});
+  assert.deepEqual(normalizeToolOverrides(null), {});
+  assert.deepEqual(normalizeToolOverrides([]), {});
+  assert.deepEqual(normalizeToolOverrides('nope'), {});
+  assert.deepEqual(normalizeToolOverrides({ tool: {} }), {}, 'a default restatement is dropped');
+  assert.deepEqual(normalizeToolOverrides({ tool: { enabled: true } }), {});
+  assert.deepEqual(normalizeToolOverrides({ tool: { approval: false } }), {});
+  assert.deepEqual(normalizeToolOverrides({ tool: { enabled: false } }), { tool: { enabled: false } });
+  assert.deepEqual(normalizeToolOverrides({ tool: { approval: true } }), { tool: { approval: true } });
+  assert.deepEqual(normalizeToolOverrides({ tool: { enabled: false, approval: true } }), { tool: { enabled: false, approval: true } });
+  assert.deepEqual(normalizeToolOverrides({ tool: { enabled: false, approval: true, extra: 'x' } }), { tool: { enabled: false, approval: true } }, 'unknown fields are dropped');
+  assert.deepEqual(normalizeToolOverrides({ 'bad name': { enabled: false }, ok: { enabled: false } }), { ok: { enabled: false } });
+  assert.deepEqual(normalizeToolOverrides({ ['x'.repeat(129)]: { enabled: false } }), {}, 'names are at most 128 non-space chars');
+  assert.deepEqual(normalizeToolOverrides({ tool: 'no' }), {});
+  assert.deepEqual(normalizeToolOverrides({ tool: [] }), {});
+
+  const many = {};
+  for (let index = 0; index < MAX_TOOL_OVERRIDES + 5; index += 1) many[`tool_${index}`] = { enabled: false };
+  assert.equal(Object.keys(normalizeToolOverrides(many)).length, MAX_TOOL_OVERRIDES, 'the map is capped at 500 entries');
+});
+
+test('model: toolEnabled and toolNeedsApproval read the stored overrides with safe defaults', () => {
+  assert.equal(toolEnabled({}, 'echo'), true);
+  assert.equal(toolEnabled({ toolOverrides: {} }, 'echo'), true);
+  assert.equal(toolEnabled({ toolOverrides: { echo: { enabled: false } } }, 'echo'), false);
+  assert.equal(toolEnabled({ toolOverrides: { echo: { approval: true } } }, 'echo'), true);
+  assert.equal(toolEnabled(undefined, 'echo'), true, 'a missing record must not hide tools');
+  assert.equal(toolNeedsApproval({}, 'echo'), false);
+  assert.equal(toolNeedsApproval({ toolOverrides: { echo: { approval: true } } }, 'echo'), true);
+  assert.equal(toolNeedsApproval({ toolOverrides: { echo: { enabled: false } } }, 'echo'), false);
+  assert.equal(toolNeedsApproval({ toolOverrides: { other: { approval: true } } }, 'echo'), false);
+});
+
+test('model: applyToolSettings validates a batch and stores only non-default overrides', () => {
+  const empty = { id: 'srv_1', toolOverrides: {} };
+  assert.deepEqual(applyToolSettings(empty, [{ name: 'a', enabled: true, approval: false }]), {}, 'defaults are not stored');
+  assert.deepEqual(applyToolSettings(empty, [{ name: 'a', enabled: false, approval: false }]), { a: { enabled: false } });
+  assert.deepEqual(applyToolSettings(empty, [{ name: 'a', enabled: true, approval: true }]), { a: { approval: true } });
+  assert.deepEqual(applyToolSettings(empty, [{ name: 'a', enabled: false, approval: true }]), { a: { enabled: false, approval: true } });
+  assert.deepEqual(applyToolSettings(empty, [
+    { name: 'b', enabled: false, approval: false },
+    { name: 'a', enabled: true, approval: true },
+  ]), { a: { approval: true }, b: { enabled: false } }, 'the result is order-independent');
+
+  const existing = { id: 'srv_1', toolOverrides: { gone: { enabled: false }, kept: { approval: true } } };
+  assert.deepEqual(applyToolSettings(existing, [{ name: 'kept', enabled: true, approval: true }]), { kept: { approval: true } }, 'unmentioned tools return to defaults');
+  assert.deepEqual(applyToolSettings(existing, [{ name: 'gone', enabled: false, approval: true }]), { gone: { enabled: false, approval: true } }, 'previous flags merge into the batch row');
+
+  const expectToolError = (fn, code) => {
+    let caught;
+    assert.throws(fn, (error) => {
+      caught = error;
+      return error instanceof InputError;
+    }, `expected InputError(${code})`);
+    assert.equal(caught.code, code);
+    assert.equal(caught.field, 'tools');
+  };
+  expectToolError(() => applyToolSettings(empty, undefined), 'invalid-tools');
+  expectToolError(() => applyToolSettings(empty, {}), 'invalid-tools');
+  expectToolError(() => applyToolSettings(empty, Array.from({ length: MAX_TOOL_OVERRIDES + 1 }, (_, index) => ({ name: `t${index}`, enabled: true, approval: false }))), 'invalid-tools');
+  expectToolError(() => applyToolSettings(empty, [null]), 'invalid-tools');
+  expectToolError(() => applyToolSettings(empty, ['nope']), 'invalid-tools');
+  expectToolError(() => applyToolSettings(empty, [{ name: 'bad name', enabled: true, approval: false }]), 'invalid-tool-name');
+  expectToolError(() => applyToolSettings(empty, [{ name: '', enabled: true, approval: false }]), 'invalid-tool-name');
+  expectToolError(() => applyToolSettings(empty, [{ name: 'a', enabled: true }, ]), 'invalid-tools');
+  expectToolError(() => applyToolSettings(empty, [{ name: 'a', enabled: 'true', approval: false }]), 'invalid-tools');
+  expectToolError(() => applyToolSettings(empty, [{ name: 'a', enabled: true, approval: 1 }]), 'invalid-tools');
+  expectToolError(() => applyToolSettings(empty, [
+    { name: 'a', enabled: true, approval: false },
+    { name: 'a', enabled: false, approval: false },
+  ]), 'invalid-tools');
+});
+
+test('model: toolParameters derives bounded parameter chips from an input schema', () => {
+  assert.deepEqual(toolParameters(undefined), []);
+  assert.deepEqual(toolParameters(null), []);
+  assert.deepEqual(toolParameters({}), []);
+  assert.deepEqual(toolParameters({ properties: [] }), []);
+  assert.deepEqual(
+    toolParameters({ properties: { b: {}, a: {} }, required: ['a', 'missing'] }),
+    [{ name: 'b', required: false }, { name: 'a', required: true }],
+    'property order is preserved and only string required names count',
+  );
+  const wide = { properties: Object.fromEntries(Array.from({ length: MAX_CACHED_PARAMS + 3 }, (_, index) => [`p${index}`, {}])) };
+  assert.equal(toolParameters(wide).length, MAX_CACHED_PARAMS, 'parameter chips are capped at 64');
+});
+
+test('model: buildToolCache and normalizeToolCache agree on the cached descriptor shape', () => {
+  const now = () => Date.parse('2026-11-16T21:00:00.000Z');
+  const live = [
+    { rawName: 'echo', publicName: 'mcp__k__echo', description: 'Echo', inputSchema: { properties: { text: {} }, required: ['text'] } },
+    { rawName: 'bad name', publicName: 'x', description: 'skipped' },
+    { rawName: 'brief', publicName: undefined, description: undefined, inputSchema: undefined },
+  ];
+  const cache = buildToolCache(live, now);
+  assert.equal(cache.at, '2026-11-16T21:00:00.000Z');
+  assert.deepEqual(cache.tools, [
+    { name: 'echo', publicName: 'mcp__k__echo', description: 'Echo', params: [{ name: 'text', required: true }] },
+    { name: 'brief', publicName: 'brief', description: '', params: [] },
+  ], 'invalid live descriptors are skipped and missing fields get defaults');
+  assert.deepEqual(normalizeToolCache(cache), cache, 'a built cache normalizes to itself');
+  assert.deepEqual(normalizeToolCache(buildToolCache([], now)), { at: '2026-11-16T21:00:00.000Z', tools: [] });
+
+  const long = { rawName: 'long', description: 'x'.repeat(MAX_CACHED_DESCRIPTION + 50) };
+  assert.equal(buildToolCache([long], now).tools[0].description.length, MAX_CACHED_DESCRIPTION);
+  const many = Array.from({ length: MAX_CACHED_TOOLS + 5 }, (_, index) => ({ rawName: `t${index}` }));
+  assert.equal(buildToolCache(many, now).tools.length, MAX_CACHED_TOOLS, 'at most 300 cached tools');
+
+  assert.equal(normalizeToolCache(null), null);
+  assert.equal(normalizeToolCache('nope'), null);
+  assert.equal(normalizeToolCache({ tools: [] }), null, 'a cache needs its timestamp');
+  assert.equal(normalizeToolCache({ at: 42, tools: [] }), null);
+  assert.equal(normalizeToolCache({ at: 'x' }), null);
+  const normalized = normalizeToolCache({
+    at: '2026-11-16T21:00:00.000Z',
+    extra: 'dropped',
+    tools: [
+      { name: 'ok', publicName: 42, description: 'fine', params: [{ name: 'p', required: true }, { name: 'q' }, { name: 3, required: false }], extra: 'dropped' },
+      { name: 'skip-no-description' },
+      { name: 'bad name', description: '' },
+      null,
+    ],
+  });
+  assert.deepEqual(normalized, {
+    at: '2026-11-16T21:00:00.000Z',
+    tools: [{ name: 'ok', publicName: 'ok', description: 'fine', params: [{ name: 'p', required: true }] }],
+  }, 'damaged cache entries are skipped, unknown fields dropped');
+});
+
+test('model: drafts ignore tool settings and the panel view never exposes them', () => {
+  const existing = normalizeDraft(httpDraft(), { now: () => NOW });
+  existing.toolOverrides = { echo: { enabled: false }, share: { approval: true } };
+  existing.toolCache = { at: '2026-11-16T21:00:00.000Z', tools: [{ name: 'echo', publicName: 'mcp__k__echo', description: '', params: [] }] };
+
+  const updated = normalizeDraft(httpDraft({ name: 'Renamed', toolOverrides: { forged: { enabled: false } }, toolCache: { at: 'forged', tools: [] } }), { existing, now: () => NOW });
+  assert.deepEqual(updated.toolOverrides, { echo: { enabled: false }, share: { approval: true } }, 'stored settings are preserved and drafts cannot forge them');
+  assert.deepEqual(updated.toolCache, existing.toolCache, 'the cached list is preserved');
+
+  const created = normalizeDraft(httpDraft({ toolOverrides: { forged: { enabled: false } }, toolCache: { at: 'x', tools: [] } }), { now: () => NOW });
+  assert.deepEqual(created.toolOverrides, {}, 'a new server starts with no overrides');
+  assert.equal(created.toolCache, null, 'a new server starts with no cache');
+
+  const view = serverView(updated);
+  assert.equal('toolOverrides' in view, false, 'tool settings have their own endpoint');
+  assert.equal('toolCache' in view, false);
 });

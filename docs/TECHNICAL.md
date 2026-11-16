@@ -11,6 +11,7 @@ and one of them is a bug.
 - [Result projection](#result-projection)
 - [Data model](#data-model)
 - [Icons](#icons)
+- [Tools](#tools)
 - [Preset exposure](#preset-exposure)
 - [Tool naming and definitions](#tool-naming-and-definitions)
 - [HTTP API](#http-api)
@@ -43,18 +44,19 @@ YAML, and imports no `@deepseek-ai/*` module. Everything the user configures liv
 plus at most one icon file per server under `$DSH_HOME/better-mcp-manager/`. The only runtime
 dependency is `@modelcontextprotocol/client` (2.2.0, MIT) for the MCP wire protocol.
 See [ADR 2](adr/0002-own-mcp-connection-manager.md),
-[ADR 5](adr/0005-hand-built-tool-definition.md) and
-[ADR 6](adr/0006-server-and-upload-icons.md).
+[ADR 5](adr/0005-hand-built-tool-definition.md),
+[ADR 6](adr/0006-server-and-upload-icons.md) and
+[ADR 7](adr/0007-tool-enablement-and-approval.md).
 
 ## Architecture
 
 ```
 Host (lib/index.js)
-├── store ........ servers.json: load, validate, atomic save (schema v2)
+├── store ........ servers.json: load, validate, atomic save, serialized patch (schema v3)
 ├── manager ...... one connection supervisor per enabled server + auto-icon fetch/cache
-├── binder ....... registers the allowed servers' tools on each live agent
+├── binder ....... registers each allowed server's enabled tools on live agents
 ├── icons ........ uploaded-icon decoding, raster checks, icons/ storage (0600)
-├── api .......... /better-mcp-manager/api/* (one prefix route, incl. icon endpoints)
+├── api .......... /better-mcp-manager/api/* (one prefix route, incl. icon and tool endpoints)
 └── dispose ...... close connections, release agent registrations, unregister route
 ```
 
@@ -65,7 +67,9 @@ Mounting the Host half:
 1. starts loading `servers.json` (the load ensures the data directory exists in mode `0700`; a missing
    file is an empty store; a file that is not JSON or has an unknown shape/version is quarantined as
    `servers.json.corrupt-<iso>` and the store starts empty, while individually malformed records are
-   dropped and their valid siblings kept; schema-version-1 icons migrate in memory);
+   dropped and their valid siblings kept; a version-1 or version-2 file migrates in memory to
+   version 3 — legacy emoji-string icons become automatic, missing `toolOverrides`/`toolCache` become
+   `{}`/`null`);
 2. registers the HTTP prefix route and the `agent/created` / `agent/disposed` /
    `agent-preset/selected` listeners synchronously as effects;
 3. converges in the background once loading finishes: one supervisor per **enabled** server, then a
@@ -89,13 +93,15 @@ a bad URL cannot lose the rest of the edit, and a failed connection cannot roll 
 ## Connection manager
 
 `lib/mcp.js` owns one supervisor per server. Its public surface for the rest of the Host is
-deliberately small: start, stop, reconfigure, status, cached tools, cached instructions, resolve the
-automatic icon, and `callTool(rawName, args, execution)`.
+deliberately small: start, stop, reconfigure, status, cached tools and instructions (including the
+descriptors the tool cache is built from), resolve the automatic icon, and
+`callTool(rawName, args, execution)`.
 
 **States.** The supervisor's own values are `disabled`, `connecting`, `connected` and `error`; while
 an `error` server is waiting for its next attempt, `nextRetryAt` is set, which the page presents as
-**重连中**. Each snapshot also carries `attempts`, `connectedAt`, `lastAttemptAt`, `nextRetryAt` and
-the last `error` (`{ code, message, detail, at }`). The state is derived, never stored.
+**重连中**. Each snapshot also carries `attempts`, `connectedAt`, `lastAttemptAt`, `nextRetryAt`,
+`toolCount`/`discoveredCount`, `enabledToolCount` and the last `error`
+(`{ code, message, detail, at }`). The state is derived, never stored.
 
 ```
 disabled ──enable──▶ connecting ──ok──▶ connected
@@ -113,8 +119,10 @@ disabled ──enable──▶ connecting ──ok──▶ connected
   There is no "give up" state: a laptop MCP server that comes back after lunch recovers on its own.
   A manual reconnect resets the attempt counter and attempts immediately.
 - **Tool-list changes** — the SDK's `tools/list_changed` notification delivers a fresh list; the
-  supervisor re-adopts and re-exposes every live agent. A refresh error keeps the previous set, and
-  a public-name collision keeps the first tool and logs a warning.
+  supervisor re-adopts and re-exposes every live agent, and `lib/index.js` writes the new descriptors
+  to `toolCache` through the serialized `store.patch` (skipped when the descriptors are unchanged). A
+  refresh error keeps the previous set, and a public-name collision keeps the first tool and logs a
+  warning.
 - **Disable** — stop retrying, close the transport, drop cached tools, remove the server's tools and
   instructions from every live agent, status becomes `disabled`.
 - **Delete** — same as disable, then the record is removed from the store.
@@ -122,8 +130,8 @@ disabled ──enable──▶ connecting ──ok──▶ connected
 
 A save only restarts the connection when the **connection configuration** changed: transport, URL,
 command, args, env, cwd, headers or OAuth. Renaming, regrouping, changing the icon, changing the
-timeout, or changing preset exposure updates the record (and re-binds agents) without dropping the
-socket.
+timeout, changing preset exposure or saving tool settings updates the record (and re-binds agents)
+without dropping the socket.
 
 **Transports.** `http` is Streamable HTTP, `sse` is the older HTTP+SSE transport, `stdio` starts a
 local process. `http`/`sse` send the configured custom headers on every request; `stdio` runs
@@ -141,7 +149,7 @@ is a `connect-failed`/`closed` error, not a silent empty tool list.
   and retries the connection once with a fresh token when the attempt looks unauthorized. A failed
   token fetch is a connection error with code `auth-failed` whose message names the endpoint status.
 
-There is no authorization-code flow in 0.2.0. See [ADR 2](adr/0002-own-mcp-connection-manager.md).
+There is no authorization-code flow in 0.3.0. See [ADR 2](adr/0002-own-mcp-connection-manager.md).
 
 **Timeouts.** `timeoutMs` (1000–600000, default 60000) bounds one `tools/call`. A call that times
 out fails that tool call (the transport error reaches the model as a tool error), not the
@@ -193,7 +201,7 @@ the Host would use for the same environment. `test/mount-check.mjs` asserts the 
 and the override.
 
 ```jsonc
-{ "version": 2, "servers": [{
+{ "version": 3, "servers": [{
   "id": "srv_1f3c9a2b70", "key": "mylocal", "name": "My MCP",
   "enabled": true, "transport": "http", "url": "http://localhost:3000/mcp",
   "command": "", "args": [], "cwd": "", "env": {},
@@ -204,6 +212,11 @@ and the override.
   //               "mimeType": "image/png", "updatedAt": "2026-11-16T10:00:00.000Z" }
   "color": "blue", "group": "",
   "presets": "all", "timeoutMs": 60000,
+  "toolOverrides": { "fail": { "enabled": false } },
+  "toolCache": { "at": "2026-11-16T10:00:00.000Z", "tools": [
+    { "name": "echo", "publicName": "mcp__mylocal__echo", "description": "Echo the text back.",
+      "params": [{ "name": "text", "required": true }] }
+  ] },
   "createdAt": "2026-11-16T10:00:00.000Z", "updatedAt": "2026-11-16T10:00:00.000Z"
 }] }
 ```
@@ -220,6 +233,7 @@ ones a change is most likely to break:
 | headers: unique case-insensitively, ≤20, name matches the HTTP token grammar, value ≤4096 chars | duplicate or invalid headers are rejected at save, not at connect |
 | `presets` is `"all"` or ≤40 **known** preset ids (roster in the error) | unknown ids would silently expose nothing |
 | `icon` is **not accepted in drafts**; it is `{kind:"auto"}` or `{kind:"upload",file,mimeType,updatedAt}` and changes only through the icon endpoints | image bytes never enter `servers.json`, and no save can clear an upload |
+| `toolOverrides` only stores deviations (`{enabled:false}` / `{approval:true}`, ≤500 raw names); `toolCache` holds ≤300 descriptors, each with a description ≤2000 chars and ≤64 parameters | a save cannot silently re-enable a tool or forge a default override |
 | `color` from a fixed palette, `group` ≤60 chars | UI storage, not semantics |
 | `timeoutMs` integer 1000..600000, `enabled` boolean | one call cannot hang forever |
 | unknown fields are dropped | forward compatibility is explicit |
@@ -230,14 +244,16 @@ written back.
 
 Writes are atomic and serialized: a snapshot is JSON-stringified, written to a uniquely named
 temporary file in the same directory with mode `0600`, then `rename`d over `servers.json` (the mode
-is re-applied afterwards in case the rename target already existed). Reads accept schema `version` 1
-or 2. A version-1 file (emoji-string icons) is migrated **in memory** on load — every legacy string
-becomes `{ "kind": "auto" }` — and rewritten as version 2 by the next save; reads never rewrite the
-file. A version-2 icon that does not match the stored shape is reset to `auto` for that record, and
-the record is kept. A file that is not JSON or has an unknown shape/version moves aside as
-`servers.json.corrupt-<iso>` and the store starts empty; a record whose identity fields are malformed
-is dropped individually and the remaining valid records are kept, with a warning in the Host log. A
-bad file therefore cannot keep the Host from booting.
+is re-applied afterwards in case the rename target already existed). `store.patch(id, fn)` applies a
+read-modify-write inside the same queue, which is how the Host persists a new `toolCache` without
+clobbering a concurrent settings save. Reads accept schema `version` 1, 2 or 3. A version-1 file
+(emoji-string icons) or version-2 file migrates **in memory** on load — every legacy icon string
+becomes `{ "kind": "auto" }`, and missing tool settings become `{}`/`null` — and is rewritten as
+version 3 by the next save; reads never rewrite the file. An icon value that does not match the
+stored shape is reset to `auto` for that record, and the record is kept. A file that is not JSON or
+has an unknown shape/version moves aside as `servers.json.corrupt-<iso>` and the store starts empty;
+a record whose identity fields are malformed is dropped individually and the remaining valid records
+are kept, with a warning in the Host log. A bad file therefore cannot keep the Host from booting.
 
 ## Icons
 
@@ -292,6 +308,82 @@ carry it.
 source contains no emoji glyphs, there is no stock icon set, and SVG is rejected on upload (a
 same-origin SVG document can execute script). See [ADR 6](adr/0006-server-and-upload-icons.md).
 
+## Tools
+
+A server's tool list is discovered, not configured: the page only decides **which discovered tools
+are exposed** and **whether a tool asks for approval**. [ADR 7](adr/0007-tool-enablement-and-approval.md)
+records why; the stored shape is in
+[API-CONTRACT §2.7](API-CONTRACT.md#27-tool-list-and-per-tool-settings).
+
+**Stored settings.** `toolOverrides` is keyed by the **raw** MCP tool name and holds only deviations:
+
+```jsonc
+"toolOverrides": { "fail": { "enabled": false }, "echo": { "approval": true } }
+```
+
+`{ enabled: false }` hides a tool; `{ approval: true }` makes it ask; an entry that restates the
+defaults is stripped before it is stored (`normalizeToolOverrides`). `toolEnabled`/`toolNeedsApproval`
+read the map with the defaults "enabled" and "no approval", so a server nobody configured carries
+`{}`. A save never accepts either map from the request: `POST`/`PUT /servers` copy the values from
+the stored record (`normalizeDraft`), so a draft can neither re-enable a tool nor forge an
+approval flag.
+
+**Tool cache.** `toolCache` is the last discovered descriptor set:
+
+```jsonc
+"toolCache": { "at": "…", "tools": [{
+  "name": "echo", "publicName": "mcp__mylocal__echo",
+  "description": "Echo the text back.", "params": [{ "name": "text", "required": true }]
+}] }
+```
+
+It is written by `lib/index.js` whenever a connected server's tool list changes (the manager's
+`onToolsChange` hook calls `persistToolCache`) and by `GET /servers/:id/tools` when the server is
+connected; both go through `store.patch`, compare the descriptor list, and skip an unchanged write.
+`description` is capped at 2000 chars, at most 300 tools and 64 parameters per tool are kept, and the
+cache holds no headers, tokens or other credentials. It exists so the **工具** tab works while the
+server is disconnected; it is not evidence that the server still offers those tools.
+
+**Endpoints.** `GET /servers/:id/tools` answers
+`{ ok, connected, cachedAt, tools: [{ name, publicName, description, params, enabled, approval }] }`
+— live descriptors plus the stored settings when connected, the cache plus settings otherwise;
+`cachedAt` is `null` when nothing has ever been discovered. `PUT /servers/:id/tools` takes
+`{ tools: [{ name, enabled, approval }] }` (every entry needs both booleans, names unique, ≤500),
+normalises the batch into `toolOverrides`, saves through `store.patch`, re-syncs the manager record
+and re-binds every live agent. Card counts come from the manager snapshot
+(`enabledToolCount / toolCount`, exposed as `工具 2/3`); a tool settings save refreshes them
+immediately.
+
+**Exposure filter.** `lib/presets.js` walks each allowed server's live tools and skips
+`toolEnabled(server, rawName) === false`; disabled tools are never registered on any `agent.ctx`.
+If no tool of a server is registered, the binder also skips that server's instruction section —
+an all-disabled server contributes neither tools nor system-prompt text. Discovery (and therefore
+the cache) keeps running regardless of the per-tool switches.
+
+**Approval seam.** `approval: true` means "ask in restricted modes"; the check lives in
+`lib/result-projection.js` (`enforceApproval`) and runs inside the tool body **before** the MCP call:
+
+1. read `exec.agent` and the calling session's permission preset via
+   `hostCtx.get('permissionPresets').current(agent.session)`;
+2. if the preset is exactly `danger-full-access` (UI 完全权限), proceed without asking;
+3. otherwise request the Host approval service once with
+   `{ agent, toolName, callId, reason: 'MCP 工具 "mcp__<key>__<tool>" 需要审批（当前不是完全权限）', signal }`;
+4. `allowed-once` proceeds; `rejected`, `cancelled` and `unavailable` fail the call with a readable
+   tool error; a missing approval service, permission service, agent or execution context **denies**
+   the call. The MCP server is not contacted unless approval was granted.
+
+The UI presents the waiting request as the DSH composer **等待审批** with **拒绝 / 允许一次**, and
+the tool card's hint reads **非完全权限时会要求你批准**. Approval is a per-call confirmation, not a
+sandbox and not a second permission system: the Host's own permission rules still apply to the
+session, and the manager adds no allowlist of its own.
+
+**Page.** The edit sheet has two tabs, **基础设置** and **工具**. The tools tab lists every tool as
+a card: raw name, clamped description, parameter chips (**必填** / **可选**), the enable switch and
+the **需要审批** switch (disabled while the tool itself is disabled), plus the hint. It shows
+**已启用 n/m**, **全部开启**/**全部关闭**, **更新于 …** for cached lists, **先保存并连接服务器，再管理
+工具** for an unsaved server, and the **保存工具设置** footer; a save keeps the tab open, reports
+**工具设置已保存** or the failure, and leaves the draft form untouched.
+
 ## Preset exposure
 
 `presets` answers one question: **which agents get this server's tools?**
@@ -319,12 +411,12 @@ The binder (`lib/presets.js`) works at agent lifecycle boundaries, never on a ti
 Server `instructions`, when present, become **one `systemPrompt.section` per server** on the same
 `agent.ctx`, named `mcp-manager:<key>`, with order `getSectionOrder('MCP_SERVERS')` (fallback 130)
 and `interpolate: false`; each server keeps its own text closure, so a server that updates its
-instructions rewrites only its own section. Only servers whose tools are actually exposed contribute
-prompt text: a connected server with zero discovered tools contributes no instructions. The injected
-text is capped at 32,768 UTF-8 bytes (cut on a code-point boundary); the status reports the server's
-original byte count. Sections are added and removed with the tool registrations, so an agent never
-keeps instructions for a server it cannot call. See
-[ADR 3](adr/0003-preset-scoped-tool-registration.md).
+instructions rewrites only its own section. Only servers with at least one **enabled** tool actually
+exposed contribute prompt text: a disconnected server, or one whose tools are all disabled or
+rejected by the preset, contributes no instructions. The injected text is capped at 32,768 UTF-8
+bytes (cut on a code-point boundary); the status reports the server's original byte count. Sections
+are added and removed with the tool registrations, so an agent never keeps instructions for a server
+it cannot call. See [ADR 3](adr/0003-preset-scoped-tool-registration.md).
 
 Two agents can be exposed to the same server: they share the one connection, each has its own
 registrations, and one agent's disposal does not affect the other.
@@ -355,8 +447,10 @@ model-visible. A tool that declares `execution.taskSupport: "required"` is expos
 fails with a clear error; the manager does not run the MCP task protocol.
 
 Tool errors are reported as tool errors (the model sees them), not as HTTP errors: the panel's HTTP
-API never executes MCP tools. Tool permissions, sandboxing and approval remain the Host's, decided
-for the agent that calls the tool; the manager does not run a second permission system.
+API never executes MCP tools. Tool permissions and sandboxing remain the Host's, decided for the
+agent that calls the tool; the manager adds no second permission system. The one opt-in the plugin
+adds is the per-tool **approval** check described in [Tools](#tools), which delegates to the Host
+approval service and never allows a call the Host would deny.
 
 ## HTTP API
 
@@ -374,6 +468,8 @@ route table, envelopes and error codes are frozen in
 | `POST` | `/servers/:id/enabled` | enable/disable |
 | `POST` | `/servers/:id/reconnect` | start a fresh attempt now |
 | `POST` | `/servers/test` | test an unsaved draft (15s cap, not stored) |
+| `GET` | `/servers/:id/tools` | live or cached tool descriptors plus each tool's `enabled`/`approval` settings |
+| `PUT` | `/servers/:id/tools` | save per-tool enable/approval settings, rebinding live agents |
 | `GET` | `/servers/:id/icon` | the current icon as image bytes; `404` when there is none |
 | `POST` | `/servers/:id/icon` | upload a `data:` URL, store it and set `icon.kind = "upload"` |
 | `DELETE` | `/servers/:id/icon` | delete the stored file and reset `icon = { kind: "auto" }` |
@@ -413,6 +509,9 @@ service is absent the roster is empty and the UI explains that per-preset select
   panel. Uploads are decoded, magic-byte-checked and written as one `0600` file under `icons/`;
   SVG is rejected because a same-origin `image/svg+xml` document can execute script. Image answers
   carry `nosniff` and `Cache-Control: private, max-age=300`, never the JSON `no-store` policy.
+- **Approval is delegated, not simulated.** A tool marked **需要审批** only asks the Host's approval
+  service; with no service the call is denied. Approval never elevates the session's permissions and
+  creates no plugin-owned policy that a later call could reuse.
 - **Secret handling.** Custom header values, an OAuth bearer token and a `client_credentials` secret
   are stored as plaintext in `servers.json` (mode `0600`). They are never written to logs, never
   echoed in a status error, and the OAuth token/client-secret inputs render as password fields. The
@@ -443,10 +542,13 @@ outer boundary.
   name, status dot and status line, and the `···` menu (编辑 / 测试连接 / 重新连接 / 启用或停用 /
   删除);
 - shows errors inline with the first two lines of the message and a **详情** dialog with the detail;
-- renders the add/edit form (enable switch, **服务器图标** preview with **上传图标** / **恢复自动**
-  and color swatches — no emoji palette; group, name, transport segmented control, address or
-  command/args/env, OAuth dialog, custom-header rows, preset exposure, save and delete) with inline
-  validation and a saving state;
+- renders the add/edit form as two tabs, **基础设置** and **工具**: the basic tab has the enable
+  switch, **服务器图标** preview with **上传图标** / **恢复自动** and color swatches — no emoji
+  palette; group, name, transport segmented control, address or command/args/env, OAuth dialog,
+  custom-header rows, preset exposure, save and delete. The tools tab lists the discovered tools with
+  description, parameter chips, per-tool enable and **需要审批** switches, **全部开启**/**全部关闭**,
+  **更新于 …** for a cached offline list, **保存工具设置** and inline saved/failed notices, and stays
+  on the tab after a save;
 - validates an icon file client-side (PNG/JPEG/WebP/GIF, ≤512 KiB) before uploading it as a data URL
   after the server record exists; a failed icon upload keeps the saved server and reports the
   reason;
@@ -463,15 +565,18 @@ Sanitized screenshots of the shipped UI live in `docs/screenshots/`: the
 [sidebar placement](screenshots/mcp-manager-sidebar.png), the
 [mixed-state list](screenshots/mcp-manager-list.png), the
 [preset-exposure form section](screenshots/mcp-manager-form-presets.png), the
-[服务器图标 form row](screenshots/mcp-manager-form-icon.png) and the
-[连接错误 详情 dialog](screenshots/mcp-manager-error-detail.png). The README embeds the first four.
+[服务器图标 form row](screenshots/mcp-manager-form-icon.png), the
+[工具 tab](screenshots/mcp-manager-form-tools.png) and the
+[连接错误 详情 dialog](screenshots/mcp-manager-error-detail.png). The README embeds the sidebar, the
+list, the presets, the icon row and the tools tab.
 
 ## Lifecycle and dispose
 
 Mount ensures the data directory exists (mode `0700`) and starts no work for disabled servers; it
-writes no store file and creates no `icons/` directory until the first save/upload. The Host half
-owns one prefix route, one store, one manager, one binder and the icon helpers. Dispose runs in
-reverse, with bounded closes:
+writes no store file and creates no `icons/` directory until the first save/upload. A connected
+server's first tool discovery does write `toolCache` even without a user save, through the same
+serialized store queue. The Host half owns one prefix route, one store, one manager, one binder and
+the icon/tool helpers. Dispose runs in reverse, with bounded closes:
 
 1. unregister the HTTP prefix route;
 2. release every `agent.ctx` tool registration and system-prompt section and clear the binder's
@@ -479,7 +584,7 @@ reverse, with bounded closes:
 3. await the startup load/converge chain so no half-initialised manager survives;
 4. dispose every connection: bump the attempt generation, clear retry timers, close clients and
    transports (5 s cap each), drop cached tools, status and the in-memory icon cache;
-5. wait for queued store writes to land.
+5. wait for queued store writes (including a pending tool-cache refresh) to land.
 
 Dispose never deletes icon files: they belong to the store and survive a plugin restart, exactly
 like the server records. Deleting a server or resetting its icon is the only thing that removes an
@@ -503,7 +608,7 @@ dsh plugin --profile web remove @ds-hu/dsh-better-mcp-manager
 #    or: Plugins page → the bundle → Remove
 #    or: ask the agent, plugin_manager remove_bundle
 
-# 2. delete the one data directory (servers.json and icons/)
+# 2. delete the one data directory (servers.json, per-tool settings and icons/)
 node bin/mcp-manager.mjs clean --yes
 #    or, when running the published package:
 npx -y @ds-hu/dsh-better-mcp-manager clean --yes
@@ -539,26 +644,26 @@ Two honest caveats:
 
 ```bash
 npm run lint        # eslint over the shipped sources and tests
-npm test            # 147 unit tests + 24 mount checks + 24 client-smoke checks
-npm run test:pack   # the 9-check `npm pack --dry-run` audit (36 files)
+npm test            # 168 unit tests + 24 mount checks + 27 client-smoke checks
+npm run test:pack   # the 9-check `npm pack --dry-run` audit (38 files)
 npm run check       # all of the above; the same gate prepublishOnly runs
 npm run e2e         # isolated DSH instance + Playwright (opt-in, see below)
 ```
 
 | Suite | What it proves |
 |---|---|
-| `test/model.test.mjs` | server-id/key allocation, validation and normalisation of every field (urls, headers, presets, icon/color/group/timeout, OAuth), `icon` dropped from every draft, stored icon narrowing, update freezing `id`/`key`/`createdAt`, tool-name derivation and collisions, `presetAllows` |
-| `test/store.test.mjs` | data-dir resolution (including the override), empty-directory mount writes nothing, reload round-trip and list order, atomic mode-`0600` write with no temp left behind, serialized concurrent writes, corrupt/unknown-shape quarantine, per-record drop, v1→v2 icon migration without a read-time rewrite, write-error propagation |
-| `test/mcp.test.mjs` | OAuth `client_credentials` form/caching/refresh and its failure mapping, bearer/custom-header precedence, failure-code classification and stderr-tail detail, UTF-8 truncation, manager snapshots for unknown/disabled servers, auto-icon selection/fetch/cache/failure-fallback |
-| `test/presets.test.mjs` | `"all"` vs id-array exposure (including preset-less agents), disabled/disconnected/empty servers, rebinding without duplicate registrations, multi-server order, one instruction section per server and zero-tool skip, missing `tools`/`systemPrompt` services, preset-selected re-exposure, bindAll pruning, dispose, refresh coalescing |
-| `test/api.test.mjs` | every route against mock `req`/`res`: envelopes and statuses, JSON content type, cross-origin fence, invalid JSON/drafts, 64 KiB rejection, create/update-in-place (frozen key)/delete/enable/reconnect, unsaved draft probe never stores, icon GET/304/404/POST/DELETE and their caps/validation, preset/agent read surfaces, group order, 404 and trailing-slash normalisation |
+| `test/model.test.mjs` | server-id/key allocation, validation and normalisation of every field (urls, headers, presets, icon/color/group/timeout, OAuth), `icon`/`toolOverrides`/`toolCache` dropped from every draft, stored icon narrowing, per-tool override normalisation and defaults, tool-cache build/narrowing, update freezing `id`/`key`/`createdAt`, tool-name derivation and collisions, `presetAllows` |
+| `test/store.test.mjs` | data-dir resolution (including the override), empty-directory mount writes nothing, reload round-trip and list order, atomic mode-`0600` write with no temp left behind, serialized concurrent writes and `patch`, corrupt/unknown-shape quarantine, per-record drop, v1/v2→v3 migration without a read-time rewrite, write-error propagation |
+| `test/mcp.test.mjs` | OAuth `client_credentials` form/caching/refresh and its failure mapping, bearer/custom-header precedence, failure-code classification and stderr-tail detail, UTF-8 truncation, manager snapshots for unknown/disabled servers (`toolCount`/`enabledToolCount`), auto-icon selection/fetch/cache/failure-fallback |
+| `test/presets.test.mjs` | `"all"` vs id-array exposure (including preset-less agents), disabled/disconnected/empty servers, per-tool enable filtering and all-disabled instruction suppression, rebinding without duplicate registrations, multi-server order, one instruction section per server and zero-tool skip, missing `tools`/`systemPrompt` services, preset-selected re-exposure, bindAll pruning, dispose, refresh coalescing |
+| `test/api.test.mjs` | every route against mock `req`/`res`: envelopes and statuses, JSON content type, cross-origin fence, invalid JSON/drafts, 64 KiB rejection, create/update-in-place (frozen key)/delete/enable/reconnect, unsaved draft probe never stores, icon GET/304/404/POST/DELETE and their caps/validation, tools GET live/cached + PUT overrides/rebind/validation and cache write-through, preset/agent read surfaces, group order, 404 and trailing-slash normalisation |
 | `test/cli.test.mjs` | `path`/`status`/`clean` against throwaway homes and `DSH_MCP_MANAGER_DATA_DIR`: absence, count/enabled output, damaged-store exit 1, `--yes` requirement, refusal of a foreign directory, unknown command/help exit codes |
-| `test/index.test.mjs` | Host mount: the prefix route, agent-lifecycle listeners and disposal are registered through effects (fake Cordis context) |
-| `test/projection.test.mjs` | MCP content projection (text, resource links, unsupported blocks, empty result), canonical output schema and tool-definition shape, `isError` rejection, spec-invalid results, image admission/fallback diagnostics (attachment service, model modality, malformed base64, attachment rejection), `structuredContent`, task-required refusal |
+| `test/index.test.mjs` | Host mount: the prefix route, agent-lifecycle listeners, tool-cache persistence hook and disposal are registered through effects (fake Cordis context) |
+| `test/projection.test.mjs` | MCP content projection (text, resource links, unsupported blocks, empty result), canonical output schema and tool-definition shape, `isError` rejection, spec-invalid results, image admission/fallback diagnostics (attachment service, model modality, malformed base64, attachment rejection), `structuredContent`, task-required refusal, approval gating (full access skip, allowed-once, rejected/cancelled/unavailable, missing services) |
 | `test/mount-check.mjs` | patch row id = Host `name`, exports and `bin` resolve, locale metadata and icon present, no `@deepseek-ai/*` import in `lib/`/`bin/`, no profile/absolute-path writes, data-dir resolver, frozen constants |
-| `test/client-smoke.mjs` | `lib/client.js` runs in a `vm` with a fake `window.__ModuleLoader__` + React: exactly the two slots and their ids/orders, zh/en dictionaries cover the same non-empty keys, no foreign API paths or imports, the icon row exposes 上传图标 / 恢复自动 with no emoji palette, one owned `<style>` removed on dispose, every timer cleared |
+| `test/client-smoke.mjs` | `lib/client.js` runs in a `vm` with a fake `window.__ModuleLoader__` + React: exactly the two slots and their ids/orders, zh/en dictionaries cover the same non-empty keys, no foreign API paths or imports, the edit sheet has two tabs and the tools tab exposes the per-tool switches/save copy, the icon row exposes 上传图标 / 恢复自动 with no emoji palette, one owned `<style>` removed on dispose, every timer cleared |
 | `test/package.mjs` | `npm pack --dry-run` audit: the `files` list covers every runtime artefact (bin/lib/locale/icon/docs/legal incl. the screenshot directory) and excludes tests/dev config; dependency and lifecycle-script rules |
-| `test/e2e/run.mjs` | 76 checks in about 2.5 minutes: boot (fresh `web` profile + the real packed tarball in transient systemd scopes, authenticated URL), bundle (sidebar row directly below 自动化任务, page opens without console/page errors), CRUD (stdio + HTTP servers, live tool counts, wrong-port 连接失败 + 详情, edit-to-recover, enable round-trip, delete), icons (fixture-declared server icon renders in the card, the form has no emoji palette, an upload changes the card bytes, 恢复自动 returns to the server icon, deleting the server removes the stored file), scoping (fake OpenAI-compatible provider: `mcp__<key>__echo` present for a standard-preset session and absent for a minimal-preset session, plus a scripted tool-call round-trip), hygiene (cleanup of scopes/processes/files/ports, production MainPID/cgroup untouched) |
+| `test/e2e/run.mjs` | 94 checks in about 2.5 minutes: boot (fresh `web` profile + the real packed tarball in transient systemd scopes, authenticated URL), bundle (sidebar row directly below 自动化任务, page opens without console/page errors), CRUD (stdio + HTTP servers, live tool counts, wrong-port 连接失败 + 详情, edit-to-recover, enable round-trip, delete), icons (fixture-declared server icon renders in the card, the form has no emoji palette, an upload changes the card bytes, 恢复自动 returns to the server icon, deleting the server removes the stored file), tools (工具 tab lists live/cached descriptors, disabling removes the tool from a real model request's `tools[]`, re-enabling restores it, card counts change 2/2→1/2, 需要审批 persists then clears to `{}`), approvals (a restricted session shows the 等待审批 composer, the tool has not run while pending, 允许一次 executes it and the result reaches the model; a 完全权限 session runs the same tool with no composer), scoping (fake OpenAI-compatible provider: `mcp__<key>__echo` present for a standard-preset session and absent for a minimal-preset session, plus a scripted tool-call round-trip), hygiene (cleanup of scopes/processes/files/ports, production MainPID/cgroup untouched) |
 
 The unit suites are offline and finish in seconds; they need no Host. `test/e2e/fixture-selftest.mjs`
 is a standalone check that drives the fixture MCP servers with the same `@modelcontextprotocol/client`
@@ -570,10 +675,11 @@ tool call. The e2e suite is the only one that boots DSH: it uses a fresh `$DSH_H
 `/var/tmp`, runs the runner, the test DSH and the fixtures in transient systemd scopes (`MemoryMax=1G`
 for the runner/DSH, `256M` for the fixtures, `MemorySwapMax=0`), installs the real packed tarball, and
 never touches the user's running instance or `/root/.dsh`. The fixture MCP servers declare icons (a
-`data:` PNG over stdio, an HTTP URL over Streamable HTTP), which is what the icon checks drive. On
-success it publishes five sanitized screenshots to `docs/screenshots/`. `--keep` leaves the scopes and
-the run directory for debugging; `--verbose` adds step logging. It is opt-in — not part of
-`npm run check` — and needs Playwright with Chromium plus registry access for the profile install.
+`data:` PNG over stdio, an HTTP URL over Streamable HTTP) and expose separate tools for the per-tool
+checks; the approval scenarios switch a real session's permission preset and wait for the DSH approval
+composer. On success it publishes six sanitized screenshots to `docs/screenshots/`. `--keep` leaves
+the scopes and the run directory for debugging; `--verbose` adds step logging. It is opt-in — not part
+of `npm run check` — and needs Playwright with Chromium plus registry access for the profile install.
 That isolation is a property of the test harness, not of the plugin.
 
 ## Failure modes
@@ -586,7 +692,11 @@ That isolation is a property of the test harness, not of the plugin.
 | code `protocol` | endpoint speaks something that is not MCP, protocol version mismatch, SSE handshake failure | retrying; detail has the protocol error |
 | code `invalid-config` | stored record cannot be used as configured (e.g. transport/command mismatch) | no connection attempt until edited |
 | code `closed` | transport closed locally or remotely | retrying; a normal reconnect |
-| Tool absent in an agent | server disabled/failing, its preset list does not include this agent's preset, or the agent predates the server and has not been re-bound yet (saving the server again re-binds every live agent) | `GET /agents` lists each live agent's exposed servers and tool names |
+| Tool absent in an agent | server disabled/failing, its preset list does not include this agent's preset, the tool is disabled in the **工具** tab, or the agent predates the server and has not been re-bound yet (saving the server again re-binds every live agent) | `GET /agents` lists each live agent's exposed servers and tool names |
+| Approval-required tool runs without asking | the session's permission preset is exactly `danger-full-access` (完全权限) | by design: approval is skipped only there; other presets ask |
+| Approval-required call fails without a composer | no approval service, no permission service, no agent/execution context, or the request was rejected/cancelled | the call is denied before the MCP server is contacted; the model gets a readable error |
+| **工具** tab shows an old list | the server is disconnected and the tab is rendering `toolCache` (`更新于 …`) | reconnect or open the tab on a connected server; settings themselves are current |
+| **保存工具设置** answers `404` | the server was deleted in another window | nothing is written; reload the page |
 | Card shows the name's first letter | server not connected, declares no `serverInfo.icons`, the icon URL failed its 5 s/512 KiB/raster checks, or the upload file is missing | draws the fallback letter; the next successful fetch or an upload replaces it |
 | Icon upload answers `400 invalid-icon` | wrong data-URL shape, non-canonical base64, decoded bytes over 512 KiB, or bytes that do not match the declared raster type | nothing is stored; the page shows the reason and keeps the saved server |
 | Icon GET answers `404 no-icon` | no upload and no usable auto icon | the page falls back to the first letter; never treated as a connection error |
@@ -603,17 +713,18 @@ than a silent success.
 
 ## What we did not build
 
-- **MCP resources, resource templates, prompt templates and sampling.** 0.2.0 manages tools and
+- **MCP resources, resource templates, prompt templates and sampling.** 0.3.0 manages tools and
   server instructions only. A server that offers only resources has nothing to expose here (a
   `resource_link` or embedded resource returned *inside* a tool result is projected as text or a
   diagnostic, not managed as a resource).
 - **MCP task-based tool execution.** A tool whose execution declares `taskSupport: "required"` is
   registered with a definition that fails the call with a clear message; the manager does not run
   the MCP task protocol.
-- **Per-tool enable/disable or per-tool preset rules.** Exposure is per server; the whole tool set
-  follows the server.
+- **Per-tool policies beyond enable and approval.** A tool can be hidden and can ask for approval;
+  there are no per-tool preset rules, per-tool timeouts, per-tool schemas or a plugin-owned allowlist.
+  Approval delegates to the Host and never replaces its permission system.
 - **OAuth authorization-code / PKCE flows.** Only a static bearer token and the client-credentials
-  grant. A server that requires an interactive browser login cannot be connected in 0.2.0.
+  grant. A server that requires an interactive browser login cannot be connected in 0.3.0.
 - **Built-in artwork or emoji icons.** The icon is either declared by the MCP server or uploaded by
   the operator (ADR 6). There is no emoji picker, no bundled icon set, no SVG upload, and no
   user-entered emoji string.
