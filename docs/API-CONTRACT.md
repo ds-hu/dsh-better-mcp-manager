@@ -3,7 +3,7 @@
 This file is the single source of truth shared by the Host half (`lib/index.js` and friends),
 the Client half (`lib/client.js`) and the tests (`test/`). Change it before changing either side.
 
-Status: **frozen for 0.4.0**. Everything below is what 0.4.0 ships.
+Status: **frozen for 0.4.1**. Everything below is what 0.4.1 ships.
 
 ---
 
@@ -321,11 +321,17 @@ Page (dark and light theme, tokens only — no literal colors outside artwork):
    The owned tab keeps items 1–3 unchanged. The external tab lists preset-owned MCP servers reported
    by `GET /external`, with the explanation that this plugin cannot edit their connection and only
    controls tool exposure/approval; grouped by preset (`external-preset`), each with a 预设自带 badge,
-   a placeholder hint when `hasPresetMcp` has no discovered servers yet, a 重新扫描 button
-   (`external-scan`), per-tool enable/approval switches (`external-tool-enabled`,
-   `external-tool-approval`), and a per-preset 保存工具设置 button (`external-save`) sending
-   `PUT /external/tools`. Loading, empty, error+retry (`external-retry`) and saved/failed notices are
-   required. The external tab never offers add/edit/delete/test of those servers.
+   a placeholder hint when `hasPresetMcp` has no discovered servers yet, and a 重新扫描 button
+   (`external-scan`). Like the owned list, the default view is compact: one clickable server card
+   (`external-server-card`) per discovered server showing its name and `enabled/total` tool count
+   (plus the preset's per-tool settings remain saveable from this view via `external-save`); its tools
+   and their parameters are not expanded inline. Opening a server card shows a per-server tool view
+   (`external-server-view`, back via `external-back`) with the full tool cards, descriptions,
+   parameter chips, per-tool enable/approval switches (`external-tool-enabled`,
+   `external-tool-approval`), 全部开启/全部关闭 (`external-enable-all`/`external-disable-all`), and a
+   per-preset 保存工具设置 button (`external-save`) sending `PUT /external/tools`. Loading, empty,
+   error+retry (`external-retry`) and saved/failed notices are required. The external tab never offers
+   add/edit/delete/test of those servers.
 5. Empty state with an add CTA; loading skeleton/spinner; retry on network failure.
 6. Poll `GET /servers` every 2.5s while the page is mounted (and immediately after every mutation);
    stop when unmounted.

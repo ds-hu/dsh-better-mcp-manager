@@ -23,9 +23,10 @@
  *              to the model on the next request;
  *   external   a preset-owned MCP server (`foreign`, mounted by the shipped
  *              `@deepseek-ai/dsh-mcp-client` inside the test preset `external`)
- *              is discovered in 其他 MCP, hiding one tool removes it from a live
- *              session's model request, approval asks only outside 完全权限,
- *              and 本插件 MCP keeps working;
+ *              is discovered in 其他 MCP as a compact server card (0.4.1), its
+ *              per-server drill-in hides one tool from a live session's model
+ *              request, approval asks only outside 完全权限, and 本插件 MCP
+ *              keeps working;
  *   hygiene    cleanup removes scopes/processes/files/ports and the production
  *              dsh-web.service MainPID and cgroup are untouched.
  *
@@ -873,7 +874,7 @@ async function main() {
       );
     });
 
-    // ── phase 4: 其他 MCP (preset-owned servers, 0.4.0) ──────────────────
+    // ── phase 4: 其他 MCP (preset-owned servers, 0.4.x) ──────────────────
     /** Replace the fake-LLM marker rules with the given ones (others are kept). */
     const configureMarkers = async (entries) => {
       const state = await fixtures.state();
@@ -884,7 +885,15 @@ async function main() {
       });
     };
 
-    await reporter.step('其他 MCP tab: preset-owned server discovery and tool list', async () => {
+    /** Read one preset-owned tool's effective settings from GET /external. */
+    const externalToolPayload = async (presetId, serverName, toolName) => {
+      const payload = await api.external();
+      const preset = (payload.presets ?? []).find((entry) => entry.id === presetId);
+      const server = preset?.servers?.find((entry) => entry.name === serverName);
+      return { payload, preset, server, tool: server?.tools?.find((tool) => tool.name === toolName) };
+    };
+
+    await reporter.step('其他 MCP tab: compact server list, then per-server tool view', async () => {
       // The owned list keeps working underneath the new page-level tabs.
       await ui.openMcpPage(page);
       const tabs = await ui.pageTabState(page);
@@ -918,8 +927,8 @@ async function main() {
       );
       await ui.waitForBodyText(page, `fixture-llm: external-${RUN_ID}`);
 
-      // GET /external runs a discovery pass and caches descriptors; it must
-      // group the server under the preset and keep both tools.
+      // GET /external runs a discovery pass and caches descriptors; the API is
+      // unchanged in 0.4.1, only the page defaults to a compact server list.
       const payload = await api.external();
       const presetView = (payload.presets ?? []).find((entry) => entry.id === 'external');
       const serverView = presetView?.servers?.find((entry) => entry.name === 'foreign');
@@ -948,6 +957,7 @@ async function main() {
         redact(JSON.stringify({ ping: pingPayload ?? null, add: addPayload ?? null }).slice(0, 500)),
       );
 
+      // ── compact list: preset group -> server card, no tool controls ─────
       await ui.openMcpPage(page);
       await ui.openExternalTab(page);
       const group = ui.externalPresetGroup(page, 'external');
@@ -958,10 +968,43 @@ async function main() {
         groupText.includes('外部MCP测试') && groupText.includes('预设自带') && groupText.includes('foreign') && groupText.includes('2 个工具'),
         groupText.replaceAll('\n', ' ').slice(0, 220),
       );
-      const pingState = await ui.externalToolState(page, 'mcp__foreign__ping');
-      const addState = await ui.externalToolState(page, 'mcp__foreign__add');
+      const serverCard = ui.externalServerCard(page, 'external', 'foreign');
+      await serverCard.waitFor({ state: 'visible', timeout: 20_000 });
+      const listMeta = await ui.externalServerMeta(page, 'external', 'foreign');
       reporter.check(
-        'external tool cards show names, descriptions and required/optional param chips',
+        'the compact list shows only server cards with a 2/2 个工具已启用 meta (no tool cards/params in the DOM)',
+        listMeta.includes('2/2 个工具已启用') &&
+          (await page.locator('[data-testid="external-tool-card"]').count()) === 0 &&
+          (await page.locator('[data-testid="external-tool-enabled"]').count()) === 0 &&
+          (await page.locator('[data-testid="external-tool-param"]').count()) === 0,
+        redact(listMeta.replaceAll('\n', ' ').slice(0, 200)),
+      );
+      const listPanel = page.locator('[data-testid="external-panel"]');
+      reporter.check(
+        'the compact list never offers add/edit/delete/test of preset-owned servers',
+        (await listPanel.locator('[data-testid="add-mcp"]').count()) === 0 &&
+          (await listPanel.locator('[data-testid="server-card"]').count()) === 0 &&
+          (await listPanel.locator('[data-testid="form-save"]').count()) === 0 &&
+          (await listPanel.locator('[data-testid="server-menu"]').count()) === 0,
+        `add=${await listPanel.locator('[data-testid="add-mcp"]').count()} cards=${await listPanel.locator('[data-testid="server-card"]').count()}`,
+      );
+      screenshotArtifacts.push(await ui.screenshotExternalTab(page, join(ARTIFACT_DIR, 'mcp-manager-external.png')));
+
+      // ── drill into the server: same tool cards/testids as before ────────
+      await ui.openExternalServer(page, 'external', 'foreign');
+      const toolView = await ui.externalToolViewState(page);
+      reporter.check(
+        'clicking the server card opens the per-server tool view with 已启用 2/2 and both tools',
+        toolView.count === '已启用 2/2' &&
+          toolView.toolNames.slice().sort().join(',') === 'mcp__foreign__add,mcp__foreign__ping' &&
+          toolView.enableAllDisabled === true &&
+          toolView.disableAllDisabled === false,
+        JSON.stringify({ count: toolView.count, names: toolView.toolNames, enableAllDisabled: toolView.enableAllDisabled, disableAllDisabled: toolView.disableAllDisabled }),
+      );
+      const pingState = await ui.externalToolState(page, 'mcp__foreign__ping', { presetId: 'external', serverName: 'foreign' });
+      const addState = await ui.externalToolState(page, 'mcp__foreign__add', { presetId: 'external', serverName: 'foreign' });
+      reporter.check(
+        'the per-server tool cards show names, descriptions and required/optional param chips',
         pingState.enabled === 'true' &&
           pingState.approval === 'false' &&
           pingState.description.includes('echo the given text') &&
@@ -971,35 +1014,51 @@ async function main() {
           addState.params.every((param) => param.required === 'false'),
         JSON.stringify({ ping: pingState.params, add: addState.params }),
       );
-      const externalPanel = page.locator('[data-testid="external-panel"]');
+      const detailView = page.locator('[data-testid="external-server-view"]');
       reporter.check(
-        'the external tab never offers add/edit/delete/test of preset-owned servers',
-        (await externalPanel.locator('[data-testid="add-mcp"]').count()) === 0 &&
-          (await externalPanel.locator('[data-testid="server-card"]').count()) === 0 &&
-          (await externalPanel.locator('[data-testid="form-save"]').count()) === 0 &&
-          (await externalPanel.locator('[data-testid="server-menu"]').count()) === 0,
-        `add=${await externalPanel.locator('[data-testid="add-mcp"]').count()} cards=${await externalPanel.locator('[data-testid="server-card"]').count()}`,
+        'the per-server tool view never offers add/edit/delete/test either',
+        (await detailView.locator('[data-testid="add-mcp"]').count()) === 0 &&
+          (await detailView.locator('[data-testid="server-card"]').count()) === 0 &&
+          (await detailView.locator('[data-testid="form-save"]').count()) === 0 &&
+          (await detailView.locator('[data-testid="server-menu"]').count()) === 0,
+        `add=${await detailView.locator('[data-testid="add-mcp"]').count()} cards=${await detailView.locator('[data-testid="server-card"]').count()}`,
       );
-      screenshotArtifacts.push(await ui.screenshotExternalTab(page, join(ARTIFACT_DIR, 'mcp-manager-external.png')));
+      screenshotArtifacts.push(await ui.screenshotExternalTab(page, join(ARTIFACT_DIR, 'mcp-manager-external-tools.png')));
     });
 
     await reporter.step('其他 MCP tab: hiding a preset-owned tool reaches the live model request', async () => {
-      // Disable ping through the per-preset switch and 保存工具设置.
-      await ui.setExternalToolSwitch(page, 'mcp__foreign__ping', 'enabled', false);
+      // We are still in the per-server view; disabling a tool saves from there
+      // and must keep us on the same view with updated baselines.
+      await ui.setExternalToolSwitch(page, 'mcp__foreign__ping', 'enabled', false, { presetId: 'external', serverName: 'foreign' });
       await ui.saveExternalTools(page, 'external');
-      let payload = await api.external();
-      let presetView = (payload.presets ?? []).find((entry) => entry.id === 'external');
-      let ping = presetView?.servers?.find((entry) => entry.name === 'foreign')?.tools?.find((tool) => tool.name === 'mcp__foreign__ping');
+      const afterDisable = await ui.externalToolViewState(page);
+      reporter.check(
+        'saving from the per-server view stays there, updates the count to 已启用 1/2 and clears the dirty state',
+        (await page.locator('[data-testid="external-server-view"]').count()) === 1 &&
+          afterDisable.count === '已启用 1/2' &&
+          (await page.locator('[data-testid="external-server-view"] [data-testid="external-save"]').isDisabled()) === true,
+        JSON.stringify({ count: afterDisable.count }),
+      );
+      let settings = await externalToolPayload('external', 'foreign', 'mcp__foreign__ping');
       reporter.check(
         'disabling ping through 其他 MCP persists enabled:false for that preset',
-        ping?.enabled === false && ping?.approval === false,
-        redact(JSON.stringify(ping ?? null)),
+        settings.tool?.enabled === false && settings.tool?.approval === false,
+        redact(JSON.stringify(settings.tool ?? null)),
       );
-      const hiddenState = await ui.externalToolState(page, 'mcp__foreign__ping');
+      const hiddenState = await ui.externalToolState(page, 'mcp__foreign__ping', { presetId: 'external', serverName: 'foreign' });
       reporter.check(
         'the disabled external tool card reports the off switch and the disabled note',
         hiddenState.enabled === 'false' && hiddenState.text.includes('已停用'),
         hiddenState.text.replaceAll('\n', ' ').slice(0, 200),
+      );
+
+      // Back to the compact list: the server card meta must reflect 1/2.
+      await ui.backToExternalList(page);
+      const hiddenMeta = await ui.externalServerMeta(page, 'external', 'foreign');
+      reporter.check(
+        '返回 returns to the compact list with the updated 1/2 个工具已启用 meta and no tool cards',
+        hiddenMeta.includes('1/2 个工具已启用') && (await page.locator('[data-testid="external-tool-card"]').count()) === 0,
+        redact(hiddenMeta.replaceAll('\n', ' ').slice(0, 200)),
       );
 
       // Materialize a fresh external-preset Agent, then force a scan so the
@@ -1050,26 +1109,28 @@ async function main() {
         hiddenBody === '' ? '' : redact(hiddenBody.replaceAll('\n', ' ').slice(-600)),
       );
 
-      // Re-enable through the UI and check a fresh session gets ping back.
+      // Re-enable through the per-server view: the compact list comes first,
+      // then the foreign card, then the same tool view.
       await ui.openMcpPage(page);
       await ui.openExternalTab(page);
-      try {
-        await ui.externalPresetGroup(page, 'external').waitFor({ state: 'visible', timeout: 20_000 });
-        await ui.externalToolCard(page, 'mcp__foreign__ping').waitFor({ state: 'visible', timeout: 20_000 });
-        await ui.setExternalToolSwitch(page, 'mcp__foreign__ping', 'enabled', true);
-      } catch (error) {
-        const panelText = await page.locator('[data-testid="external-panel"]').innerText().catch(() => '');
-        throw new Error(`${error?.message ?? error} | external panel: ${redact(panelText.replaceAll('\n', ' ').slice(0, 900))}`, { cause: error });
-      }
+      await ui.openExternalServer(page, 'external', 'foreign');
+      await ui.setExternalToolSwitch(page, 'mcp__foreign__ping', 'enabled', true, { presetId: 'external', serverName: 'foreign' });
       await ui.saveExternalTools(page, 'external');
-      payload = await api.external();
-      presetView = (payload.presets ?? []).find((entry) => entry.id === 'external');
-      ping = presetView?.servers?.find((entry) => entry.name === 'foreign')?.tools?.find((tool) => tool.name === 'mcp__foreign__ping');
+      settings = await externalToolPayload('external', 'foreign', 'mcp__foreign__ping');
+      const restoredState = await ui.externalToolState(page, 'mcp__foreign__ping', { presetId: 'external', serverName: 'foreign' });
       reporter.check(
-        're-enabling ping through 其他 MCP restores enabled:true',
-        ping?.enabled === true && (await ui.externalToolState(page, 'mcp__foreign__ping')).enabled === 'true',
-        redact(JSON.stringify(ping ?? null)),
+        're-enabling ping through the per-server view restores enabled:true immediately (no rescan needed)',
+        settings.tool?.enabled === true && restoredState.enabled === 'true',
+        redact(JSON.stringify(settings.tool ?? null)),
       );
+      await ui.backToExternalList(page);
+      const restoredMeta = await ui.externalServerMeta(page, 'external', 'foreign');
+      reporter.check(
+        'the compact list meta returns to 2/2 个工具已启用 after the re-enable',
+        restoredMeta.includes('2/2 个工具已启用'),
+        redact(restoredMeta.replaceAll('\n', ' ').slice(0, 200)),
+      );
+
       const restoredMarker = `E2E-EXT-RESTORED-${RUN_ID}`;
       await configureMarkers([{ match: restoredMarker, reply: { kind: 'text', text: `fixture-llm: ext-restored-${RUN_ID}` } }]);
       await ui.startNewSession(page);
@@ -1090,18 +1151,17 @@ async function main() {
     });
 
     await reporter.step('其他 MCP tab: approval for a preset-owned tool (restricted asks, 完全权限 skips)', async () => {
-      // Turn approval on for add through the per-preset tools settings.
+      // Approvals are enabled from the per-server view as well.
       await ui.openMcpPage(page);
       await ui.openExternalTab(page);
-      await ui.setExternalToolSwitch(page, 'mcp__foreign__add', 'approval', true);
+      await ui.openExternalServer(page, 'external', 'foreign');
+      await ui.setExternalToolSwitch(page, 'mcp__foreign__add', 'approval', true, { presetId: 'external', serverName: 'foreign' });
       await ui.saveExternalTools(page, 'external');
-      let payload = await api.external();
-      let presetView = (payload.presets ?? []).find((entry) => entry.id === 'external');
-      let add = presetView?.servers?.find((entry) => entry.name === 'foreign')?.tools?.find((tool) => tool.name === 'mcp__foreign__add');
+      let settings = await externalToolPayload('external', 'foreign', 'mcp__foreign__add');
       reporter.check(
         'enabling approval for the foreign add tool persists approval:true',
-        add?.approval === true && add?.enabled === true,
-        redact(JSON.stringify(add ?? null)),
+        settings.tool?.approval === true && settings.tool?.enabled === true,
+        redact(JSON.stringify(settings.tool ?? null)),
       );
 
       // Restricted session: the Host-wide pre-execute policy must ask.
@@ -1167,15 +1227,21 @@ async function main() {
       );
       await ui.waitForBodyText(page, `fixture-llm: tool-result-${RUN_ID}`);
 
-      // Leave the external settings at their defaults.
+      // Leave the external settings at their defaults, from the same drill-in.
       await ui.openMcpPage(page);
       await ui.openExternalTab(page);
-      await ui.setExternalToolSwitch(page, 'mcp__foreign__add', 'approval', false);
+      await ui.openExternalServer(page, 'external', 'foreign');
+      await ui.setExternalToolSwitch(page, 'mcp__foreign__add', 'approval', false, { presetId: 'external', serverName: 'foreign' });
       await ui.saveExternalTools(page, 'external');
-      payload = await api.external();
-      presetView = (payload.presets ?? []).find((entry) => entry.id === 'external');
-      add = presetView?.servers?.find((entry) => entry.name === 'foreign')?.tools?.find((tool) => tool.name === 'mcp__foreign__add');
-      reporter.check('approval can be turned back off through 其他 MCP', add?.approval === false && add?.enabled === true, redact(JSON.stringify(add ?? null)));
+      settings = await externalToolPayload('external', 'foreign', 'mcp__foreign__add');
+      reporter.check('approval can be turned back off through the per-server view', settings.tool?.approval === false && settings.tool?.enabled === true, redact(JSON.stringify(settings.tool ?? null)));
+      await ui.backToExternalList(page);
+      const finalMeta = await ui.externalServerMeta(page, 'external', 'foreign');
+      reporter.check(
+        'the compact list ends at the default state: 2/2 个工具已启用 and no tool cards',
+        finalMeta.includes('2/2 个工具已启用') && (await page.locator('[data-testid="external-tool-card"]').count()) === 0,
+        redact(finalMeta.replaceAll('\n', ' ').slice(0, 200)),
+      );
 
       // Own-tab regression after the whole external round-trip.
       await ui.openOwnedTab(page);
@@ -1242,7 +1308,7 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
   // Publish screenshots only from a fully successful UI pass (the caller has
   // already recorded failures; a missing artifact is a failure, not silence).
   await reporter.step('publish sanitized screenshots to docs/screenshots', async () => {
-    const wanted = ['mcp-manager-list.png', 'mcp-manager-sidebar.png', 'mcp-manager-error-detail.png', 'mcp-manager-form-presets.png', 'mcp-manager-form-icon.png', 'mcp-manager-form-tools.png', 'mcp-manager-external.png'];
+    const wanted = ['mcp-manager-list.png', 'mcp-manager-sidebar.png', 'mcp-manager-error-detail.png', 'mcp-manager-form-presets.png', 'mcp-manager-form-icon.png', 'mcp-manager-form-tools.png', 'mcp-manager-external.png', 'mcp-manager-external-tools.png'];
     const published = [];
     for (const name of wanted) {
       const source = screenshotArtifacts.find((file) => basename(file) === name);
@@ -1254,7 +1320,7 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
       await copyFile(source, target);
       published.push(`${name} (${formatBytes(size)})`);
     }
-    reporter.check('seven sanitized screenshots published under docs/screenshots', published.length === 7, published.join(', '));
+    reporter.check('eight sanitized screenshots published under docs/screenshots', published.length === 8, published.join(', '));
   });
 
   if (clean) {

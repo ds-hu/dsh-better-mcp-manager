@@ -54,8 +54,8 @@ ever taking over their connection or credentials.
   call outside 完全权限 sessions. The card shows enabled/discovered counts, and the tab still shows
   the last known list while the server is offline.
 - **Other MCP**: a **其他 MCP** page tab manages preset-owned MCP tools mounted by other presets or
-  plugins — per-tool enable and **需要审批**, grouped by preset, with a rescan and an honest caveat
-  that the connection itself is not editable here.
+  plugins — grouped by preset as a compact server list, with a per-server tool view for enable and
+  **需要审批**, a rescan, and an honest caveat that the connection itself is not editable here.
 - **Test connection** on an unsaved draft before saving it.
 - **Per-server tool timeout**, default 60 seconds.
 
@@ -157,9 +157,11 @@ attempt immediately; **测试连接** probes the saved server again.
 
 If another agent preset or plugin mounts its own MCP servers through
 `@deepseek-ai/dsh-mcp-client`, switch to the **其他 MCP** tab. It groups what it finds by preset,
-marks each group **预设自带**, and lets you enable/disable every inherited tool and mark it
-**需要审批**. There is no add/edit/delete/test here — that connection belongs to the preset. See
-[Other MCP](#other-mcp).
+marks each group **预设自带**, and shows one compact card per discovered server with its
+**x/y 个工具已启用** count. Open a server card to manage its tools: full descriptions, parameter
+chips, per-tool **启用** and **需要审批**, **全部开启/全部关闭**, and **保存工具设置**; **返回** goes
+back to the refreshed list. There is no add/edit/delete/test here — that connection belongs to the
+preset. See [Other MCP](#other-mcp).
 
 ## Icons
 
@@ -219,13 +221,17 @@ the model's tool list** and **make a call ask for approval** outside full-access
 
 The page has two tabs: **本插件 MCP** (everything described above) and **其他 MCP**:
 
-- **Grouped by preset, marked 预设自带.** Each preset that mounts MCP servers gets a group with its
-  name, id, the **预设自带** badge and its MCP servers, each with the tools that server reported
-  (description and parameter chips included).
-- **Per-tool switches.** **启用** and **需要审批** work like the owned tools tab: disabling removes
-  the tool from the agent's model-facing tool list (not merely a call-time rejection), and approval
-  asks only outside **完全权限**. A per-preset **保存工具设置** persists the choices; the footer
-  explains **停用后该工具会从 Agent 的工具列表中消失；需要审批只在非完全权限下生效**.
+- **Grouped by preset, marked 预设自带, shown as a compact list.** Each preset that mounts MCP
+  servers gets a group with its name, id, the **预设自带** badge and its tool count; under it, one
+  clickable card per discovered server shows a letter tile, the server name, **x/y 个工具已启用** and,
+  when known, **发现于 …**. Tool descriptions and parameters are not expanded in this list.
+- **Open a server card to manage its tools.** The per-server view has a back button, the server name
+  with **{preset} · {presetId} · 预设自带**, **已启用 x/y**, **全部开启 / 全部关闭**, and the full tool
+  cards: description, parameter chips, **启用** and **需要审批** (approval is disabled while the tool
+  itself is disabled). **保存工具设置** saves from this view and stays there; **返回** goes back to
+  the refreshed list. A preset's save is also available in the list footer and is enabled only when
+  something changed. Either footer explains **停用后该工具会从 Agent 的工具列表中消失；需要审批只在
+  非完全权限下生效**.
 - **Discovery is live.** The tab scans the tools visible to live agents, so a preset's tools appear
   after at least one session using that preset has run. A preset that mounts an MCP client but has
   no live session yet gets a placeholder: **打开一次使用该预设的会话后自动同步，也可以点「重新扫描」**.
@@ -240,7 +246,11 @@ The page has two tabs: **本插件 MCP** (everything described above) and **其�
   cannot override the policy, only ask for it.
 
 <p align="center">
-  <img src="docs/screenshots/mcp-manager-external.png" alt="The 其他 MCP tab: 本插件 MCP / 其他 MCP tabs, intro copy, 上次扫描 and 重新扫描, a 外部MCP测试 preset with the 预设自带 badge and a foreign server, and add/ping tool cards with 启用 and 需要审批 switches and 保存工具设置" width="820">
+  <img src="docs/screenshots/mcp-manager-external.png" alt="The 其他 MCP tab's compact list: 本插件 MCP / 其他 MCP tabs, intro copy, 上次扫描 and 重新扫描, a 外部MCP测试 preset with the 预设自带 badge and 2 个工具, and a foreign server card with a letter tile, 2/2 个工具已启用 · 发现于 … and 保存工具设置" width="820">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/mcp-manager-external-tools.png" alt="The per-server tool view for foreign: back button, header 外部MCP测试 · external · 预设自带, 工具列表 with 已启用 2/2 and 全部开启/全部关闭, and mcp__foreign__add / mcp__foreign__ping cards with descriptions, parameter chips and 需要审批 switches above the footer hint and 保存工具设置" width="820">
 </p>
 
 ## Data and security
@@ -249,8 +259,9 @@ The page has two tabs: **本插件 MCP** (everything described above) and **其�
   `servers.json` for the servers this plugin owns and `external.json` for preset-owned MCP tool
   settings and descriptors, plus uploaded icons in `icons/` (each file `0600`). Nothing is written
   to the profile, to preset YAML or to the sessions directory. Mounting the plugin creates the data
-  directory; `servers.json` appears when you save the first server, `external.json` on the first save on the 其他 MCP tab. Server-declared HTTP icons are fetched by the Host and cached in memory only
-  — they are never written to disk. Per-tool enable/approval choices and the cached tool descriptors
+  directory; `servers.json` appears when you save the first server, `external.json` on the first save
+  on the 其他 MCP tab. Server-declared HTTP icons are fetched by the Host and cached in memory only —
+  they are never written to disk. Per-tool enable/approval choices and the cached tool descriptors
   (name, public name, description, parameter names, timestamps) are stored in those JSON files; the
   caches never contain headers, tokens or other credentials.
 - **Secrets are stored in `servers.json` in plaintext**: custom header values, a bearer token and a
@@ -298,7 +309,7 @@ prints the data directory. Both only read.
 
 ## Compatibility and limitations
 
-- **Tools and server instructions only.** 0.4.0 does not expose MCP resources, resource templates,
+- **Tools and server instructions only.** 0.4.1 does not expose MCP resources, resource templates,
   prompt templates or sampling. A server that offers only resources has nothing to show here.
 - **One connection per enabled server**, shared by every agent the server is exposed to. Tools are
   registered per agent preset and per tool: only the enabled tools of an allowed server reach an
@@ -310,7 +321,7 @@ prints the data directory. Both only read.
   **需要审批** tool runs without asking; every other preset asks. If the Host exposes no approval
   service (or the call has no agent), an approval-required tool is denied rather than allowed.
 - **OAuth settings are bearer or client-credentials only.** There is no authorization-code/PKCE
-  flow, so a server that requires an interactive browser login cannot be connected in 0.4.0.
+  flow, so a server that requires an interactive browser login cannot be connected in 0.4.1.
 - **No YAML import or migration.** MCP servers configured through the built-in
   `@deepseek-ai/dsh-mcp-client` rows keep working untouched. The **其他 MCP** tab can hide or gate
   their tools, but it never imports, edits or owns those rows; deleting anything on this page never

@@ -15,7 +15,7 @@ model but not to the operator: a noisy tool could not be hidden, and a dangerous
 made to ask for approval, without editing the preset's YAML — which is the preset owner's file, not
 this plugin's, and which would leave residue behind when this bundle is removed.
 
-The requirement for 0.4.0 was therefore:
+The requirement for 0.4.0 (with the page UI refined in 0.4.1) was therefore:
 
 - list preset-owned MCP servers and their tools, grouped by owning preset;
 - hide an individual inherited tool from the model, and mark an individual tool so a call asks for
@@ -82,9 +82,14 @@ exists — never an authoritative connection configuration, and never credential
 64 params) keep the file bounded. Deleting the file resets every choice; `clean --yes` deletes it
 with the data directory.
 
-**The page gets two tabs: 本插件 MCP and 其他 MCP.** The external tab is read-mostly: grouped cards,
-per-tool enable/approval switches, **保存工具设置**, **重新扫描**, and explicit copy that the
-connection cannot be edited here. It offers no add, edit, delete, test or reconnect path.
+**The page gets two tabs: 本插件 MCP and 其他 MCP, with a compact list and a drill-in tool view.**
+The external tab defaults to the same card-list shape as the owned servers: one clickable card per
+discovered server (letter tile, server name, `x/y` enabled count, discovery time) under its preset
+group, with no tool descriptions or parameters expanded. Opening a card shows a per-server tool view
+with the full tool cards, descriptions, parameter chips, `启用`/`需要审批` switches and
+**保存工具设置**; **返回** goes back to the list with refreshed counts. The list footer also keeps a
+dirty-gated preset save. **重新扫描** and explicit copy that the connection cannot be edited here
+remain. It still offers no add, edit, delete, test or reconnect path.
 
 ## Consequences
 

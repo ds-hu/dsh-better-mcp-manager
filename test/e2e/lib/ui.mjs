@@ -736,7 +736,12 @@ export async function approvalPromptCount(page) {
   return page.locator('[data-approval-key]').count();
 }
 
-// ── management page: 其他 MCP tab (0.4.0) ────────────────────────────────────
+// ── management page: 其他 MCP tab (0.4.x) ────────────────────────────────────
+
+/** Escape a literal string for use inside a RegExp. */
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
 
 /** Read the page-level tab pressed states. */
 export async function pageTabState(page) {
@@ -771,7 +776,7 @@ export async function openOwnedTab(page) {
   return page.locator('[data-testid="mcp-list"]');
 }
 
-/** One preset group in 其他 MCP. */
+/** One preset group in 其他 MCP (compact list). */
 export function externalPresetGroup(page, presetId) {
   return page.locator(`[data-testid="external-preset"][data-preset-id="${presetId}"]`).first();
 }
@@ -783,15 +788,124 @@ export async function externalGroups(page) {
     .evaluateAll((groups) => groups.map((group) => ({ id: group.getAttribute('data-preset-id'), text: group.innerText })));
 }
 
-/** One external tool card by its public (model-facing) name. */
+/** One preset-owned server card in the compact list. */
+export function externalServerCard(page, presetId, serverName) {
+  return page
+    .locator(`[data-testid="external-server-card"][data-preset-id="${presetId}"][data-server-name="${serverName}"]`)
+    .first();
+}
+
+/** Compact list snapshot: preset/server identity plus the card's meta copy. */
+export async function externalServerCards(page) {
+  return page
+    .locator('[data-testid="external-server-card"]')
+    .evaluateAll((cards) => cards.map((card) => ({
+      presetId: card.getAttribute('data-preset-id'),
+      serverName: card.getAttribute('data-server-name'),
+      text: card.innerText,
+    })));
+}
+
+/** Read one server card's meta line (`x/y 个工具已启用` + discovered time). */
+export async function externalServerMeta(page, presetId, serverName) {
+  const card = externalServerCard(page, presetId, serverName);
+  await card.waitFor({ state: 'visible', timeout: 20_000 });
+  return card.innerText();
+}
+
+/** Open one server card and wait for the per-server tool view. */
+export async function openExternalServer(page, presetId, serverName) {
+  const card = externalServerCard(page, presetId, serverName);
+  await card.waitFor({ state: 'visible', timeout: 20_000 });
+  await card.click();
+  const view = page.locator('[data-testid="external-server-view"]');
+  await view.waitFor({ state: 'visible', timeout: 20_000 });
+  await page.locator('[data-testid="external-tools-panel"]').waitFor({ state: 'visible', timeout: 20_000 });
+  await waitFor(
+    async () => {
+      if ((await page.locator('[data-testid="external-loading"]').count()) > 0) return undefined;
+      return true;
+    },
+    { timeoutMs: 20_000, intervalMs: 150, label: 'external server tool view to finish loading' },
+  );
+  return view;
+}
+
+/** Leave the per-server tool view and wait for the compact list. */
+export async function backToExternalList(page) {
+  await page.locator('[data-testid="external-back"]').click();
+  await page.locator('[data-testid="external-panel"]').waitFor({ state: 'visible', timeout: 20_000 });
+  return page.locator('[data-testid="external-panel"]');
+}
+
+/** Derive the server namespace from a public `mcp__<server>__<tool>` name. */
+function serverNameFromPublicName(publicName) {
+  const match = /^mcp__(.+?)__/u.exec(publicName);
+  return match?.[1];
+}
+
+/**
+ * Ensure the per-server tool view containing `publicName` is open.
+ *
+ * The compact list is the default view, so tool helpers can be called from
+ * either view: when the tool cards are not rendered, find the owning server
+ * card (by options or the `mcp__<server>__` name) and drill in.
+ */
+export async function ensureExternalServerView(page, publicName, { presetId, serverName } = {}) {
+  const escaped = escapeRegex(publicName);
+  const inDetail = (await page.locator('[data-testid="external-server-view"]').count()) > 0;
+  if (inDetail) {
+    const nameNode = page.locator('[data-testid="external-tool-name"]').filter({ hasText: new RegExp(`^${escaped}$`, 'u') });
+    if ((await nameNode.count()) > 0) return page.locator('[data-testid="external-server-view"]');
+    await backToExternalList(page);
+  }
+  const resolvedServer = serverName ?? serverNameFromPublicName(publicName);
+  if (resolvedServer === undefined) throw new Error(`cannot derive the external server name from "${publicName}"`);
+  let resolvedPreset = presetId;
+  if (resolvedPreset === undefined) {
+    const card = page.locator(`[data-testid="external-server-card"][data-server-name="${resolvedServer}"]`).first();
+    if ((await card.count()) === 0) throw new Error(`no external server card for "${resolvedServer}" is rendered`);
+    const cardPreset = await card.getAttribute('data-preset-id');
+    if (cardPreset === null || cardPreset === '') throw new Error(`external server card for "${resolvedServer}" has no data-preset-id`);
+    resolvedPreset = cardPreset;
+  }
+  await openExternalServer(page, resolvedPreset, resolvedServer);
+  await page
+    .locator('[data-testid="external-tool-name"]')
+    .filter({ hasText: new RegExp(`^${escaped}$`, 'u') })
+    .first()
+    .waitFor({ state: 'visible', timeout: 20_000 });
+  return page.locator('[data-testid="external-server-view"]');
+}
+
+/** One external tool card by its public (model-facing) name (per-server view). */
 export function externalToolCard(page, publicName) {
-  const escaped = publicName.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-  const nameNode = page.locator('[data-testid="external-tool-name"]').filter({ hasText: new RegExp(`^${escaped}$`, 'u') });
+  const nameNode = page
+    .locator('[data-testid="external-tool-name"]')
+    .filter({ hasText: new RegExp(`^${escapeRegex(publicName)}$`, 'u') });
   return page.locator('[data-testid="external-tool-card"]').filter({ has: nameNode }).first();
 }
 
+/** Per-server tool view snapshot: count copy, batch controls and card names. */
+export async function externalToolViewState(page) {
+  const view = page.locator('[data-testid="external-server-view"]');
+  await view.waitFor({ state: 'visible', timeout: 20_000 });
+  const count = page.locator('[data-testid="external-count"]');
+  await count.waitFor({ state: 'visible', timeout: 20_000 });
+  return {
+    count: (await count.innerText()).trim(),
+    toolNames: await page
+      .locator('[data-testid="external-tool-name"]')
+      .evaluateAll((nodes) => nodes.map((node) => node.textContent ?? '')),
+    enableAllDisabled: await page.locator('[data-testid="external-enable-all"]').isDisabled(),
+    disableAllDisabled: await page.locator('[data-testid="external-disable-all"]').isDisabled(),
+    text: await view.innerText(),
+  };
+}
+
 /** Read one external tool card's switches, params, description and copy. */
-export async function externalToolState(page, publicName) {
+export async function externalToolState(page, publicName, options = {}) {
+  await ensureExternalServerView(page, publicName, options);
   const card = externalToolCard(page, publicName);
   await card.waitFor({ state: 'visible', timeout: 15_000 });
   const enabled = card.locator('[data-testid="external-tool-enabled"]');
@@ -811,7 +925,8 @@ export async function externalToolState(page, publicName) {
 }
 
 /** Flip one external tool switch and wait for its aria-checked state. */
-export async function setExternalToolSwitch(page, publicName, switchKind, on) {
+export async function setExternalToolSwitch(page, publicName, switchKind, on, options = {}) {
+  await ensureExternalServerView(page, publicName, options);
   const testId = switchKind === 'approval' ? 'external-tool-approval' : 'external-tool-enabled';
   const control = externalToolCard(page, publicName).locator(`[data-testid="${testId}"]`);
   await control.waitFor({ state: 'visible', timeout: 10_000 });
@@ -823,13 +938,18 @@ export async function setExternalToolSwitch(page, publicName, switchKind, on) {
   });
 }
 
-/** Click a preset group's 保存工具设置 and wait for its saved/error notice. */
+/**
+ * Click 保存工具设置 in the view that is open: the per-server tool view keeps
+ * its own save button (and stays open on that view); the compact list keeps the
+ * per-preset footer button. Waits for the saved/error notice.
+ */
 export async function saveExternalTools(page, presetId) {
-  const group = externalPresetGroup(page, presetId);
-  await group.locator('[data-testid="external-save"]').click();
+  const detail = page.locator('[data-testid="external-server-view"]');
+  const scope = (await detail.count()) > 0 ? detail : externalPresetGroup(page, presetId);
+  await scope.locator('[data-testid="external-save"]').click();
   return waitFor(
     async () => {
-      const text = await group.innerText().catch(() => '');
+      const text = await scope.innerText().catch(() => '');
       if (text.includes('工具设置已保存')) return text;
       if (text.includes('保存失败')) throw new Error(text.slice(0, 400));
       return undefined;
@@ -859,7 +979,7 @@ export async function scanExternal(page) {
   );
 }
 
-/** Screenshot the page surface (owned/other tabs + the 其他 MCP content). */
+/** Screenshot the page surface (tabs + compact list or per-server tool view). */
 export async function screenshotExternalTab(page, path) {
   const pageSurface = page.locator('.mm-page').first();
   await pageSurface.waitFor({ state: 'visible', timeout: 10_000 });

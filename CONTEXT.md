@@ -164,8 +164,10 @@ plugin's own tools use the §2.7 approval gate and are never double-gated.
 Per `(presetId, public tool name)` in `external.json`: only deviations from "enabled, no approval"
 are stored (`{ enabled: false }` and/or `{ approval: true }`). The **其他 MCP** tab edits them per
 preset and saves with `PUT /external/tools`; the payload also carries the last discovered descriptors
-per server. Like owned tool settings, they are runtime state, not preset configuration: nothing is
-written back to the preset.
+per server. The tab is a compact server list (one clickable card per discovered server, with an
+`x/y` enabled count); its per-server tool view is where descriptions, parameter chips and the enable/
+approval switches are shown and saved. Like owned tool settings, they are runtime state, not preset
+configuration: nothing is written back to the preset.
 
 ### OAuth settings
 
@@ -173,7 +175,7 @@ Per-server authentication beyond custom headers: `none`, `bearer` (a static toke
 `Authorization: Bearer` header unless a custom `Authorization` header already exists — custom
 headers win), or `client_credentials` (fetch a token from `tokenUrl` with `clientId`,
 `clientSecret`, `scope`, cache it until `expires_in - 60s`, retry once on a 401). There is no
-authorization-code flow in 0.4.0. Secrets are stored in the data file, never written to logs.
+authorization-code flow in 0.4.1. Secrets are stored in the data file, never written to logs.
 
 ### Store and data directory
 

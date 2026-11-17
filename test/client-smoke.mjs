@@ -107,8 +107,10 @@ if (source !== '') {
     const testIds = [
       'page-tab-owned', 'page-tab-external', 'external-panel', 'external-loading', 'external-error',
       'external-retry', 'external-empty', 'external-scan', 'external-preset', 'external-owned-badge',
-      'external-pending', 'external-tool-card', 'external-tool-name', 'external-tool-desc',
-      'external-tool-param', 'external-tool-enabled', 'external-tool-approval', 'external-save',
+      'external-pending', 'external-server-card', 'external-server-view', 'external-back',
+      'external-tools-panel', 'external-count', 'external-enable-all', 'external-disable-all',
+      'external-tool-card', 'external-tool-name', 'external-tool-desc', 'external-tool-param',
+      'external-tool-enabled', 'external-tool-approval', 'external-save',
     ];
     for (const testId of testIds) assert.ok(source.includes(`"${testId}"`), `lib/client.js is missing the "${testId}" hook`);
     for (const path of ['"/external"', '"/external/scan"', '"/external/tools"']) {
@@ -118,7 +120,27 @@ if (source !== '') {
       assert.equal(source.includes(`"${forbidden}"`), false, `the external tab must never offer ${forbidden}`);
     }
     assert.match(source, /data-preset-id/u, 'each external preset group carries its preset id');
+    assert.match(source, /data-server-name/u, 'each compact server card carries its server name');
     assert.match(source, /externalBaselines/u, 'the tab tracks per-preset save baselines');
+
+    // 0.4.1 compact presentation: the list view renders server cards only and
+    // opens a per-server view; tool cards may only appear inside that detail view.
+    const cardStart = source.indexOf('function ExternalServerCard');
+    const viewStart = source.indexOf('function ExternalServerView');
+    const nextFunction = source.indexOf('function EditFormView');
+    assert.ok(cardStart > 0, 'ExternalServerCard must be defined');
+    assert.ok(viewStart > cardStart, 'ExternalServerView must follow ExternalServerCard');
+    assert.ok(nextFunction > viewStart, 'sanity: the detail view ends before the edit form');
+    const cardBody = source.slice(cardStart, viewStart);
+    const viewBody = source.slice(viewStart, nextFunction);
+    assert.equal(cardBody.includes('ExternalToolCard'), false, 'the compact server card must not expand tool cards inline');
+    assert.ok(viewBody.includes('ExternalToolCard'), 'the per-server view renders the full tool cards');
+    assert.ok(cardBody.includes('external-server-card'), 'the compact card carries its test hook');
+    assert.ok(cardBody.includes('mm-externalServerCard'), 'the compact card uses the shared card class');
+    assert.ok(viewBody.includes('external-server-view'), 'the detail view carries its test hook');
+    assert.ok(viewBody.includes('external-back'), 'the detail view has a back button');
+    assert.ok(viewBody.includes('external-enable-all') && viewBody.includes('external-disable-all'), 'the detail view has the batch buttons');
+    assert.ok(viewBody.includes('external-count'), 'the detail view shows the tools.count line');
   });
 
   check('the browser half never imports a Harness package', () => {
@@ -563,6 +585,10 @@ check('the dictionaries carry every label the panel needs', () => {
     { topic: 'external footHint', exact: 'external.footHint' },
     { topic: 'external noParams', exact: 'external.noParams' },
     { topic: 'external toolsEmpty', exact: 'external.toolsEmpty' },
+    { topic: 'external server meta', exact: 'external.serverMeta' },
+    { topic: 'external discovered at', exact: 'external.discoveredAt' },
+    { topic: 'external back', exact: 'external.back' },
+    { topic: 'external detail hint', exact: 'external.detailHint' },
     { topic: 'presets', pattern: /(^|\.)presets(?:\.|$)/u },
     { topic: 'status.connected', exact: 'status.connected' },
     { topic: 'status.error', exact: 'status.error' },
@@ -685,6 +711,20 @@ check('the page tabs and external copy match the contract', () => {
   }
   assert.match(zh['external.intro'], /不能修改连接或凭据/u, 'the intro states that connections/credentials are out of scope');
   assert.match(zh['external.footHint'], /非完全权限/u);
+  // 0.4.1 compact server cards + per-server detail view.
+  for (const dictionary of [zh, en]) {
+    assert.match(dictionary['external.serverMeta'], /\{enabled\}/u);
+    assert.match(dictionary['external.serverMeta'], /\{total\}/u);
+    assert.match(dictionary['external.discoveredAt'], /\{time\}/u);
+    assert.equal(dictionary['external.back'].length > 0, true);
+    assert.equal(dictionary['external.detailHint'].length > 0, true);
+  }
+  assert.match(zh['external.serverMeta'], /工具/u);
+  assert.match(en['external.serverMeta'], /tools/u);
+  assert.match(zh['external.detailHint'], /工具/u);
+  assert.match(zh['external.detailHint'], /审批/u);
+  assert.match(en['external.detailHint'], /tool/u);
+  assert.match(en['external.detailHint'], /approval/u);
 });
 
 check('the client exposes the 0.4.0 external helpers and components', () => {
@@ -693,6 +733,8 @@ check('the client exposes the 0.4.0 external helpers and components', () => {
   assert.equal(typeof api.ExternalTab, 'function', 'ExternalTab must be exported');
   assert.equal(typeof api.ExternalView, 'function', 'ExternalView must be SSR-able');
   assert.equal(typeof api.ExternalToolCard, 'function');
+  assert.equal(typeof api.ExternalServerCard, 'function', '0.4.1 exposes the compact server card');
+  assert.equal(typeof api.ExternalServerView, 'function', '0.4.1 exposes the per-server tool view');
   assert.equal(typeof api.normalizeExternalPayload, 'function');
   assert.equal(typeof api.externalToolSettings, 'function');
   assert.equal(typeof api.externalToolSettingsKey, 'function');
