@@ -3,7 +3,7 @@
 This file is the single source of truth shared by the Host half (`lib/index.js` and friends),
 the Client half (`lib/client.js`) and the tests (`test/`). Change it before changing either side.
 
-Status: **frozen for 0.3.0**. Everything below is what 0.3.0 ships.
+Status: **frozen for 0.4.0**. Everything below is what 0.4.0 ships.
 
 ---
 
@@ -206,6 +206,40 @@ The page can manage the tools one MCP server exposes:
 - Tool settings and the cache are not accepted in save drafts; they change only through the tool
   endpoints in §3. A new server starts with `{}` / `null`.
 
+### 2.8 Preset-owned ("external") MCP tools
+
+A second management surface covers MCP servers this plugin does **not** own: servers mounted by
+other plugins or agent presets through `@deepseek-ai/dsh-mcp-client`. The plugin never edits that
+preset YAML, never starts or stops those connections and never touches their credentials; it only
+manages whether an already-registered tool is exposed to the agent and whether calling it asks for
+approval.
+
+- **Ownership.** A tool is external for an Agent when its name occurs in the Agent's inherited
+  scoped tool registry (the preset layer) under the `mcp__` namespace and the plugin did not
+  register it. The source preset is `agentPresets.composedPreset(agent.ctx)`; the source server is
+  the `mcp__<serverName>__` prefix. Descriptors come from live Agents (`tools.view(agent)`), so a
+  preset's tools appear after at least one Agent of that preset exists; before that the payload
+  carries a placeholder (`hasPresetMcp: true`, no servers). `hasPresetMcp` is derived from
+  `agentPresets.inspectCompositions()` seeing an `@deepseek-ai/dsh-mcp-client` module.
+- **Disable.** A disabled external tool is removed from that Agent's model-facing tool set with
+  `agent.ctx.tools.restrict({ deny })`, not merely rejected at call time. Restrictions are
+  recomputed when an Agent is created, when its preset selection changes, and when the tool
+  registry changes (MCP reconnects/tool-list updates), and only affect Agents of the owning preset.
+- **Approval.** Before a call to an external tool with `approval: true`, a Host-wide
+  `tools/pre-execute` policy returns `{ kind: 'ask', reason }`. The shared DSH pipeline runs the
+  approval service with that reason and only dispatches after `allowed-once`. Like §2.7, the exact
+  `danger-full-access` (完全权限) preset skips the request; a missing approval channel or a
+  non-grant denies the call before dispatch. The plugin's own tools keep their §2.7 gate and are
+  never double-gated.
+- **Persistence.** Decisions and descriptors live in a second file
+  `$DSH_HOME/better-mcp-manager/external.json` (mode `0600`, atomic replace, schema version 1):
+  `{ version, presets: { "<presetId>": { updatedAt, overrides: { "<publicName>": { enabled?: false,
+  approval?: true } }, servers: { "<serverName>": { discoveredAt, tools: [{ name, description,
+  params: [{ name, required }] }] } } } } }`. Only deviations from the defaults are stored
+  (`enabled` defaults true, `approval` defaults false). Descriptors are capped (100 presets,
+  200 servers per preset, 300 tools per server, description 2000 chars, 64 params) and carry no
+  credentials. The cleanup CLI removes this file with the rest of the data directory.
+
 ## 3. Host HTTP API
 
 Base: `/better-mcp-manager/api`, same-origin only. `kind: 'prefix'` route on `ctx.webServer`.
@@ -232,6 +266,9 @@ Base: `/better-mcp-manager/api`, same-origin only. `kind: 'prefix'` route on `ct
 | POST | `/servers/:id/icon` | `{ dataUrl: "data:image/png;base64,..." }` | `{ ok, server }`; stores the decoded image and sets `icon.kind = "upload"` |
 | GET | `/servers/:id/tools` | — | `{ ok, connected, cachedAt, tools }` — live descriptors when connected, otherwise the record cache; each tool carries `name`, `publicName`, `description`, `params`, `enabled`, `approval` |
 | PUT | `/servers/:id/tools` | `{ tools: [{ name, enabled, approval }] }` | `{ ok, server }`; stores only non-default overrides and rebinds live agents |
+| GET | `/external` | — | `{ ok, scannedAt, presets: [{ id, name, hasPresetMcp, servers: [{ name, discoveredAt, tools: [{ name, description, params, enabled, approval }] }] }] }` — preset-owned MCP tools (§2.8); discovery refreshes first |
+| POST | `/external/scan` | — | same payload as `GET /external`, after re-running discovery |
+| PUT | `/external/tools` | `{ presetId, tools: [{ name, enabled, approval }] }` | same payload as `GET /external`; stores only non-default overrides for that preset and re-applies exposure |
 | DELETE | `/servers/:id/icon` | — | `{ ok, server }`; deletes the stored file and resets `icon = { kind: "auto" }` |
 | GET | `/presets` | — | `{ ok, presets: [Preset] }` where `Preset = { id, name, description, order }` |
 | GET | `/agents` | — | `{ ok, agents: [{ sessionId, preset, servers: [key], tools: [publicName] }] }` — live exposure diagnostics |
@@ -280,18 +317,28 @@ Page (dark and light theme, tokens only — no literal colors outside artwork):
    OAuth 设置 dialog (mode none/bearer/client_credentials); 自定义请求头 rows (name, value,
    delete, `+ 添加请求头`); 预设 section (radio: 全部预设 / 指定预设, then preset checkboxes);
    保存 (and 删除 in edit mode) with inline validation errors and a saving state.
-4. Empty state with an add CTA; loading skeleton/spinner; retry on network failure.
-5. Poll `GET /servers` every 2.5s while the page is mounted (and immediately after every mutation);
+4. Page-level tabs distinguish **本插件 MCP** (`page-tab-owned`) and **其他 MCP** (`page-tab-external`).
+   The owned tab keeps items 1–3 unchanged. The external tab lists preset-owned MCP servers reported
+   by `GET /external`, with the explanation that this plugin cannot edit their connection and only
+   controls tool exposure/approval; grouped by preset (`external-preset`), each with a 预设自带 badge,
+   a placeholder hint when `hasPresetMcp` has no discovered servers yet, a 重新扫描 button
+   (`external-scan`), per-tool enable/approval switches (`external-tool-enabled`,
+   `external-tool-approval`), and a per-preset 保存工具设置 button (`external-save`) sending
+   `PUT /external/tools`. Loading, empty, error+retry (`external-retry`) and saved/failed notices are
+   required. The external tab never offers add/edit/delete/test of those servers.
+5. Empty state with an add CTA; loading skeleton/spinner; retry on network failure.
+6. Poll `GET /servers` every 2.5s while the page is mounted (and immediately after every mutation);
    stop when unmounted.
-6. All copy through `ctx.locale.register(NS, { zh, en })`; locale namespace `mcpManager`.
-7. Cleanup: one `<style data-plugin-css>` tag per plugin instance, removed on dispose; every timer
+7. All copy through `ctx.locale.register(NS, { zh, en })`; locale namespace `mcpManager`.
+8. Cleanup: one `<style data-plugin-css>` tag per plugin instance, removed on dispose; every timer
    cleared in `ctx.effect` cleanup.
 
 ## 6. Test surface
 
 - Unit (plain `node --test`, no Host): store/validation, key allocation, preset predicate, tool
-  name derivation, API router with mock `req`/`res`, MCP result projection (text/resource/image
-  diagnostic), client-credentials refresh.
+  name derivation, per-tool settings/cache, preset-owned discovery/restriction/pre-execute/state
+  persistence (`test/external.test.mjs`), API router with mock `req`/`res`, MCP result projection
+  (text/resource/image diagnostic), client-credentials refresh.
 - Mount check: patch row id === Host `name`, exports resolve, no `@deepseek-ai/*` import in `lib/`,
   no writes outside the data dir, locale/icon exported and packed.
 - Client smoke: run `lib/client.js` in a `vm` with a fake `window.__ModuleLoader__` + fake React,
@@ -299,4 +346,6 @@ Page (dark and light theme, tokens only — no literal colors outside artwork):
 - E2E (isolated DSH_HOME + its own systemd scope, never the production instance): install the packed
   tarball into a fresh `web` profile, boot on a free port, drive the real page with Playwright,
   verify connect/fail/tool-count/preset scoping against local fixture MCP servers and a fake
-  OpenAI-compatible endpoint that records the tool schemas it receives.
+  OpenAI-compatible endpoint that records the tool schemas it receives; a preset-mounted fixture MCP
+  drives the 其他 MCP tab, disabled-tool removal from `tools[]`, and the restricted/full-access
+  approval split end to end.

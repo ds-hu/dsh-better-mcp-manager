@@ -155,6 +155,18 @@ export class InstanceApi {
     return (await this.put(`/better-mcp-manager/api/servers/${encodeURIComponent(id)}/tools`, { tools })).payload;
   }
 
+  async external() {
+    return (await this.get('/better-mcp-manager/api/external')).payload;
+  }
+
+  async scanExternal() {
+    return (await this.post('/better-mcp-manager/api/external/scan')).payload;
+  }
+
+  async putExternalTools(presetId, tools) {
+    return (await this.put('/better-mcp-manager/api/external/tools', { presetId, tools })).payload;
+  }
+
   async uploadIcon(id, dataUrl) {
     return (await this.post(`/better-mcp-manager/api/servers/${encodeURIComponent(id)}/icon`, { dataUrl })).payload;
   }

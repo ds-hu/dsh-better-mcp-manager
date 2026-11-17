@@ -21,6 +21,11 @@
  *              minimal-preset session's request does not; a tool_call for the
  *              MCP tool executes against the fixture and its result is fed back
  *              to the model on the next request;
+ *   external   a preset-owned MCP server (`foreign`, mounted by the shipped
+ *              `@deepseek-ai/dsh-mcp-client` inside the test preset `external`)
+ *              is discovered in 其他 MCP, hiding one tool removes it from a live
+ *              session's model request, approval asks only outside 完全权限,
+ *              and 本插件 MCP keeps working;
  *   hygiene    cleanup removes scopes/processes/files/ports and the production
  *              dsh-web.service MainPID and cgroup are untouched.
  *
@@ -48,6 +53,9 @@ import {
   addBundleToManifest,
   bootDsh,
   createFreshProfile,
+  EXTERNAL_MCP_CLIENT_PACKAGE,
+  FIXTURE_EXTERNAL_SCRIPT,
+  installExternalMcpClient,
   installPackedPlugin,
   packPlugin,
   scanBootLog,
@@ -85,6 +93,12 @@ const DATA_DIR = join(DSH_HOME, 'better-mcp-manager');
 const ICONS_DIR = join(DATA_DIR, 'icons');
 const UPLOAD_A_PATH = join(RUN_DIR, 'tmp', 'upload-a.png');
 const UPLOAD_B_PATH = join(RUN_DIR, 'tmp', 'upload-b.png');
+// 0.4.0: the preset-owned MCP server's script lives inside the run directory;
+// the profile patch points at this absolute path (never at the repo checkout).
+const EXTERNAL_FIXTURE_SOURCE = join(REPO_ROOT, FIXTURE_EXTERNAL_SCRIPT);
+const EXTERNAL_FIXTURE_DIR = join(RUN_DIR, 'fixtures');
+const EXTERNAL_FIXTURE_PATH = join(EXTERNAL_FIXTURE_DIR, 'mcp-external-server.mjs');
+const EXTERNAL_PRESET = { presetId: 'external', presetName: '外部MCP测试', order: 99, serverName: 'foreign' };
 
 const reporter = new Reporter({ verbose: FLAGS.verbose });
 const resources = { browser: null, dsh: null, fixtures: null };
@@ -113,6 +127,8 @@ async function main() {
   await mkdir(join(RUN_DIR, 'tmp'), { recursive: true });
   await mkdir(ARTIFACT_DIR, { recursive: true });
   await mkdir(WORKSPACE_DIR, { recursive: true });
+  await mkdir(EXTERNAL_FIXTURE_DIR, { recursive: true });
+  await copyFile(EXTERNAL_FIXTURE_SOURCE, EXTERNAL_FIXTURE_PATH);
   // The development host runs the assistant inside dsh-web.service, whose TMPDIR
   // is the shared /var/tmp/dsh scratch home. Redirect every child (test DSH,
   // fixtures, pnpm, chromium) to this run's own tmp dir so the isolated E2E
@@ -148,12 +164,23 @@ async function main() {
       const bundles = addBundleToManifest({ profileDir: PROFILE_DIR });
       reporter.check('test profile is the shipped web template plus this bundle', bundles.includes('@deepseek-ai/dsh-base') && bundles.includes('@deepseek-ai/dsh-web-app') && bundles.includes('@ds-hu/dsh-better-mcp-manager'));
 
-      writeProfilePatch({ profileDir: PROFILE_DIR, fakeBaseURL: fixtures.fakeBaseURL });
+      writeProfilePatch({
+        profileDir: PROFILE_DIR,
+        fakeBaseURL: fixtures.fakeBaseURL,
+        externalPreset: { ...EXTERNAL_PRESET, nodePath: process.execPath, fixturePath: EXTERNAL_FIXTURE_PATH },
+      });
       const install = await installPackedPlugin({ repoRoot: REPO_ROOT, runDir: RUN_DIR, dshHome: DSH_HOME, homeDir: HOME_DIR, profileName: PROFILE_NAME, profileDir: PROFILE_DIR, tarball: pack.tarball });
       reporter.check(
         'packed tarball installed via `dsh plugin add` with the real registry dependency',
         install.installedVersion === JSON.parse(await readFile(join(REPO_ROOT, 'package.json'), 'utf8')).version && install.mcpClientVersion === '2.2.0',
         `plugin ${install.installedVersion}, @modelcontextprotocol/client ${install.mcpClientVersion}`,
+      );
+
+      const externalClient = await installExternalMcpClient({ runDir: RUN_DIR, dshHome: DSH_HOME, homeDir: HOME_DIR, profileName: PROFILE_NAME, profileDir: PROFILE_DIR });
+      reporter.check(
+        'shipped MCP client installed for the preset-owned (其他 MCP) test preset',
+        externalClient.version !== '' && existsSync(join(PROFILE_DIR, 'node_modules', EXTERNAL_MCP_CLIENT_PACKAGE, 'package.json')),
+        `${EXTERNAL_MCP_CLIENT_PACKAGE}@${externalClient.version} (${externalClient.mode})`,
       );
     });
 
@@ -846,6 +873,320 @@ async function main() {
       );
     });
 
+    // ── phase 4: 其他 MCP (preset-owned servers, 0.4.0) ──────────────────
+    /** Replace the fake-LLM marker rules with the given ones (others are kept). */
+    const configureMarkers = async (entries) => {
+      const state = await fixtures.state();
+      const replaced = new Set(entries.map((entry) => String(entry.match)));
+      await fixtures.configure({
+        ...state.config,
+        markers: [...(state.config.markers ?? []).filter((rule) => !replaced.has(String(rule.match))), ...entries],
+      });
+    };
+
+    await reporter.step('其他 MCP tab: preset-owned server discovery and tool list', async () => {
+      // The owned list keeps working underneath the new page-level tabs.
+      await ui.openMcpPage(page);
+      const tabs = await ui.pageTabState(page);
+      reporter.check(
+        'page-level tabs expose 本插件 MCP (default) and 其他 MCP',
+        tabs.ownedPressed === 'true' && tabs.externalPressed === 'false' && (await ui.card(page, stdioName).count()) === 1,
+        JSON.stringify(tabs),
+      );
+
+      // A live Agent of the external preset is what lets the Host see the
+      // preset's shipped mcp-client tools (discovery reads tools.view(agent)).
+      const discoverMarker = `E2E-EXTERNAL-${RUN_ID}`;
+      await configureMarkers([{ match: discoverMarker, reply: { kind: 'text', text: `fixture-llm: external-${RUN_ID}` } }]);
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'external');
+      const presetPermission = await ui.currentPermission(page);
+      reporter.check('外部MCP测试 preset session starts outside 完全权限', presetPermission !== '完全权限', presetPermission);
+      await ui.sendMessage(page, `${discoverMarker} 外部预设会话`);
+      const discoverRequest = await waitFor(
+        async () => {
+          const state = await fixtures.state();
+          return requestsForMarker(state, discoverMarker)[0];
+        },
+        { timeoutMs: 120_000, intervalMs: 500, label: 'the external-preset model request' },
+      );
+      const foreignNames = (discoverRequest.tools ?? []).filter((name) => name.startsWith('mcp__foreign__')).sort();
+      reporter.check(
+        'external-preset session advertises the preset-owned foreign tools',
+        JSON.stringify(foreignNames) === JSON.stringify(['mcp__foreign__add', 'mcp__foreign__ping']),
+        foreignNames.join(', ') || '(none)',
+      );
+      await ui.waitForBodyText(page, `fixture-llm: external-${RUN_ID}`);
+
+      // GET /external runs a discovery pass and caches descriptors; it must
+      // group the server under the preset and keep both tools.
+      const payload = await api.external();
+      const presetView = (payload.presets ?? []).find((entry) => entry.id === 'external');
+      const serverView = presetView?.servers?.find((entry) => entry.name === 'foreign');
+      const pingPayload = serverView?.tools?.find((tool) => tool.name === 'mcp__foreign__ping');
+      const addPayload = serverView?.tools?.find((tool) => tool.name === 'mcp__foreign__add');
+      reporter.check(
+        'GET /external reports the preset, the 预设自带 foreign server and both tools',
+        payload.ok === true &&
+          typeof payload.scannedAt === 'string' &&
+          presetView?.name === '外部MCP测试' &&
+          presetView?.hasPresetMcp === true &&
+          serverView?.tools?.map((tool) => tool.name).sort().join(',') === 'mcp__foreign__add,mcp__foreign__ping',
+        redact(JSON.stringify(presetView ?? null).slice(0, 400)),
+      );
+      reporter.check(
+        'GET /external carries tool descriptions, param chips and default tool settings',
+        pingPayload?.description?.includes('echo the given text') &&
+          pingPayload?.enabled === true &&
+          pingPayload?.approval === false &&
+          pingPayload?.params?.some((param) => param.name === 'text' && param.required === true) &&
+          addPayload?.enabled === true &&
+          addPayload?.approval === false &&
+          addPayload?.params?.length === 2 &&
+          addPayload.params.every((param) => param.required === false) &&
+          addPayload.params.map((param) => param.name).sort().join(',') === 'a,b',
+        redact(JSON.stringify({ ping: pingPayload ?? null, add: addPayload ?? null }).slice(0, 500)),
+      );
+
+      await ui.openMcpPage(page);
+      await ui.openExternalTab(page);
+      const group = ui.externalPresetGroup(page, 'external');
+      await group.waitFor({ state: 'visible', timeout: 20_000 });
+      const groupText = await group.innerText();
+      reporter.check(
+        '其他 MCP groups the server under 外部MCP测试 with the 预设自带 badge and foreign name',
+        groupText.includes('外部MCP测试') && groupText.includes('预设自带') && groupText.includes('foreign') && groupText.includes('2 个工具'),
+        groupText.replaceAll('\n', ' ').slice(0, 220),
+      );
+      const pingState = await ui.externalToolState(page, 'mcp__foreign__ping');
+      const addState = await ui.externalToolState(page, 'mcp__foreign__add');
+      reporter.check(
+        'external tool cards show names, descriptions and required/optional param chips',
+        pingState.enabled === 'true' &&
+          pingState.approval === 'false' &&
+          pingState.description.includes('echo the given text') &&
+          pingState.params.some((param) => param.text.includes('text') && param.required === 'true') &&
+          addState.enabled === 'true' &&
+          addState.params.length === 2 &&
+          addState.params.every((param) => param.required === 'false'),
+        JSON.stringify({ ping: pingState.params, add: addState.params }),
+      );
+      const externalPanel = page.locator('[data-testid="external-panel"]');
+      reporter.check(
+        'the external tab never offers add/edit/delete/test of preset-owned servers',
+        (await externalPanel.locator('[data-testid="add-mcp"]').count()) === 0 &&
+          (await externalPanel.locator('[data-testid="server-card"]').count()) === 0 &&
+          (await externalPanel.locator('[data-testid="form-save"]').count()) === 0 &&
+          (await externalPanel.locator('[data-testid="server-menu"]').count()) === 0,
+        `add=${await externalPanel.locator('[data-testid="add-mcp"]').count()} cards=${await externalPanel.locator('[data-testid="server-card"]').count()}`,
+      );
+      screenshotArtifacts.push(await ui.screenshotExternalTab(page, join(ARTIFACT_DIR, 'mcp-manager-external.png')));
+    });
+
+    await reporter.step('其他 MCP tab: hiding a preset-owned tool reaches the live model request', async () => {
+      // Disable ping through the per-preset switch and 保存工具设置.
+      await ui.setExternalToolSwitch(page, 'mcp__foreign__ping', 'enabled', false);
+      await ui.saveExternalTools(page, 'external');
+      let payload = await api.external();
+      let presetView = (payload.presets ?? []).find((entry) => entry.id === 'external');
+      let ping = presetView?.servers?.find((entry) => entry.name === 'foreign')?.tools?.find((tool) => tool.name === 'mcp__foreign__ping');
+      reporter.check(
+        'disabling ping through 其他 MCP persists enabled:false for that preset',
+        ping?.enabled === false && ping?.approval === false,
+        redact(JSON.stringify(ping ?? null)),
+      );
+      const hiddenState = await ui.externalToolState(page, 'mcp__foreign__ping');
+      reporter.check(
+        'the disabled external tool card reports the off switch and the disabled note',
+        hiddenState.enabled === 'false' && hiddenState.text.includes('已停用'),
+        hiddenState.text.replaceAll('\n', ' ').slice(0, 200),
+      );
+
+      // Materialize a fresh external-preset Agent, then force a scan so the
+      // stored restriction applies before the next model request.
+      const materializeMarker = `E2E-EXT-MATERIALIZE-${RUN_ID}`;
+      const hiddenMarker = `E2E-EXT-HIDDEN-${RUN_ID}`;
+      // Marker rules are checked in order over the whole transcript: the
+      // hidden-turn rule must precede the materialize rule, otherwise the
+      // materialize text from the same transcript keeps matching first.
+      await configureMarkers([
+        { match: hiddenMarker, reply: { kind: 'text', text: `fixture-llm: ext-hidden-${RUN_ID}` } },
+        { match: materializeMarker, reply: { kind: 'text', text: `fixture-llm: ext-materialize-${RUN_ID}` } },
+      ]);
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'external');
+      await ui.sendMessage(page, `${materializeMarker} 外部预设隐藏会话`);
+      await waitFor(
+        async () => {
+          const state = await fixtures.state();
+          return requestsForMarker(state, materializeMarker)[0];
+        },
+        { timeoutMs: 120_000, intervalMs: 500, label: 'the external-preset materialize request' },
+      );
+      await ui.waitForBodyText(page, `fixture-llm: ext-materialize-${RUN_ID}`);
+      await api.scanExternal();
+      await ui.sendMessage(page, `${hiddenMarker} 停用后的外部请求`);
+      const hiddenRequest = await waitFor(
+        async () => {
+          const state = await fixtures.state();
+          return requestsForMarker(state, hiddenMarker)[0];
+        },
+        { timeoutMs: 120_000, intervalMs: 500, label: 'the model request after hiding ping' },
+      );
+      reporter.check(
+        'after hiding, the live external-preset model request no longer carries mcp__foreign__ping',
+        !(hiddenRequest.tools ?? []).includes('mcp__foreign__ping') && (hiddenRequest.tools ?? []).includes('mcp__foreign__add'),
+        (hiddenRequest.tools ?? []).filter((name) => name.startsWith('mcp__foreign__')).join(', ') || '(none)',
+      );
+      let hiddenBody = '';
+      try {
+        await ui.waitForBodyText(page, `fixture-llm: ext-hidden-${RUN_ID}`, { timeoutMs: 60_000 });
+      } catch {
+        hiddenBody = await page.locator('body').innerText().catch(() => '');
+      }
+      reporter.check(
+        'the hidden-tool turn still answers in the session',
+        hiddenBody === '',
+        hiddenBody === '' ? '' : redact(hiddenBody.replaceAll('\n', ' ').slice(-600)),
+      );
+
+      // Re-enable through the UI and check a fresh session gets ping back.
+      await ui.openMcpPage(page);
+      await ui.openExternalTab(page);
+      try {
+        await ui.externalPresetGroup(page, 'external').waitFor({ state: 'visible', timeout: 20_000 });
+        await ui.externalToolCard(page, 'mcp__foreign__ping').waitFor({ state: 'visible', timeout: 20_000 });
+        await ui.setExternalToolSwitch(page, 'mcp__foreign__ping', 'enabled', true);
+      } catch (error) {
+        const panelText = await page.locator('[data-testid="external-panel"]').innerText().catch(() => '');
+        throw new Error(`${error?.message ?? error} | external panel: ${redact(panelText.replaceAll('\n', ' ').slice(0, 900))}`, { cause: error });
+      }
+      await ui.saveExternalTools(page, 'external');
+      payload = await api.external();
+      presetView = (payload.presets ?? []).find((entry) => entry.id === 'external');
+      ping = presetView?.servers?.find((entry) => entry.name === 'foreign')?.tools?.find((tool) => tool.name === 'mcp__foreign__ping');
+      reporter.check(
+        're-enabling ping through 其他 MCP restores enabled:true',
+        ping?.enabled === true && (await ui.externalToolState(page, 'mcp__foreign__ping')).enabled === 'true',
+        redact(JSON.stringify(ping ?? null)),
+      );
+      const restoredMarker = `E2E-EXT-RESTORED-${RUN_ID}`;
+      await configureMarkers([{ match: restoredMarker, reply: { kind: 'text', text: `fixture-llm: ext-restored-${RUN_ID}` } }]);
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'external');
+      await ui.sendMessage(page, `${restoredMarker} 恢复后的外部请求`);
+      const restoredRequest = await waitFor(
+        async () => {
+          const state = await fixtures.state();
+          return requestsForMarker(state, restoredMarker)[0];
+        },
+        { timeoutMs: 120_000, intervalMs: 500, label: 'the model request after re-enabling ping' },
+      );
+      reporter.check(
+        'a fresh external-preset session advertises mcp__foreign__ping again',
+        (restoredRequest.tools ?? []).includes('mcp__foreign__ping') && (restoredRequest.tools ?? []).includes('mcp__foreign__add'),
+        (restoredRequest.tools ?? []).filter((name) => name.startsWith('mcp__foreign__')).join(', ') || '(none)',
+      );
+    });
+
+    await reporter.step('其他 MCP tab: approval for a preset-owned tool (restricted asks, 完全权限 skips)', async () => {
+      // Turn approval on for add through the per-preset tools settings.
+      await ui.openMcpPage(page);
+      await ui.openExternalTab(page);
+      await ui.setExternalToolSwitch(page, 'mcp__foreign__add', 'approval', true);
+      await ui.saveExternalTools(page, 'external');
+      let payload = await api.external();
+      let presetView = (payload.presets ?? []).find((entry) => entry.id === 'external');
+      let add = presetView?.servers?.find((entry) => entry.name === 'foreign')?.tools?.find((tool) => tool.name === 'mcp__foreign__add');
+      reporter.check(
+        'enabling approval for the foreign add tool persists approval:true',
+        add?.approval === true && add?.enabled === true,
+        redact(JSON.stringify(add ?? null)),
+      );
+
+      // Restricted session: the Host-wide pre-execute policy must ask.
+      const approvalMarker = `E2E-EXT-APPROVAL-${RUN_ID}`;
+      await configureMarkers([{ match: approvalMarker, reply: { kind: 'tool', toolName: 'mcp__foreign__add', arguments: { a: 2, b: 3 } } }]);
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'external');
+      const restrictedPermission = await ui.currentPermission(page);
+      reporter.check('the approval external-preset session is restricted (not 完全权限)', restrictedPermission !== '完全权限', restrictedPermission);
+      await ui.sendMessage(page, `${approvalMarker} 请调用需要审批的外部 add 工具`);
+      const prompt = await ui.waitApprovalPrompt(page, { timeoutMs: 120_000 });
+      reporter.check(
+        'restricted external-preset session shows the DSH approval composer with the external tool reason',
+        prompt.text.includes('等待审批') && prompt.text.includes('需要审批（当前不是完全权限）') && prompt.text.includes('mcp__foreign__add'),
+        redact(prompt.text.replaceAll('\n', ' ').slice(0, 320)),
+      );
+      const pendingState = await fixtures.state();
+      reporter.check(
+        'the preset-owned tool has not run while the approval is pending',
+        requestsForMarker(pendingState, approvalMarker).every((request) => (request.toolResultTexts ?? []).length === 0),
+        `requests: ${requestsForMarker(pendingState, approvalMarker).length}`,
+      );
+      await ui.answerApproval(page, 'allow');
+      const approved = await waitFor(
+        async () => {
+          const state = await fixtures.state();
+          return requestsForMarker(state, approvalMarker).find((request) =>
+            (request.toolResultTexts ?? []).some((text) => text.includes('external-add: 5')),
+          );
+        },
+        { timeoutMs: 120_000, intervalMs: 500, label: 'the model request containing the approved external-add result' },
+      );
+      reporter.check(
+        '允许一次 executes the preset-owned tool and returns external-add: 5 to the model',
+        approved.toolResultTexts.some((text) => text.includes('external-add: 5')),
+        approved.toolResultTexts.map((text) => text.slice(0, 60)).join(' | '),
+      );
+      await ui.waitForBodyText(page, `fixture-llm: tool-result-${RUN_ID}`);
+      reporter.check('the approval composer is gone after the decision', (await ui.approvalPromptCount(page)) === 0);
+
+      // 完全权限: the same tool runs without the approval composer.
+      const fullMarker = `E2E-EXT-FULL-${RUN_ID}`;
+      await configureMarkers([{ match: fullMarker, reply: { kind: 'tool', toolName: 'mcp__foreign__add', arguments: { a: 4, b: 6 } } }]);
+      await ui.startNewSession(page);
+      await ui.selectPreset(page, 'external');
+      await ui.switchPermission(page, '完全权限');
+      const fullPermission = await ui.currentPermission(page);
+      reporter.check('the second external-preset session runs with 完全权限', fullPermission === '完全权限', fullPermission);
+      await ui.sendMessage(page, `${fullMarker} 完全权限直接调用外部 add 工具`);
+      const direct = await waitFor(
+        async () => {
+          const state = await fixtures.state();
+          return requestsForMarker(state, fullMarker).find((request) =>
+            (request.toolResultTexts ?? []).some((text) => text.includes('external-add: 10')),
+          );
+        },
+        { timeoutMs: 120_000, intervalMs: 500, label: 'the model request containing the direct external-add result' },
+      );
+      reporter.check(
+        '完全权限 skips the approval composer and runs the preset-owned tool directly',
+        direct.toolResultTexts.some((text) => text.includes('external-add: 10')) && (await ui.approvalPromptCount(page)) === 0,
+        direct.toolResultTexts.map((text) => text.slice(0, 60)).join(' | '),
+      );
+      await ui.waitForBodyText(page, `fixture-llm: tool-result-${RUN_ID}`);
+
+      // Leave the external settings at their defaults.
+      await ui.openMcpPage(page);
+      await ui.openExternalTab(page);
+      await ui.setExternalToolSwitch(page, 'mcp__foreign__add', 'approval', false);
+      await ui.saveExternalTools(page, 'external');
+      payload = await api.external();
+      presetView = (payload.presets ?? []).find((entry) => entry.id === 'external');
+      add = presetView?.servers?.find((entry) => entry.name === 'foreign')?.tools?.find((tool) => tool.name === 'mcp__foreign__add');
+      reporter.check('approval can be turned back off through 其他 MCP', add?.approval === false && add?.enabled === true, redact(JSON.stringify(add ?? null)));
+
+      // Own-tab regression after the whole external round-trip.
+      await ui.openOwnedTab(page);
+      const ownedTabs = await ui.pageTabState(page);
+      reporter.check(
+        '本插件 MCP tab still renders the owned cards after the external round-trip',
+        ownedTabs.ownedPressed === 'true' && (await ui.card(page, stdioName).count()) === 1 && (await page.locator('[data-testid="add-mcp"]').count()) === 1,
+        JSON.stringify(ownedTabs),
+      );
+    });
+
     const icon404s = diagnostics.httpErrors.filter((entry) => entry.status === 404 && /\/better-mcp-manager\/api\/servers\/[^/]+\/icon/.test(entry.url));
     const unexpectedHttp = diagnostics.httpErrors.filter((entry) => !icon404s.includes(entry));
     const explainedConsole = diagnostics.consoleErrors.filter(
@@ -875,7 +1216,7 @@ async function main() {
 
 /**
  * Screenshot publishing and cleanup:
- *  - copy the three sanitized screenshots into docs/screenshots (< 400 KiB each);
+ *  - copy the sanitized screenshots into docs/screenshots (< 400 KiB each);
  *  - close the browser, stop both scopes, delete the run directory;
  *  - verify no scopes/processes/listeners/files remain;
  *  - verify production MainPID/cgroup are untouched.
@@ -901,7 +1242,7 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
   // Publish screenshots only from a fully successful UI pass (the caller has
   // already recorded failures; a missing artifact is a failure, not silence).
   await reporter.step('publish sanitized screenshots to docs/screenshots', async () => {
-    const wanted = ['mcp-manager-list.png', 'mcp-manager-sidebar.png', 'mcp-manager-error-detail.png', 'mcp-manager-form-presets.png', 'mcp-manager-form-icon.png', 'mcp-manager-form-tools.png'];
+    const wanted = ['mcp-manager-list.png', 'mcp-manager-sidebar.png', 'mcp-manager-error-detail.png', 'mcp-manager-form-presets.png', 'mcp-manager-form-icon.png', 'mcp-manager-form-tools.png', 'mcp-manager-external.png'];
     const published = [];
     for (const name of wanted) {
       const source = screenshotArtifacts.find((file) => basename(file) === name);
@@ -913,7 +1254,7 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
       await copyFile(source, target);
       published.push(`${name} (${formatBytes(size)})`);
     }
-    reporter.check('six sanitized screenshots published under docs/screenshots', published.length === 6, published.join(', '));
+    reporter.check('seven sanitized screenshots published under docs/screenshots', published.length === 7, published.join(', '));
   });
 
   if (clean) {

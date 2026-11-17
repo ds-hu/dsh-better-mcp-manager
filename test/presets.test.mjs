@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createExposure } from '../lib/presets.js';
+import { agentTools, composedPreset, createExposure } from '../lib/presets.js';
 
 /** One stored server record with the fields exposure reads. */
 function server(overrides = {}) {
@@ -419,4 +419,37 @@ test('presets: approvalRequired is passed into the registered tool definition', 
   await plain.registered[0].execute({}, exec);
   assert.equal(plain.approvalRequests.length, 0, 'a tool without the override does not ask');
   assert.equal(plain.callToolCalls.length, 1);
+});
+
+test('presets: ownToolNames reports exactly the names this plugin registered', () => {
+  const { exposure, agent } = harness({
+    connections: new Map([['srv_alpha', connection({ tools: [tool('echo'), tool('bild'), tool('trace')] })]]),
+  });
+  assert.deepEqual([...exposure.ownToolNames()].sort(), [], 'no agent means no registrations yet');
+  exposure.bindAgent(agent());
+  assert.deepEqual([...exposure.ownToolNames()].sort(), ['mcp__alpha__bild', 'mcp__alpha__echo', 'mcp__alpha__trace']);
+});
+
+test('presets: composedPreset and agentTools tolerate missing services and contexts', () => {
+  const valid = {
+    ctx: {
+      get(name) {
+        if (name === 'agentPresets') return { composedPreset: () => 'standard' };
+        if (name === 'tools') return { view: () => ({}) };
+        return undefined;
+      },
+    },
+  };
+  const hostCtx = {
+    get(name) {
+      if (name === 'agentPresets') return { composedPreset: (agentCtx) => (agentCtx === valid.ctx ? 'standard' : undefined) };
+      return undefined;
+    },
+  };
+  assert.equal(composedPreset(hostCtx, valid), 'standard');
+  assert.equal(composedPreset({ get: () => undefined }, valid), undefined, 'no service means no preset');
+  assert.equal(composedPreset(hostCtx, undefined), undefined, 'a missing agent is not an error');
+  assert.equal(typeof agentTools(valid)?.view, 'function', 'agentTools returns the live tools service');
+  assert.equal(agentTools({}), undefined);
+  assert.equal(agentTools({ ctx: { get() { throw new Error('gone'); } } }), undefined, 'a torn-down context degrades to undefined');
 });

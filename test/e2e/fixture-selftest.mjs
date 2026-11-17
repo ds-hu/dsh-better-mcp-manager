@@ -206,6 +206,40 @@ try {
   }
 }
 
+// ── preset-owned (其他 MCP) stdio fixture ─────────────────────────────────
+{
+  const externalClient = new Client(clientInfo, { capabilities: {} });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(fixtures, 'mcp-external-server.mjs')],
+    stderr: 'pipe',
+  });
+  await externalClient.connect(transport);
+  try {
+    const tools = await externalClient.listTools();
+    const byName = new Map(tools.tools.map((tool) => [tool.name, tool]));
+    check(
+      'external fixture tools/list returns ping+add with the expected descriptions',
+      byName.size === 2 && ['add', 'ping'].every((name) => byName.has(name)) && byName.get('ping')?.description.includes('echo the given text') && byName.get('add')?.description.includes('Add two numbers'),
+      tools.tools.map((tool) => tool.name).join(','),
+    );
+    check(
+      'external fixture declares ping(text required) and add(a,b optional) params',
+      JSON.stringify(byName.get('ping')?.inputSchema?.required ?? []) === JSON.stringify(['text']) &&
+        (byName.get('add')?.inputSchema?.required ?? []).length === 0 &&
+        Object.keys(byName.get('add')?.inputSchema?.properties ?? {}).sort().join(',') === 'a,b',
+      JSON.stringify({ pingRequired: byName.get('ping')?.inputSchema?.required, addProperties: Object.keys(byName.get('add')?.inputSchema?.properties ?? {}) }),
+    );
+    const ping = await externalClient.callTool({ name: 'ping', arguments: { text: 'external-self-test' } });
+    check('external fixture tools/call ping echoes the text', ping.content?.[0]?.text === 'external-ping: external-self-test', String(ping.content?.[0]?.text));
+    const add = await externalClient.callTool({ name: 'add', arguments: { a: 2, b: 3 } });
+    check('external fixture tools/call add sums the operands', add.content?.[0]?.text === 'external-add: 5', String(add.content?.[0]?.text));
+    check('external fixture initializes as serverName foreign', externalClient.getServerVersion()?.name === 'foreign', JSON.stringify(externalClient.getServerVersion() ?? null));
+  } finally {
+    await externalClient.close();
+  }
+}
+
 // ── connection failure surface ────────────────────────────────────────────
 {
   const failedClient = new Client(clientInfo, { capabilities: {} });

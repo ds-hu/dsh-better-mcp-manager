@@ -136,34 +136,71 @@ the calling session's permission preset through `permissionPresets.current(agent
 The DSH UI presents that request as the **等待审批** composer with **拒绝 / 允许一次** and the reason
 `MCP 工具 "mcp__<key>__<tool>" 需要审批（当前不是完全权限）`.
 
+### Preset-owned ("external") MCP
+
+An MCP server this plugin does **not** own: another agent preset or plugin mounts it through its own
+`@deepseek-ai/dsh-mcp-client` rows. The plugin never edits that YAML, never starts/stops those
+connections, never reads their credentials, and never adds, edits, deletes or tests them. It manages
+only what a Host plugin can reach at runtime:
+
+- **discovery** — the public tool registry only shows another scope's inherited names to a live
+  Agent, so external tools are discovered from `tools.view(agent)` of live Agents; the owning preset
+  comes from `agentPresets.composedPreset(agent.ctx)` and the server namespace from the
+  `mcp__<serverName>__` prefix. A preset whose composition mounts `dsh-mcp-client`
+  (`agentPresets.inspectCompositions()`) but has no live session is shown with `hasPresetMcp: true`
+  and no servers yet;
+- **disable** — a disabled tool is removed from that Agent's model-facing tool set with
+  `agent.ctx.tools.restrict({ deny })`, not merely rejected at call time;
+- **approval** — a Host-wide `tools/pre-execute` policy returns `{ kind: "ask", reason }` for an
+  external tool with `approval: true`; the shared DSH pipeline runs the approval service and only
+  dispatches after `allowed-once`.
+
+"External" is always relative to this plugin's own registrations: a name is external only when it is
+in the Agent's inherited, restrictable `mcp__` names and **not** in `exposure.ownToolNames()`. The
+plugin's own tools use the §2.7 approval gate and are never double-gated.
+
+### External tool settings
+
+Per `(presetId, public tool name)` in `external.json`: only deviations from "enabled, no approval"
+are stored (`{ enabled: false }` and/or `{ approval: true }`). The **其他 MCP** tab edits them per
+preset and saves with `PUT /external/tools`; the payload also carries the last discovered descriptors
+per server. Like owned tool settings, they are runtime state, not preset configuration: nothing is
+written back to the preset.
+
 ### OAuth settings
 
 Per-server authentication beyond custom headers: `none`, `bearer` (a static token, sent as an
 `Authorization: Bearer` header unless a custom `Authorization` header already exists — custom
 headers win), or `client_credentials` (fetch a token from `tokenUrl` with `clientId`,
 `clientSecret`, `scope`, cache it until `expires_in - 60s`, retry once on a 401). There is no
-authorization-code flow in 0.3.0. Secrets are stored in the data file, never written to logs.
+authorization-code flow in 0.4.0. Secrets are stored in the data file, never written to logs.
 
 ### Store and data directory
 
-One JSON document plus uploaded icon files in one directory:
+Two JSON documents plus uploaded icon files in one directory:
 
 ```
 $DSH_HOME/better-mcp-manager/     mode 0700
 ├── servers.json                  mode 0600, atomic replace
 │   { "version": 3, "servers": [ ... ] }
+├── external.json                 mode 0600, atomic replace
+│   { "version": 1, "presets": { "<presetId>": { updatedAt, overrides, servers } } }
 └── icons/                        mode 0700, created on the first upload
     └── <server id>.<ext>         mode 0600, exactly one file per server
 ```
 
-The directory is created when the plugin mounts; `servers.json` appears on the first save and
-`icons/` on the first upload. It is **per DSH home, not per profile**: profiles under the same
-`$DSH_HOME` share one list. `DSH_MCP_MANAGER_DATA_DIR` overrides the location (test/scratch use; the
-CLI resolves it the same way). The store is the only source of truth for servers; live status is
-derived and recomputed. A schema-version-1 or -2 file is migrated **in memory** on load (legacy
-emoji-string icons become `{ kind: "auto" }`; missing tool settings become `{}` / `null`) and is
-rewritten as version 3 by the next save, never by a read. The **clean** CLI is what deletes this
-directory, including `icons/`.
+The directory is created when the plugin mounts; `servers.json` appears on the first owned-server
+save, `external.json` on the first 其他 MCP save, and `icons/` on the first upload. It is
+**per DSH home, not per profile**: profiles under the same `$DSH_HOME` share one list.
+`DSH_MCP_MANAGER_DATA_DIR` overrides the location (test/scratch use; the CLI resolves it the same
+way). The store is the only source of truth for owned servers; live status is derived and recomputed.
+A schema-version-1 or -2 `servers.json` is migrated **in memory** on load (legacy emoji-string icons
+become `{ kind: "auto" }`; missing tool settings become `{}` / `null`) and is rewritten as version 3
+by the next save, never by a read. `external.json` has schema version 1 and is normalized on load:
+only valid `mcp__` names, valid preset ids, ≤100 presets, ≤200 servers per preset, ≤300 tools per
+server, ≤2000 override entries per preset, description ≤2000 chars and ≤64 params; a corrupt or
+unknown-version file is quarantined and the state starts empty. The **clean** CLI deletes the whole
+directory, including `external.json` and `icons/`.
 
 ## Invariants
 
@@ -200,22 +237,38 @@ directory, including `icons/`.
 13. **Uninstall is two steps and leaves nothing else**: remove the bundle (the code, the row, the
     route, the client) and run `clean` for the one directory, which includes `icons/`. Mounting
     without configuring writes no file (the directory itself is created on mount).
+14. **External names never include this plugin's own tools.** Ownership is decided by
+    `exposure.ownToolNames()` plus the Agent's restrictable `mcp__` names; a name registered by this
+    plugin is never treated as preset-owned, never restricted by the external controller, and never
+    double-gated.
+15. **Disabling an external tool is a restriction, not a call-time filter.** It must be removed from
+    the Agent's model-facing tool list with `agent.ctx.tools.restrict({ deny })`, recomputed when an
+    Agent is created, when its preset is selected, and when the tool registry changes; only Agents of
+    the owning preset are affected.
+16. **External approval asks outside `danger-full-access` only and never dispatches first.** The
+    `tools/pre-execute` policy returns an ask; the shared pipeline must grant `allowed-once` before
+    the call reaches the MCP server. Rejected/cancelled/unavailable or a missing approval channel
+    denies, and this plugin's own tools keep their own gate.
+17. **`external.json` holds descriptors and deviations only, never credentials.** It stores the last
+    discovered tool descriptors plus `enabled:false`/`approval:true` overrides; losing it resets
+    choices to defaults, and discovery cannot happen without a live Agent of that preset.
 
 ## File map
 
 | Path | Role |
 |---|---|
-| `lib/index.js` | Host plugin entry: `apply(ctx)` / dispose, wires store, manager, binder, API, tool-cache persistence |
+| `lib/index.js` | Host plugin entry: `apply(ctx)` / dispose, wires store, manager, binder, API, external controller, tool-cache persistence |
 | `lib/store.js` | data directory resolution, load/save, atomic replace, mode `0600`, serialized `patch`, schema v1/v2→v3 migration |
 | `lib/model.js` | validation and normalisation of drafts, key allocation, preset predicate, icon normalisation, per-tool overrides and cache |
 | `lib/icons.js` | uploaded icons: data-URL decoding, raster magic checks, `icons/` storage (0600), deletion |
 | `lib/mcp.js` | one MCP client per server: transports, OAuth, connect/list/call, backoff, status counts, auto-icon fetch/cache |
-| `lib/presets.js` | `agent/created` binding, live-agent re-exposure, per-tool enable filtering, `systemPrompt.section` instructions |
+| `lib/external.js` | preset-owned MCP controller: live discovery, `external.json`, restrictions, approval pre-execute, scan/save API |
+| `lib/presets.js` | `agent/created` binding, live-agent re-exposure, per-tool enable filtering, `systemPrompt.section` instructions, `ownToolNames()`, `composedPreset`/`agentTools` helpers |
 | `lib/tool-definition.js` | hand-built `ToolDefinition` for a discovered MCP tool, approval flag included |
 | `lib/result-projection.js` | MCP result → ordered text/image/diagnostic tool result; restricted-mode approval seam |
-| `lib/api.js` | HTTP router for `/better-mcp-manager/api/*`, including icon and tool endpoints |
+| `lib/api.js` | HTTP router for `/better-mcp-manager/api/*`, including icon, tool and external endpoints |
 | `lib/http.js` | same-origin JSON guard, 64 KiB body cap (1 MiB for icon uploads), JSON responses |
-| `lib/client.js` | browser half: `sidebar.panellist` entry, `main` page, polling, two form tabs, styles, locale dictionaries |
+| `lib/client.js` | browser half: `sidebar.panellist` entry, `main` page, 本插件 MCP / 其他 MCP tabs, polling, two form tabs, styles, locale dictionaries |
 | `bin/mcp-manager.mjs` | maintenance CLI: `status` (default), `path`, `clean [--yes]` |
 | `locale/en.json`, `locale/zh.json` | plugin-page metadata (title/description); the page's UI copy lives in `lib/client.js` |
 | `icon.svg` | sidebar artwork and plugin-page icon |
@@ -238,11 +291,17 @@ The plugin is a guest in the Host and uses only public context capabilities:
   order 10 and Plugins is order 0, which is what puts MCP 管理 directly below 自动化任务.
 - **HTTP** — one `ctx.webServer` route with `kind: 'prefix'` at `/better-mcp-manager/api`, plus the
   Host's own web auth.
-- **Agent events** — `agent/created`, `agent/disposed`, `agent-preset/selected`.
-- **Agent-preset service** — `ctx.agentPresets.list()` for the roster and
-  `composedPreset(agent.ctx)` for the id an agent runs.
+- **Agent events** — `agent/created`, `agent/disposed`, `agent-preset/selected`, `tools/change`,
+  and the Host-wide `tools/pre-execute` policy used for external approval.
+- **Agent-preset service** — `ctx.agentPresets.list()` for the roster,
+  `composedPreset(agent.ctx)` for the id an agent runs, and
+  `inspectCompositions()` to detect presets whose composition mounts
+  `@deepseek-ai/dsh-mcp-client`.
 - **Per-agent registries** — `agent.ctx` tools and `systemPrompt.section` registrations; their
   lifetime is the agent's lifetime.
+- **Agent registry views** — `agents.list()` plus `agent.ctx.tools.view(agent)` for the inherited
+  `visible`/`restrictableNames` sets, and `agent.ctx.tools.restrict({ deny })` to remove a
+  preset-owned tool from that Agent's model-facing list.
 - **Approval and permission presets** — only for tools marked **需要审批**:
   `permissionPresets.current(agent.session)` decides whether the session is full access, and
   `approval.request(...)` asks once in every other mode. Both are looked up lazily; a profile
@@ -290,6 +349,23 @@ The plugin is a guest in the Host and uses only public context capabilities:
 - **Tool settings are not save-draft fields.** `toolOverrides` and `toolCache` are dropped from
   drafts; only `PUT /servers/:id/tools` changes them. Treating them as ordinary form fields would
   let a stale form silently re-enable a disabled tool.
+- **Preset-owned MCP servers are not this plugin's to edit.** The **其他 MCP** tab may hide or gate
+  their tools, but nothing may rewrite the preset's YAML, start/stop the connection or read its
+  credentials. There is no add/edit/delete/test/reconnect path for them, and there must never be one.
+- **External discovery is live-agent-bound.** Descriptors exist only while some Agent of the owning
+  preset is alive; `external.json` is a cache of the last view, not a discovery source. A placeholder
+  (`hasPresetMcp`, no servers) is the correct state before the first session, not an error.
+- **External disable uses `restrict`, not a call-time check.** `agent.ctx.tools.restrict({ deny })`
+  removes the tool from the model-facing list and must be recomputed on agent creation, preset
+  selection and tool-registry changes, only for Agents of the owning preset.
+- **External approval asks through the Host, and the policy may refuse.** The `tools/pre-execute`
+  result is an ask; the shared pipeline decides whether it can be shown. A `never` approval policy
+  denies the call instead of displaying a prompt — document and report that, never bypass it, and
+  never dispatch to the MCP server before an `allowed-once`.
+- **Only non-own `mcp__` names are external.** Ownership is `exposure.ownToolNames()` plus the
+  Agent's restrictable set; never treat this plugin's own tools as preset-owned or double-gate them.
+- **`external.json` is descriptors and deviations, never credentials.** It is safe to delete (the
+  choices reset); it must never grow a token, header or password field.
 - **MCP instructions are per server, one system-prompt section each** (`mcp-manager:<key>`), added
   only to agents to which the server is exposed. A server that returns none adds no section, and a
   connected server with zero discovered tools contributes no prompt text at all.

@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createApi } from '../lib/api.js';
-import { MAX_ICON_BYTES } from '../lib/model.js';
+import { InputError, MAX_ICON_BYTES } from '../lib/model.js';
 import { createStore } from '../lib/store.js';
 import { PLUGIN_VERSION } from '../lib/version.js';
 
@@ -61,7 +61,7 @@ function makeResponse() {
 }
 
 /** One disposable API harness. */
-async function harness(t, { roster, bare = false, connection, autoIcon } = {}) {
+async function harness(t, { roster, bare = false, connection, autoIcon, external } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-api-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const clock = { value: Date.parse('2026-11-16T10:00:00Z') };
@@ -138,6 +138,7 @@ async function harness(t, { roster, bare = false, connection, autoIcon } = {}) {
     store,
     manager,
     exposure,
+    external,
     hostCtx,
     version: PLUGIN_VERSION,
     dataDir: dir,
@@ -1011,4 +1012,74 @@ test('api: server views report enabledToolCount from the live status', async (t)
   const list = await call({ path: '/servers' });
   assert.equal(list.body.servers[0].status.toolCount, 2);
   assert.equal(list.body.servers[0].status.enabledToolCount, 1);
+});
+
+/* ---------------------------------------------------------------- */
+/* 0.4.0 preset-owned ("external") MCP routes                        */
+/* ---------------------------------------------------------------- */
+
+test('api: external MCP routes answer 500 when the controller is not mounted', async (t) => {
+  const { call } = await harness(t);
+  assertError(await call({ path: '/external' }), 500, 'unavailable');
+  assertError(await call({ method: 'POST', path: '/external/scan' }), 500, 'unavailable');
+  assertError(await call({
+    method: 'PUT',
+    path: '/external/tools',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ presetId: 'standard', tools: [] }),
+  }), 500, 'unavailable');
+});
+
+test('api: GET/POST external endpoints scan and PUT saves one preset', async (t) => {
+  const scans = [];
+  const saves = [];
+  const payload = {
+    scannedAt: '2026-11-17T09:00:00.000Z',
+    presets: [{ id: 'standard', name: 'Standard', hasPresetMcp: true, servers: [] }],
+  };
+  const external = {
+    async scan() {
+      scans.push(Date.now());
+      return payload;
+    },
+    async saveTools(presetId, tools) {
+      saves.push({ presetId, tools });
+      if (presetId === 'bad') throw new InputError('invalid-preset', 'presetId is invalid', 'presetId');
+      if (!Array.isArray(tools)) throw new InputError('invalid-tools', 'tools must be an array', 'tools');
+      return payload;
+    },
+  };
+  const { call } = await harness(t, { external });
+
+  const get = await call({ path: '/external' });
+  assert.equal(get.status, 200);
+  assert.deepEqual(get.body, { ok: true, ...payload }, 'GET returns the scan payload');
+  assert.equal(scans.length, 1, 'GET refreshes discovery first');
+
+  const scan = await call({ method: 'POST', path: '/external/scan' });
+  assert.equal(scan.status, 200);
+  assert.deepEqual(scan.body, { ok: true, ...payload });
+  assert.equal(scans.length, 2);
+  assertError(await call({ method: 'POST', path: '/external/scan', headers: { origin: 'https://evil.example' } }), 403, 'cross-origin');
+
+  const body = { presetId: 'standard', tools: [{ name: 'mcp__pan__echo', enabled: false, approval: true }] };
+  const saved = await call({ method: 'PUT', path: '/external/tools', headers: JSON_HEADERS, body: JSON.stringify(body) });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body, { ok: true, ...payload });
+  assert.deepEqual(saves.at(-1), body, 'the controller receives the preset and the full tool list');
+
+  assertError(await call({ method: 'PUT', path: '/external/tools', headers: JSON_HEADERS, body: JSON.stringify({ presetId: 'bad', tools: [] }) }), 400, 'invalid-preset');
+  const invalid = await call({ method: 'PUT', path: '/external/tools', headers: JSON_HEADERS, body: JSON.stringify({ presetId: 'standard', tools: null }) });
+  assertError(invalid, 400, 'invalid-tools');
+  assert.equal(invalid.body.field, 'tools');
+  assertError(await call({ method: 'PUT', path: '/external/tools', headers: JSON_HEADERS, body: '[]' }), 400, 'invalid-body');
+  assertError(await call({ method: 'PUT', path: '/external/tools', headers: JSON_HEADERS, body: '{ nope' }), 400, 'invalid-json');
+  assertError(await call({ method: 'PUT', path: '/external/tools', body: JSON.stringify(body) }), 415, 'unsupported-media-type');
+  for (const request of [
+    { method: 'DELETE', path: '/external' },
+    { method: 'GET', path: '/external/tools' },
+    { method: 'PUT', path: '/external/scan', headers: JSON_HEADERS, body: JSON.stringify(body) },
+  ]) {
+    assertError(await call(request), 404, 'not-found');
+  }
 });

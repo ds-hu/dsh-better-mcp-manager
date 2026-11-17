@@ -29,6 +29,10 @@ applies to live agents as soon as you save. The same page also manages **individ
 one tool from every agent while keeping the rest, and make a tool ask for your approval before it
 runs outside full-access sessions.
 
+MCP servers that **another preset or plugin mounts for itself** are not left out: a second tab,
+**其他 MCP**, lists their inherited tools and lets you hide or gate those too, without this plugin
+ever taking over their connection or credentials.
+
 ## Features
 
 - **Full-page manager** in the sidebar, directly below 自动化任务. Rounded cards, iOS-like toggles
@@ -49,6 +53,9 @@ runs outside full-access sessions.
   description and parameters; enable or disable it, and turn on **需要审批** to ask before every
   call outside 完全权限 sessions. The card shows enabled/discovered counts, and the tab still shows
   the last known list while the server is offline.
+- **Other MCP**: a **其他 MCP** page tab manages preset-owned MCP tools mounted by other presets or
+  plugins — per-tool enable and **需要审批**, grouped by preset, with a rescan and an honest caveat
+  that the connection itself is not editable here.
 - **Test connection** on an unsaved draft before saving it.
 - **Per-server tool timeout**, default 60 seconds.
 
@@ -146,6 +153,14 @@ The two numbers are **enabled / discovered** tools. If a server fails, the card 
 lines of the error; **详情** opens the full message and transport detail. **重新连接** starts a fresh
 attempt immediately; **测试连接** probes the saved server again.
 
+### 6. Manage preset-owned MCP tools
+
+If another agent preset or plugin mounts its own MCP servers through
+`@deepseek-ai/dsh-mcp-client`, switch to the **其他 MCP** tab. It groups what it finds by preset,
+marks each group **预设自带**, and lets you enable/disable every inherited tool and mark it
+**需要审批**. There is no add/edit/delete/test here — that connection belongs to the preset. See
+[Other MCP](#other-mcp).
+
 ## Icons
 
 A server's icon is never artwork bundled with this plugin: there is no emoji palette and no built-in
@@ -194,17 +209,51 @@ survive reconnects and restarts.
   <img src="docs/screenshots/mcp-manager-form-tools.png" alt="The 工具 tab: 工具列表 with 已启用 2/2, 全部开启/全部关闭, per-tool switches and 需要审批, parameter chips and 保存工具设置" width="820">
 </p>
 
+## Other MCP
+
+Some MCP servers are not added on this page: an agent preset or another plugin can mount its own
+`@deepseek-ai/dsh-mcp-client` rows. Those servers stay owned by that preset. This manager never
+edits that YAML, never connects or disconnects those servers, and never reads their credentials —
+but it can do the two things a Host plugin may safely do at runtime: **remove an inherited tool from
+the model's tool list** and **make a call ask for approval** outside full-access sessions.
+
+The page has two tabs: **本插件 MCP** (everything described above) and **其他 MCP**:
+
+- **Grouped by preset, marked 预设自带.** Each preset that mounts MCP servers gets a group with its
+  name, id, the **预设自带** badge and its MCP servers, each with the tools that server reported
+  (description and parameter chips included).
+- **Per-tool switches.** **启用** and **需要审批** work like the owned tools tab: disabling removes
+  the tool from the agent's model-facing tool list (not merely a call-time rejection), and approval
+  asks only outside **完全权限**. A per-preset **保存工具设置** persists the choices; the footer
+  explains **停用后该工具会从 Agent 的工具列表中消失；需要审批只在非完全权限下生效**.
+- **Discovery is live.** The tab scans the tools visible to live agents, so a preset's tools appear
+  after at least one session using that preset has run. A preset that mounts an MCP client but has
+  no live session yet gets a placeholder: **打开一次使用该预设的会话后自动同步，也可以点「重新扫描」**.
+  **重新扫描** re-runs discovery; the last scan time is shown as **上次扫描：…**.
+- **The connection is out of scope.** There is no add, edit, delete, test or reconnect for these
+  servers; change the preset/plugin that owns them for that.
+- **Persistence.** The choices and the last discovered descriptors live in
+  `$DSH_HOME/better-mcp-manager/external.json` (mode `0600`), never credentials. Deleting that file
+  (or running `clean --yes`) returns everything to the defaults: enabled, no approval.
+- **Approval follows your DSH policy.** The request is passed to the Host's approval pipeline. If
+  your OAuth/approval policy is set to `never`, an ask is denied rather than displayed — this plugin
+  cannot override the policy, only ask for it.
+
+<p align="center">
+  <img src="docs/screenshots/mcp-manager-external.png" alt="The 其他 MCP tab: 本插件 MCP / 其他 MCP tabs, intro copy, 上次扫描 and 重新扫描, a 外部MCP测试 preset with the 预设自带 badge and a foreign server, and add/ping tool cards with 启用 and 需要审批 switches and 保存工具设置" width="820">
+</p>
+
 ## Data and security
 
-- All plugin state is one JSON file, `$DSH_HOME/better-mcp-manager/servers.json` (mode `0600`, inside
-  a mode `0700` directory), plus uploaded icons in that directory's `icons/` subdirectory (`0700`,
-  each file `0600`). Nothing is written to the profile, to preset YAML or to the sessions directory.
-  Mounting the plugin creates the data directory; the JSON file appears when you save the first
-  server. Server-declared HTTP icons are fetched by the Host and cached in memory only — they are
-  never written to disk. Per-tool enable/approval choices and the cached tool descriptors (name,
-  public name, description, parameter names, timestamps) are stored in the same JSON file; the cache
-  never contains headers, tokens or other credentials.
-- **Secrets are stored in that file in plaintext**: custom header values, a bearer token and a
+- All plugin state is two JSON files inside `$DSH_HOME/better-mcp-manager/` (mode `0700`):
+  `servers.json` for the servers this plugin owns and `external.json` for preset-owned MCP tool
+  settings and descriptors, plus uploaded icons in `icons/` (each file `0600`). Nothing is written
+  to the profile, to preset YAML or to the sessions directory. Mounting the plugin creates the data
+  directory; `servers.json` appears when you save the first server, `external.json` on the first save on the 其他 MCP tab. Server-declared HTTP icons are fetched by the Host and cached in memory only
+  — they are never written to disk. Per-tool enable/approval choices and the cached tool descriptors
+  (name, public name, description, parameter names, timestamps) are stored in those JSON files; the
+  caches never contain headers, tokens or other credentials.
+- **Secrets are stored in `servers.json` in plaintext**: custom header values, a bearer token and a
   `client_credentials` secret. Protect the machine and the file; do not commit it, paste it into an
   issue, or copy it to a shared host.
 - The HTTP API is served by the Host's own web server under `/better-mcp-manager/api` and is
@@ -223,8 +272,8 @@ and the icons, or delete it with the clean CLI (below) to remove every trace.
 
 ## Uninstall
 
-Remove the bundle, then delete the one data directory (server list, per-tool settings and uploaded
-icons):
+Remove the bundle, then delete the one data directory (server list, per-tool settings, preset-owned
+MCP settings and uploaded icons):
 
 ```bash
 # 1. remove the bundle — CLI, Plugins page (Remove), or plugin_manager remove_bundle
@@ -249,7 +298,7 @@ prints the data directory. Both only read.
 
 ## Compatibility and limitations
 
-- **Tools and server instructions only.** 0.3.0 does not expose MCP resources, resource templates,
+- **Tools and server instructions only.** 0.4.0 does not expose MCP resources, resource templates,
   prompt templates or sampling. A server that offers only resources has nothing to show here.
 - **One connection per enabled server**, shared by every agent the server is exposed to. Tools are
   registered per agent preset and per tool: only the enabled tools of an allowed server reach an
@@ -261,10 +310,21 @@ prints the data directory. Both only read.
   **需要审批** tool runs without asking; every other preset asks. If the Host exposes no approval
   service (or the call has no agent), an approval-required tool is denied rather than allowed.
 - **OAuth settings are bearer or client-credentials only.** There is no authorization-code/PKCE
-  flow, so a server that requires an interactive browser login cannot be connected in 0.3.0.
+  flow, so a server that requires an interactive browser login cannot be connected in 0.4.0.
 - **No YAML import or migration.** MCP servers configured through the built-in
-  `@deepseek-ai/dsh-mcp-client` rows keep working untouched; this page does not show them, and
-  deleting a row here never touches them.
+  `@deepseek-ai/dsh-mcp-client` rows keep working untouched. The **其他 MCP** tab can hide or gate
+  their tools, but it never imports, edits or owns those rows; deleting anything on this page never
+  touches them.
+- **其他 MCP is runtime-only.** It manages tools that are already registered by a live preset; it
+  cannot create, edit, test or reconnect those servers, and it never reads their credentials.
+- **其他 MCP discovery needs a live session of that preset.** Descriptors come from live agents, so a
+  preset that mounts an MCP client but has no session yet shows a placeholder until one runs (or
+  until a rescan sees one).
+- **Approval depends on the Host's approval policy.** An ask is passed to the Host; if the policy is
+  `never` (a DSH-level setting this plugin does not control), the ask is denied instead of shown.
+- **其他 MCP state is in a second file.** `external.json` stores only descriptors and deviations
+  (`enabled:false` / `approval:true`); it never stores credentials, and `clean --yes` removes it
+  with the rest of the data directory.
 - **HTTP/SSE servers must be reachable from the DSH Host**, not from the browser. `localhost` in
   the URL means the host's localhost.
 - **No built-in icons.** An icon is either declared by the MCP server or uploaded by you; there is
@@ -297,13 +357,17 @@ prints the data directory. Both only read.
 | Save answers `403` | A reverse proxy that rewrites the `Host` header breaks the same-origin check. Preserve the original `Host` for the DSH web port. |
 | **保存工具设置** fails | The server record was deleted in another window, or the Host restarted. Reload the page and reopen the tab; the previous settings are untouched. |
 | The **工具** tab shows an old tool list | The server is disconnected and the tab is showing **更新于 …** from the last discovery. Reconnect the server (or reopen the tab on a connected one) to refresh. |
+| **其他 MCP** is empty | No preset mounts `@deepseek-ai/dsh-mcp-client`, or none of their tools have been discovered yet. Open a session using that preset, then press **重新扫描**. |
+| **其他 MCP** shows a preset but no tools | The preset mounts an MCP client but no live session of it exists yet. Open one session with that preset; the placeholder explains this. |
+| A toggle in **其他 MCP** does nothing | Press that preset's **保存工具设置** — switches are local until saved (the save button enables only when something changed). |
+| A **需要审批** external tool is denied without a prompt | Your DSH approval policy may be `never`, which denies asks rather than displaying them. Change the policy in DSH or run in a restricted preset that can ask. |
 | The page shows an empty list with no error | The Host half is not running: check that the bundle is enabled and `GET /better-mcp-manager/api/health` answers. |
 
 ## Documentation
 
 | Document | What is in it |
 |---|---|
-| [docs/TECHNICAL.md](docs/TECHNICAL.md) | Architecture, icon model, tool management, approval seam, data model, HTTP API, security, lifecycle, uninstall, testing |
+| [docs/TECHNICAL.md](docs/TECHNICAL.md) | Architecture, icon model, tool management, preset-owned MCP, approval seams, data model, HTTP API, security, lifecycle, uninstall, testing |
 | [CONTEXT.md](CONTEXT.md) | The vocabulary and invariants this plugin is built on |
 | [docs/adr](docs/adr) | Why the design is what it is |
 | [docs/API-CONTRACT.md](docs/API-CONTRACT.md) | The frozen Host/Client/data contract |

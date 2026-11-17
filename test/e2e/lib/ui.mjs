@@ -14,12 +14,13 @@ import { sleep, waitFor } from './util.mjs';
 
 const SIDEBAR_AUTOMATION = '自动化任务';
 const SIDEBAR_MCP = /MCP\s*管理/;
-const MODE_BUTTON = /标准模式|极简模式|PTC 模式|创造模式/;
+const MODE_BUTTON = /标准模式|极简模式|PTC 模式|创造模式|外部MCP测试/;
 const PRESET_LABELS = {
   standard: '标准模式',
   minimal: '极简模式',
   ptc: 'PTC 模式',
   cordis: '创造模式',
+  external: '外部MCP测试',
 };
 
 export const PRESET_IDS = Object.keys(PRESET_LABELS);
@@ -733,4 +734,134 @@ export async function answerApproval(page, outcome, { timeoutMs = 15_000 } = {})
 /** How many pending approval composers are on screen right now. */
 export async function approvalPromptCount(page) {
   return page.locator('[data-approval-key]').count();
+}
+
+// ── management page: 其他 MCP tab (0.4.0) ────────────────────────────────────
+
+/** Read the page-level tab pressed states. */
+export async function pageTabState(page) {
+  const owned = page.locator('[data-testid="page-tab-owned"]');
+  const external = page.locator('[data-testid="page-tab-external"]');
+  await owned.waitFor({ state: 'visible', timeout: 20_000 });
+  await external.waitFor({ state: 'visible', timeout: 20_000 });
+  return {
+    ownedPressed: await owned.getAttribute('aria-pressed'),
+    externalPressed: await external.getAttribute('aria-pressed'),
+  };
+}
+
+/** Open 其他 MCP and wait until its initial GET /external load settles. */
+export async function openExternalTab(page) {
+  await page.locator('[data-testid="page-tab-external"]').click();
+  await page.locator('[data-testid="external-panel"]').waitFor({ state: 'visible', timeout: 20_000 });
+  await waitFor(
+    async () => {
+      if ((await page.locator('[data-testid="external-loading"]').count()) > 0) return undefined;
+      return true;
+    },
+    { timeoutMs: 30_000, intervalMs: 150, label: '其他 MCP tab to finish loading' },
+  );
+  return page.locator('[data-testid="external-panel"]');
+}
+
+/** Switch back to 本插件 MCP and wait for the owned list. */
+export async function openOwnedTab(page) {
+  await page.locator('[data-testid="page-tab-owned"]').click();
+  await page.locator('[data-testid="mcp-list"]').waitFor({ state: 'visible', timeout: 15_000 });
+  return page.locator('[data-testid="mcp-list"]');
+}
+
+/** One preset group in 其他 MCP. */
+export function externalPresetGroup(page, presetId) {
+  return page.locator(`[data-testid="external-preset"][data-preset-id="${presetId}"]`).first();
+}
+
+/** Group ids + text currently rendered in 其他 MCP. */
+export async function externalGroups(page) {
+  return page
+    .locator('[data-testid="external-preset"]')
+    .evaluateAll((groups) => groups.map((group) => ({ id: group.getAttribute('data-preset-id'), text: group.innerText })));
+}
+
+/** One external tool card by its public (model-facing) name. */
+export function externalToolCard(page, publicName) {
+  const escaped = publicName.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  const nameNode = page.locator('[data-testid="external-tool-name"]').filter({ hasText: new RegExp(`^${escaped}$`, 'u') });
+  return page.locator('[data-testid="external-tool-card"]').filter({ has: nameNode }).first();
+}
+
+/** Read one external tool card's switches, params, description and copy. */
+export async function externalToolState(page, publicName) {
+  const card = externalToolCard(page, publicName);
+  await card.waitFor({ state: 'visible', timeout: 15_000 });
+  const enabled = card.locator('[data-testid="external-tool-enabled"]');
+  const approval = card.locator('[data-testid="external-tool-approval"]');
+  const params = await card
+    .locator('[data-testid="external-tool-param"]')
+    .evaluateAll((elements) => elements.map((element) => ({ text: element.textContent ?? '', required: element.getAttribute('data-required') })));
+  return {
+    name: publicName,
+    enabled: await enabled.getAttribute('aria-checked'),
+    approval: await approval.getAttribute('aria-checked'),
+    approvalDisabled: await approval.isDisabled(),
+    description: (await card.locator('[data-testid="external-tool-desc"]').innerText().catch(() => '')) ?? '',
+    params,
+    text: await card.innerText(),
+  };
+}
+
+/** Flip one external tool switch and wait for its aria-checked state. */
+export async function setExternalToolSwitch(page, publicName, switchKind, on) {
+  const testId = switchKind === 'approval' ? 'external-tool-approval' : 'external-tool-enabled';
+  const control = externalToolCard(page, publicName).locator(`[data-testid="${testId}"]`);
+  await control.waitFor({ state: 'visible', timeout: 10_000 });
+  if ((await control.getAttribute('aria-checked')) !== (on ? 'true' : 'false')) await control.click();
+  await waitFor(async () => ((await control.getAttribute('aria-checked')) === (on ? 'true' : 'false') ? true : undefined), {
+    timeoutMs: 10_000,
+    intervalMs: 100,
+    label: `external tool ${publicName} ${switchKind} to become ${on}`,
+  });
+}
+
+/** Click a preset group's 保存工具设置 and wait for its saved/error notice. */
+export async function saveExternalTools(page, presetId) {
+  const group = externalPresetGroup(page, presetId);
+  await group.locator('[data-testid="external-save"]').click();
+  return waitFor(
+    async () => {
+      const text = await group.innerText().catch(() => '');
+      if (text.includes('工具设置已保存')) return text;
+      if (text.includes('保存失败')) throw new Error(text.slice(0, 400));
+      return undefined;
+    },
+    { timeoutMs: 30_000, intervalMs: 200, label: `external tools for ${presetId} to save` },
+  );
+}
+
+/** Press 重新扫描 and wait until the scan settles. */
+export async function scanExternal(page) {
+  const button = page.locator('[data-testid="external-scan"]');
+  await button.waitFor({ state: 'visible', timeout: 10_000 });
+  await button.click();
+  await waitFor(
+    async () => {
+      const text = (await button.innerText().catch(() => '')).trim();
+      return text === '重新扫描' && !(await button.isDisabled()) ? true : undefined;
+    },
+    { timeoutMs: 60_000, intervalMs: 250, label: 'external scan to finish' },
+  );
+  await waitFor(
+    async () => {
+      if ((await page.locator('[data-testid="external-loading"]').count()) > 0) return undefined;
+      return true;
+    },
+    { timeoutMs: 30_000, intervalMs: 150, label: '其他 MCP tab to settle after scan' },
+  );
+}
+
+/** Screenshot the page surface (owned/other tabs + the 其他 MCP content). */
+export async function screenshotExternalTab(page, path) {
+  const pageSurface = page.locator('.mm-page').first();
+  await pageSurface.waitFor({ state: 'visible', timeout: 10_000 });
+  return screenshotElement(pageSurface, path);
 }

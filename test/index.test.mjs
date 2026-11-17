@@ -151,7 +151,11 @@ test('index: mount registers the prefix route, agent listeners and disposal', as
   assert.equal(routes[0].path, API_PREFIX);
   assert.equal(typeof routes[0].handler, 'function');
 
-  assert.deepEqual([...events.keys()].sort(), ['agent-preset/selected', 'agent/created', 'agent/disposed']);
+  assert.deepEqual(
+    [...events.keys()].sort(),
+    ['agent-preset/selected', 'agent/created', 'agent/disposed', 'tools/change', 'tools/pre-execute'],
+    '0.4.0 adds the external-MCP restriction/approval listeners',
+  );
   assert.ok(effects.length >= 2, 'the plugin must own its route and lifecycle through ctx.effect');
 
   // Let the mount-time store load and agent sweep settle, then exercise the

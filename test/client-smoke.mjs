@@ -103,6 +103,24 @@ if (source !== '') {
     assert.match(source, /enabledToolCount/u, 'the card count must read enabledToolCount (contract §2.3)');
   });
 
+  check('the external MCP tab carries the agreed test hooks and no own-server actions', () => {
+    const testIds = [
+      'page-tab-owned', 'page-tab-external', 'external-panel', 'external-loading', 'external-error',
+      'external-retry', 'external-empty', 'external-scan', 'external-preset', 'external-owned-badge',
+      'external-pending', 'external-tool-card', 'external-tool-name', 'external-tool-desc',
+      'external-tool-param', 'external-tool-enabled', 'external-tool-approval', 'external-save',
+    ];
+    for (const testId of testIds) assert.ok(source.includes(`"${testId}"`), `lib/client.js is missing the "${testId}" hook`);
+    for (const path of ['"/external"', '"/external/scan"', '"/external/tools"']) {
+      assert.ok(source.includes(path), `the client must call ${path}`);
+    }
+    for (const forbidden of ['external-add', 'external-edit', 'external-delete', 'external-test', 'external-reconnect']) {
+      assert.equal(source.includes(`"${forbidden}"`), false, `the external tab must never offer ${forbidden}`);
+    }
+    assert.match(source, /data-preset-id/u, 'each external preset group carries its preset id');
+    assert.match(source, /externalBaselines/u, 'the tab tracks per-preset save baselines');
+  });
+
   check('the browser half never imports a Harness package', () => {
     assert.doesNotMatch(source, /import\s[^;]*?from\s+['"]@deepseek-ai\//u, 'lib/client.js imports an @deepseek-ai/ package');
     assert.doesNotMatch(source, /require\(\s*['"]@deepseek-ai\//u, 'lib/client.js requires an @deepseek-ai/ package');
@@ -521,6 +539,30 @@ check('the dictionaries carry every label the panel needs', () => {
     { topic: 'tools count', exact: 'tools.count' },
     { topic: 'tools save first', exact: 'tools.saveFirst' },
     { topic: 'tools footer hint', exact: 'tools.footHint' },
+    { topic: 'page owned tab', exact: 'page.tabOwned' },
+    { topic: 'page external tab', exact: 'page.tabExternal' },
+    { topic: 'page tabs label', exact: 'page.tabsLabel' },
+    { topic: 'external title', exact: 'external.title' },
+    { topic: 'external intro', exact: 'external.intro' },
+    { topic: 'external scan', exact: 'external.scan' },
+    { topic: 'external scanning', exact: 'external.scanning' },
+    { topic: 'external scannedAt', exact: 'external.scannedAt' },
+    { topic: 'external neverScanned', exact: 'external.neverScanned' },
+    { topic: 'external loading', exact: 'external.loading' },
+    { topic: 'external empty', exact: 'external.empty' },
+    { topic: 'external pending', exact: 'external.pending' },
+    { topic: 'external pendingHint', exact: 'external.pendingHint' },
+    { topic: 'external save', exact: 'external.save' },
+    { topic: 'external saved', exact: 'external.saved' },
+    { topic: 'external saveFailed', exact: 'external.saveFailed' },
+    { topic: 'external loadFailed', exact: 'external.loadFailed' },
+    { topic: 'external retry', exact: 'external.retry' },
+    { topic: 'external toolCount', exact: 'external.toolCount' },
+    { topic: 'external ownedBadge', exact: 'external.ownedBadge' },
+    { topic: 'external disabledNote', exact: 'external.disabledNote' },
+    { topic: 'external footHint', exact: 'external.footHint' },
+    { topic: 'external noParams', exact: 'external.noParams' },
+    { topic: 'external toolsEmpty', exact: 'external.toolsEmpty' },
     { topic: 'presets', pattern: /(^|\.)presets(?:\.|$)/u },
     { topic: 'status.connected', exact: 'status.connected' },
     { topic: 'status.error', exact: 'status.error' },
@@ -627,6 +669,102 @@ check('the client exposes the 0.3.0 tool helpers and components', () => {
   assert.equal(api.toolSettingsKey(normalized), api.toolSettingsKey([...normalized].reverse()), 'the fingerprint is order-independent');
   assert.notEqual(api.toolSettingsKey(normalized), api.toolSettingsKey([{ ...normalized[0], enabled: false }, normalized[1]]), 'a toggle changes the fingerprint');
   assert.equal(JSON.stringify(api.toolSettingsKey([])), JSON.stringify('[]'));
+});
+
+check('the page tabs and external copy match the contract', () => {
+  const loaded = bundleOrFail();
+  const { zh, en } = loaded.log.locale[0].dictionary;
+  assert.equal(zh['page.tabOwned'], '本插件 MCP');
+  assert.equal(en['page.tabOwned'], 'Plugin MCP');
+  assert.equal(zh['page.tabExternal'], '其他 MCP');
+  assert.equal(en['page.tabExternal'], 'Other MCP');
+  assert.equal(zh['page.tabsLabel'], 'MCP 分组');
+  assert.equal(en['page.tabsLabel'], 'MCP groups');
+  for (const key of ['external.scannedAt', 'external.saveFailed', 'external.loadFailed', 'external.toolCount']) {
+    for (const dictionary of [zh, en]) assert.match(dictionary[key], /\{\w+\}/u, `${key} must carry a placeholder`);
+  }
+  assert.match(zh['external.intro'], /不能修改连接或凭据/u, 'the intro states that connections/credentials are out of scope');
+  assert.match(zh['external.footHint'], /非完全权限/u);
+});
+
+check('the client exposes the 0.4.0 external helpers and components', () => {
+  const loaded = bundleOrFail();
+  const api = loaded.exports.__mcpTest;
+  assert.equal(typeof api.ExternalTab, 'function', 'ExternalTab must be exported');
+  assert.equal(typeof api.ExternalView, 'function', 'ExternalView must be SSR-able');
+  assert.equal(typeof api.ExternalToolCard, 'function');
+  assert.equal(typeof api.normalizeExternalPayload, 'function');
+  assert.equal(typeof api.externalToolSettings, 'function');
+  assert.equal(typeof api.externalToolSettingsKey, 'function');
+  assert.equal(typeof api.externalBaselines, 'function');
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(api.normalizeExternalPayload(undefined))),
+    { scannedAt: null, presets: [] },
+    'a missing payload normalizes to the empty state',
+  );
+  const normalized = JSON.parse(JSON.stringify(api.normalizeExternalPayload({
+    scannedAt: '2026-11-17T09:00:00.000Z',
+    extra: 'dropped',
+    presets: [
+      {
+        id: 'standard',
+        name: 'Standard',
+        hasPresetMcp: true,
+        servers: [
+          {
+            name: 'pan',
+            discoveredAt: 42,
+            tools: [
+              { name: 'mcp__pan__zeta', description: 7, enabled: false, params: [{ name: 'q', required: 1 }, null] },
+              null,
+              { name: '' },
+              { name: 'mcp__pan__alpha' },
+            ],
+          },
+          { name: '', tools: [] },
+        ],
+      },
+      { id: 'custom', servers: 'nope' },
+      { id: '', servers: [] },
+      null,
+    ],
+  })));
+  assert.equal(normalized.scannedAt, '2026-11-17T09:00:00.000Z');
+  assert.deepEqual(normalized.presets.map((preset) => preset.id), ['standard', 'custom'], 'invalid presets are dropped, valid ones keep payload order');
+  assert.deepEqual(normalized.presets[1], { id: 'custom', name: 'custom', hasPresetMcp: false, servers: [] });
+  assert.deepEqual(normalized.presets[0], {
+    id: 'standard',
+    name: 'Standard',
+    hasPresetMcp: true,
+    servers: [{
+      name: 'pan',
+      discoveredAt: null,
+      tools: [
+        { name: 'mcp__pan__alpha', description: '', params: [], enabled: true, approval: false },
+        { name: 'mcp__pan__zeta', description: '', params: [{ name: 'q', required: false }], enabled: false, approval: false },
+      ],
+    }],
+  }, 'servers and tools are sorted, damaged entries dropped, defaults applied');
+
+  const settings = JSON.parse(JSON.stringify(api.externalToolSettings(normalized.presets[0])));
+  assert.deepEqual(settings, [
+    { name: 'mcp__pan__alpha', enabled: true, approval: false },
+    { name: 'mcp__pan__zeta', enabled: false, approval: false },
+  ], 'the PUT body is the flattened sorted full list');
+  const standard = normalized.presets[0];
+  const reversed = { ...standard, servers: [{ ...standard.servers[0], tools: [...standard.servers[0].tools].reverse() }] };
+  assert.equal(api.externalToolSettingsKey(standard), api.externalToolSettingsKey(reversed), 'the fingerprint is order-independent');
+  assert.notEqual(
+    api.externalToolSettingsKey(standard),
+    api.externalToolSettingsKey({ ...standard, servers: [{ ...standard.servers[0], tools: [{ ...standard.servers[0].tools[0], approval: true }, standard.servers[0].tools[1]] }] }),
+    'a toggle changes the fingerprint',
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(api.externalBaselines(normalized.presets))),
+    { standard: api.externalToolSettingsKey(standard), custom: api.externalToolSettingsKey(normalized.presets[1]) },
+    'baselines are keyed by preset id',
+  );
 });
 
 check('save drafts never carry an icon or tool-settings field', () => {

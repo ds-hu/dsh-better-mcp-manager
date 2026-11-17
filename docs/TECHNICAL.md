@@ -12,6 +12,7 @@ and one of them is a bug.
 - [Data model](#data-model)
 - [Icons](#icons)
 - [Tools](#tools)
+- [Other MCP (preset-owned)](#other-mcp-preset-owned)
 - [Preset exposure](#preset-exposure)
 - [Tool naming and definitions](#tool-naming-and-definitions)
 - [HTTP API](#http-api)
@@ -40,13 +41,14 @@ The bundle patch inserts exactly one row, and its `id` equals the `name` exporte
 and inserts no other rows, so it sits loose in the Host root realm.
 
 The Host half never writes `cordis.patch.yml`, never mounts Loader rows, never edits agent-preset
-YAML, and imports no `@deepseek-ai/*` module. Everything the user configures lives in one JSON file
+YAML, and imports no `@deepseek-ai/*` module. Everything the user configures lives in two JSON files
 plus at most one icon file per server under `$DSH_HOME/better-mcp-manager/`. The only runtime
 dependency is `@modelcontextprotocol/client` (2.2.0, MIT) for the MCP wire protocol.
 See [ADR 2](adr/0002-own-mcp-connection-manager.md),
 [ADR 5](adr/0005-hand-built-tool-definition.md),
-[ADR 6](adr/0006-server-and-upload-icons.md) and
-[ADR 7](adr/0007-tool-enablement-and-approval.md).
+[ADR 6](adr/0006-server-and-upload-icons.md),
+[ADR 7](adr/0007-tool-enablement-and-approval.md) and
+[ADR 8](adr/0008-preset-owned-mcp-management.md).
 
 ## Architecture
 
@@ -56,13 +58,15 @@ Host (lib/index.js)
 ├── manager ...... one connection supervisor per enabled server + auto-icon fetch/cache
 ├── binder ....... registers each allowed server's enabled tools on live agents
 ├── icons ........ uploaded-icon decoding, raster checks, icons/ storage (0600)
-├── api .......... /better-mcp-manager/api/* (one prefix route, incl. icon and tool endpoints)
+├── external ..... preset-owned MCP discovery, restrictions, pre-execute approval, external.json
+├── api .......... /better-mcp-manager/api/* (one prefix route, incl. icon/tool/external endpoints)
 └── dispose ...... close connections, release agent registrations, unregister route
 ```
 
 Mounting the Host half:
 
-`apply` builds the store, connection manager, exposure controller and API, then:
+`apply` builds the store, connection manager, exposure controller, external controller and API,
+then:
 
 1. starts loading `servers.json` (the load ensures the data directory exists in mode `0700`; a missing
    file is an empty store; a file that is not JSON or has an unknown shape/version is quarantined as
@@ -70,11 +74,13 @@ Mounting the Host half:
    dropped and their valid siblings kept; a version-1 or version-2 file migrates in memory to
    version 3 — legacy emoji-string icons become automatic, missing `toolOverrides`/`toolCache` become
    `{}`/`null`);
-2. registers the HTTP prefix route and the `agent/created` / `agent/disposed` /
+2. starts the external controller (`external.start()`), which loads `external.json`, registers its
+   five Host listeners and schedules the first discovery scan;
+3. registers the HTTP prefix route and the `agent/created` / `agent/disposed` /
    `agent-preset/selected` listeners synchronously as effects;
-3. converges in the background once loading finishes: one supervisor per **enabled** server, then a
-   bind of every live agent; a later-mounting `agents` service gets its own bind sweep through
-   `ctx.inject(['agents'])`.
+4. converges in the background once loading finishes: one supervisor per **enabled** server, then a
+   bind of every live agent; a later-mounting `agents` service gets its own bind sweep and external
+   scan through `ctx.inject(['agents'])`.
 
 A startup failure is logged and reported through individual server cards; it never rejects plugin
 activation. The panel can poll while convergence is still in progress — a server simply appears
@@ -149,7 +155,7 @@ is a `connect-failed`/`closed` error, not a silent empty tool list.
   and retries the connection once with a fresh token when the attempt looks unauthorized. A failed
   token fetch is a connection error with code `auth-failed` whose message names the endpoint status.
 
-There is no authorization-code flow in 0.3.0. See [ADR 2](adr/0002-own-mcp-connection-manager.md).
+There is no authorization-code flow in 0.4.0. See [ADR 2](adr/0002-own-mcp-connection-manager.md).
 
 **Timeouts.** `timeoutMs` (1000–600000, default 60000) bounds one `tools/call`. A call that times
 out fails that tool call (the transport error reaches the model as a tool error), not the
@@ -185,10 +191,10 @@ adapted for this plugin's single-connection model; attribution is in [NOTICE](..
 
 ## Data model
 
-One JSON file plus an icon directory under `$DSH_HOME/better-mcp-manager/`; the directory is mode
-`0700`, `servers.json` is mode `0600`, and uploaded icons live in `icons/` (mode `0700`, each file
-`0600`). Creating the store ensures the data directory exists (mode `0700`) on mount; `servers.json`
-appears on the first save, `icons/` on the first upload, and mounting without configuring writes no
+Two JSON files plus an icon directory under `$DSH_HOME/better-mcp-manager/`; the directory is mode
+`0700`, `servers.json` and `external.json` are mode `0600`, and uploaded icons live in `icons/`
+(mode `0700`, each file `0600`). Creating either store ensures the data directory exists (mode
+`0700`) on mount; `servers.json` appears on the first owned-server save, `external.json` on the first save on the 其他 MCP tab, `icons/` on the first upload, and mounting without configuring writes no
 file.
 
 The resolver understands one test/scratch override: `DSH_MCP_MANAGER_DATA_DIR` (absolute path) wins
@@ -384,6 +390,100 @@ the **需要审批** switch (disabled while the tool itself is disabled), plus t
 工具** for an unsaved server, and the **保存工具设置** footer; a save keeps the tab open, reports
 **工具设置已保存** or the failure, and leaves the draft form untouched.
 
+## Other MCP (preset-owned)
+
+Not every MCP server in a profile belongs to this plugin. Another plugin or an agent preset can
+mount its own `@deepseek-ai/dsh-mcp-client` rows; their tools are inherited by Agents of that preset.
+The **其他 MCP** page tab manages exactly the two levers a Host plugin can reach at runtime — remove
+an inherited tool from the model-facing tool list, and ask for approval before a call — without
+editing preset YAML, starting/stopping those connections, or touching their credentials.
+[ADR 8](adr/0008-preset-owned-mcp-management.md) records the decision; the contract is
+[API-CONTRACT §2.8](API-CONTRACT.md#28-preset-owned-external-mcp-tools).
+
+**Discovery algorithm** (`lib/external.js`). A scan walks live Agents
+(`hostCtx.get('agents').list()`) and, per Agent:
+
+1. resolves `presetId = composedPreset(hostCtx, agent)` and reads
+   `agent.ctx.tools.view(agent)` (`visible` Map plus `restrictableNames` Set);
+2. builds the candidate set from `restrictableNames` — names matching
+   `mcp__<serverName>__<raw>` — minus `exposure.ownToolNames()`, so this plugin's own tools can never
+   be classified as external;
+3. applies the stored restrictions **before** reading the visible list (a tool just re-enabled is
+   still absent while the old restriction is alive, and `restrictableNames` is stable under
+   restrictions), then re-reads the view;
+4. groups the visible external names by server namespace (the first `__` terminates the server name;
+   it is ≤32 `[A-Za-z0-9_-]`), describes each tool from its live definition
+   (`description` ≤2000 chars, parameter names/requiredness from the input schema, ≤64), and merges
+   over the previous cache. A disabled tool is kept in the cache while its `enabled:false` override
+   exists, so it stays visible in the panel across rescans; a cached tool that is no longer listed
+   and has no disabled override is dropped, and `discoveredAt` is refreshed on change;
+5. adds a placeholder preset when `agentPresets.inspectCompositions()` shows an
+   `@deepseek-ai/dsh-mcp-client` module but no Agent of that preset is live yet
+   (`hasPresetMcp: true`, `servers: []`), and sorts presets by the roster's `order`.
+
+Scans are coalesced (microtask by default, 25 ms for `tools/change`) and triggered by startup,
+`agent/created`, `agent/disposed`, `agent-preset/selected`, `tools/change`, a late `agents` service,
+`GET /external`, `POST /external/scan`, and after every settings save. `scannedAt` advances on every
+scan; `external.json` is written when discovery changed or settings were saved.
+
+**Restrictions.** For each Agent the controller computes a deny list from
+`overrides[name].enabled === false` over that Agent's restrictable external names and calls
+`agent.ctx.tools.restrict({ deny })`. The restriction replaces the previous one when its signature
+changes (same preset, same deny set → no-op), is applied only to Agents of the owning preset, and is
+disposed when the Agent is disposed or the controller shuts down. This removes the tool from the
+model-facing tool set — it is not a call-time rejection — and it is recomputed on agent creation,
+preset switch and tool-registry changes.
+
+**Approval seam.** `external.start()` registers a Host-wide `tools/pre-execute` listener. For a
+candidate name it checks, in order: `mcp__` namespace → live Agent → owning preset →
+`overrides[name].approval === true` → not one of this plugin's own names → the name is in the
+Agent's restrictable set → the session is not exactly `danger-full-access`. If all hold it returns
+`{ kind: 'ask', reason: 'MCP 工具 "<name>" 需要审批（当前不是完全权限）' }`; otherwise it calls the
+next policy. The shared DSH pipeline runs the approval service and only dispatches on
+`allowed-once`; rejected/cancelled/unavailable or a missing approval channel deny before the MCP
+call. This plugin's own tools return `next()` here and keep their existing approval body, so nothing is
+double-gated. The Host's approval policy still decides whether an ask can be displayed: with a
+`never` policy the ask is denied rather than shown, and the plugin cannot override that.
+
+**State file.** `$DSH_HOME/better-mcp-manager/external.json` (schema version 1, mode `0600` inside
+the `0700` data directory, atomic temp-file + rename):
+
+```jsonc
+{ "version": 1, "presets": {
+  "<presetId>": {
+    "updatedAt": "…",
+    "overrides": { "mcp__foreign__ping": { "approval": true },
+                   "mcp__foreign__add": { "enabled": false } },
+    "servers": { "foreign": { "discoveredAt": "…", "tools": [{ "name": "mcp__foreign__ping",
+      "description": "…", "params": [{ "name": "text", "required": true }] }] } }
+  }
+} }
+```
+
+Only deviations from "enabled, no approval" are stored. Caps: 100 presets, 200 servers per preset,
+300 tools per server, 2000 override entries per preset, description 2000 chars, 64 params per tool. Only valid `mcp__` names and preset ids are
+accepted; a corrupt or unknown-version file is moved to `external.json.corrupt-<iso>` and the state
+starts empty. No credentials, headers or tokens are ever written. `clean --yes` deletes the file with
+the whole directory; deleting it resets every choice to the default.
+
+**API.** `GET /external` refreshes discovery then returns
+`{ ok, scannedAt, presets: [{ id, name, hasPresetMcp, servers: [{ name, discoveredAt, tools: [{ name,
+description, params, enabled, approval }] }] }] }`; `POST /external/scan` is the same after an
+explicit rescan (same-origin checked); `PUT /external/tools` takes
+`{ presetId, tools: [{ name, enabled, approval }] }`, stores only deviations, re-applies restrictions
+and returns the refreshed payload. Validation failures are `400 invalid-body` / `400 invalid-preset` /
+`400 invalid-tools` / `400 invalid-tool-name`; a missing controller answers
+`500 unavailable`; unsupported methods on these paths fall through to `404 not-found`.
+
+**Page.** The main page has two level-1 tabs, **本插件 MCP** and **其他 MCP**. The external tab shows
+the intro caveat, **上次扫描：…** and **重新扫描**; one group per preset with its id and the
+**预设自带** badge, a **该预设自带 MCP，但工具列表还未同步** placeholder plus the hint to open a
+session or rescan, and per-server cards with description, parameter chips and per-tool **启用** /
+**需要审批** switches (approval is disabled while the tool itself is disabled). A per-preset
+**保存工具设置** button enables only when something changed; the footer reads **停用后该工具会从 Agent
+的工具列表中消失；需要审批只在非完全权限下生效**. The tab never offers add/edit/delete/test/
+reconnect.
+
 ## Preset exposure
 
 `presets` answers one question: **which agents get this server's tools?**
@@ -475,6 +575,9 @@ route table, envelopes and error codes are frozen in
 | `DELETE` | `/servers/:id/icon` | delete the stored file and reset `icon = { kind: "auto" }` |
 | `GET` | `/presets` | agent-preset roster |
 | `GET` | `/agents` | live exposure diagnostics |
+| `GET` | `/external` | preset-owned MCP groups/tools after a discovery refresh |
+| `POST` | `/external/scan` | re-run discovery now, same payload; no body, same-origin checked |
+| `PUT` | `/external/tools` | save one preset's tool enable/approval settings and re-apply exposure |
 | `GET` | `/health` | version, pid, uptime |
 
 Responses are JSON: success `{ ok: true, ... }`, failure `{ ok: false, code, error }` with 400/404/
@@ -490,6 +593,13 @@ own web auth.
 and the resolved `dataDir`. Preset rows are `{ id, name, description, order }` plus an optional
 `broken` diagnostic when the Host reports that the preset failed to activate; when the agent-preset
 service is absent the roster is empty and the UI explains that per-preset selection needs presets.
+
+The three external routes answer the payload
+`{ ok, scannedAt, presets: [{ id, name, hasPresetMcp, servers: [{ name, discoveredAt, tools }] }] }`
+(§[Other MCP](#other-mcp-preset-owned)); `scannedAt` records the last scan (it is `null` only before the controller's first scan). `PUT` validates
+with `400 invalid-preset` / `400 invalid-tools` / `400 invalid-tool-name`; a missing external
+controller answers `500 unavailable`; any other method under `/external*` falls through to
+`404 not-found`. None of them accepts a preset's credentials and none writes preset YAML.
 
 ## Security
 
@@ -512,6 +622,11 @@ service is absent the roster is empty and the UI explains that per-preset select
 - **Approval is delegated, not simulated.** A tool marked **需要审批** only asks the Host's approval
   service; with no service the call is denied. Approval never elevates the session's permissions and
   creates no plugin-owned policy that a later call could reuse.
+- **External MCP stays external.** The preset-owned controller never reads, writes or starts a
+  preset's MCP connection and never touches its YAML or credentials. It operates on the Agent's
+  runtime tool registry only: discover inherited names, remove them with a restriction, and add an
+  approval ask through the Host's `tools/pre-execute` policy. Its file holds descriptors and
+  deviations, never secrets.
 - **Secret handling.** Custom header values, an OAuth bearer token and a `client_credentials` secret
   are stored as plaintext in `servers.json` (mode `0600`). They are never written to logs, never
   echoed in a status error, and the OAuth token/client-secret inputs render as password fields. The
@@ -537,6 +652,16 @@ outer boundary.
   `main` slot page (`key: 'mcp-manager'`);
 - polls `GET /servers` every 2.5 s while the page is mounted, and immediately after each mutation,
   so a connection that drops updates without a manual refresh;
+- renders the main page as two level-1 tabs, **本插件 MCP** (`page-tab-owned`) and **其他 MCP**
+  (`page-tab-external`); the owned tab keeps the header, add button, cards and form, while the
+  external tab renders the preset-owned surface described in
+  [Other MCP](#other-mcp-preset-owned) and hides the add button;
+- renders the external tab: intro caveat, **上次扫描：…** + **重新扫描**, one group per preset with
+  the **预设自带** badge and tool count, a placeholder for a preset with an MCP client but no live
+  session, per-server cards with description/parameter chips, per-tool **启用**/**需要审批**
+  switches, a per-preset **保存工具设置** that enables only when changed, inline saved/failed notices,
+  and loading/empty/error+retry states. It never shows add/edit/delete/test/reconnect for external
+  servers;
 - renders the server cards grouped by `group` (ungrouped last, as **其他（未分组）**), each with an
   icon tile (the `iconUrl` image, falling back to the name's first letter when it fails to load),
   name, status dot and status line, and the `···` menu (编辑 / 测试连接 / 重新连接 / 启用或停用 /
@@ -566,29 +691,34 @@ Sanitized screenshots of the shipped UI live in `docs/screenshots/`: the
 [mixed-state list](screenshots/mcp-manager-list.png), the
 [preset-exposure form section](screenshots/mcp-manager-form-presets.png), the
 [服务器图标 form row](screenshots/mcp-manager-form-icon.png), the
-[工具 tab](screenshots/mcp-manager-form-tools.png) and the
+[工具 tab](screenshots/mcp-manager-form-tools.png), the
+[其他 MCP tab](screenshots/mcp-manager-external.png) and the
 [连接错误 详情 dialog](screenshots/mcp-manager-error-detail.png). The README embeds the sidebar, the
-list, the presets, the icon row and the tools tab.
+list, the presets, the icon row, the tools tab and the external tab.
 
 ## Lifecycle and dispose
 
 Mount ensures the data directory exists (mode `0700`) and starts no work for disabled servers; it
 writes no store file and creates no `icons/` directory until the first save/upload. A connected
 server's first tool discovery does write `toolCache` even without a user save, through the same
-serialized store queue. The Host half owns one prefix route, one store, one manager, one binder and
-the icon/tool helpers. Dispose runs in reverse, with bounded closes:
+serialized store queue, and the first save on 其他 MCP or the first scan that discovers a tool
+creates `external.json`. The Host half owns one prefix route, one store, one manager, one binder, the
+icon/tool helpers and the preset-owned controller. Dispose runs in reverse, with bounded closes:
 
 1. unregister the HTTP prefix route;
-2. release every `agent.ctx` tool registration and system-prompt section and clear the binder's
+2. dispose the external controller: remove its five Host listeners, release every
+   `tools.restrict` restriction, and wait for its load/persist queue;
+3. release every `agent.ctx` tool registration and system-prompt section and clear the binder's
    bookkeeping;
-3. await the startup load/converge chain so no half-initialised manager survives;
-4. dispose every connection: bump the attempt generation, clear retry timers, close clients and
+4. await the startup load/converge chain so no half-initialised manager survives;
+5. dispose every connection: bump the attempt generation, clear retry timers, close clients and
    transports (5 s cap each), drop cached tools, status and the in-memory icon cache;
-5. wait for queued store writes (including a pending tool-cache refresh) to land.
+6. wait for queued store writes (including a pending tool-cache refresh or external state write) to
+   land.
 
-Dispose never deletes icon files: they belong to the store and survive a plugin restart, exactly
-like the server records. Deleting a server or resetting its icon is the only thing that removes an
-uploaded file.
+Dispose never deletes icon files or `external.json`: they belong to the store and survive a plugin
+restart, exactly like the server records. Deleting a server/resetting its icon and saving external
+tool settings (or deleting `external.json`) are the only things that change that state.
 
 The agent-lifecycle listeners are removed by their own effect disposer, and the client half removes
 its locale namespace, stylesheet, slot registrations and every timer on dispose. Disabling the
@@ -608,7 +738,7 @@ dsh plugin --profile web remove @ds-hu/dsh-better-mcp-manager
 #    or: Plugins page → the bundle → Remove
 #    or: ask the agent, plugin_manager remove_bundle
 
-# 2. delete the one data directory (servers.json, per-tool settings and icons/)
+# 2. delete the one data directory (servers.json, external.json, per-tool settings and icons/)
 node bin/mcp-manager.mjs clean --yes
 #    or, when running the published package:
 npx -y @ds-hu/dsh-better-mcp-manager clean --yes
@@ -627,8 +757,8 @@ created (`0700` directory, `0600` file); `dsh plugin --profile <t> remove
 @ds-hu/dsh-better-mcp-manager` removes the dependency, the `dsh.profile.bundles` row and the
 `node_modules` entry itself, leaves no `.better*` residue in the profile, and the profile boots again
 without a dangling-bundle error. `bin/mcp-manager.mjs clean --yes` then removes the data directory
-including `icons/`. No install scripts run, no service or timer is created, and `$DSH_HOME/storages`
-and `.plugin-manager` never carry this plugin's name.
+including `icons/` and, when present, `external.json`. No install scripts run, no service or timer is
+created, and `$DSH_HOME/storages` and `.plugin-manager` never carry this plugin's name.
 
 Two honest caveats:
 
@@ -644,8 +774,8 @@ Two honest caveats:
 
 ```bash
 npm run lint        # eslint over the shipped sources and tests
-npm test            # 168 unit tests + 24 mount checks + 27 client-smoke checks
-npm run test:pack   # the 9-check `npm pack --dry-run` audit (38 files)
+npm test            # 188 unit tests + 24 mount checks + 30 client-smoke checks
+npm run test:pack   # the 9-check `npm pack --dry-run` audit (40 files)
 npm run check       # all of the above; the same gate prepublishOnly runs
 npm run e2e         # isolated DSH instance + Playwright (opt-in, see below)
 ```
@@ -656,31 +786,34 @@ npm run e2e         # isolated DSH instance + Playwright (opt-in, see below)
 | `test/store.test.mjs` | data-dir resolution (including the override), empty-directory mount writes nothing, reload round-trip and list order, atomic mode-`0600` write with no temp left behind, serialized concurrent writes and `patch`, corrupt/unknown-shape quarantine, per-record drop, v1/v2→v3 migration without a read-time rewrite, write-error propagation |
 | `test/mcp.test.mjs` | OAuth `client_credentials` form/caching/refresh and its failure mapping, bearer/custom-header precedence, failure-code classification and stderr-tail detail, UTF-8 truncation, manager snapshots for unknown/disabled servers (`toolCount`/`enabledToolCount`), auto-icon selection/fetch/cache/failure-fallback |
 | `test/presets.test.mjs` | `"all"` vs id-array exposure (including preset-less agents), disabled/disconnected/empty servers, per-tool enable filtering and all-disabled instruction suppression, rebinding without duplicate registrations, multi-server order, one instruction section per server and zero-tool skip, missing `tools`/`systemPrompt` services, preset-selected re-exposure, bindAll pruning, dispose, refresh coalescing |
-| `test/api.test.mjs` | every route against mock `req`/`res`: envelopes and statuses, JSON content type, cross-origin fence, invalid JSON/drafts, 64 KiB rejection, create/update-in-place (frozen key)/delete/enable/reconnect, unsaved draft probe never stores, icon GET/304/404/POST/DELETE and their caps/validation, tools GET live/cached + PUT overrides/rebind/validation and cache write-through, preset/agent read surfaces, group order, 404 and trailing-slash normalisation |
+| `test/api.test.mjs` | every route against mock `req`/`res`: envelopes and statuses, JSON content type, cross-origin fence, invalid JSON/drafts, 64 KiB rejection, create/update-in-place (frozen key)/delete/enable/reconnect, unsaved draft probe never stores, icon GET/304/404/POST/DELETE and their caps/validation, tools GET live/cached + PUT overrides/rebind/validation and cache write-through, external GET/scan/PUT payloads, deviations-only persistence and `invalid-preset`/`invalid-tools`/`invalid-tool-name`/`unavailable` errors, preset/agent read surfaces, group order, 404 and trailing-slash normalisation |
 | `test/cli.test.mjs` | `path`/`status`/`clean` against throwaway homes and `DSH_MCP_MANAGER_DATA_DIR`: absence, count/enabled output, damaged-store exit 1, `--yes` requirement, refusal of a foreign directory, unknown command/help exit codes |
-| `test/index.test.mjs` | Host mount: the prefix route, agent-lifecycle listeners, tool-cache persistence hook and disposal are registered through effects (fake Cordis context) |
+| `test/index.test.mjs` | Host mount: the prefix route, agent-lifecycle listeners, tool-cache persistence hook, external controller startup and disposal are registered through effects (fake Cordis context) |
+| `test/external.test.mjs` | the preset-owned controller: `external.json` normalisation (versions, caps, unsafe keys, invalid names), load/quarantine/atomic save, live-agent discovery and server/tool grouping, disabled-tool cache retention through a rescan, `restrict({deny})` compute/replace/release, approval `tools/pre-execute` conditions and full-access skip, `hasPresetMcp` placeholders, save/scan coalescing and payload shape |
 | `test/projection.test.mjs` | MCP content projection (text, resource links, unsupported blocks, empty result), canonical output schema and tool-definition shape, `isError` rejection, spec-invalid results, image admission/fallback diagnostics (attachment service, model modality, malformed base64, attachment rejection), `structuredContent`, task-required refusal, approval gating (full access skip, allowed-once, rejected/cancelled/unavailable, missing services) |
-| `test/mount-check.mjs` | patch row id = Host `name`, exports and `bin` resolve, locale metadata and icon present, no `@deepseek-ai/*` import in `lib/`/`bin/`, no profile/absolute-path writes, data-dir resolver, frozen constants |
-| `test/client-smoke.mjs` | `lib/client.js` runs in a `vm` with a fake `window.__ModuleLoader__` + React: exactly the two slots and their ids/orders, zh/en dictionaries cover the same non-empty keys, no foreign API paths or imports, the edit sheet has two tabs and the tools tab exposes the per-tool switches/save copy, the icon row exposes 上传图标 / 恢复自动 with no emoji palette, one owned `<style>` removed on dispose, every timer cleared |
+| `test/mount-check.mjs` | patch row id = Host `name`, exports and `bin` resolve, locale metadata and icon present, no `@deepseek-ai/*` import in `lib/`/`bin/`, no profile/absolute-path writes, data-dir resolver, frozen constants (including the external schema version and caps) |
+| `test/client-smoke.mjs` | `lib/client.js` runs in a `vm` with a fake `window.__ModuleLoader__` + React: exactly the two slots and their ids/orders, two page tabs (本插件 MCP / 其他 MCP) with the external panel's scan/save/badge copy and no add/edit/delete/test controls, zh/en dictionaries cover the same non-empty keys, no foreign API paths or imports, the edit sheet has two tabs and the tools tab exposes the per-tool switches/save copy, the icon row exposes 上传图标 / 恢复自动 with no emoji palette, one owned `<style>` removed on dispose, every timer cleared |
 | `test/package.mjs` | `npm pack --dry-run` audit: the `files` list covers every runtime artefact (bin/lib/locale/icon/docs/legal incl. the screenshot directory) and excludes tests/dev config; dependency and lifecycle-script rules |
-| `test/e2e/run.mjs` | 94 checks in about 2.5 minutes: boot (fresh `web` profile + the real packed tarball in transient systemd scopes, authenticated URL), bundle (sidebar row directly below 自动化任务, page opens without console/page errors), CRUD (stdio + HTTP servers, live tool counts, wrong-port 连接失败 + 详情, edit-to-recover, enable round-trip, delete), icons (fixture-declared server icon renders in the card, the form has no emoji palette, an upload changes the card bytes, 恢复自动 returns to the server icon, deleting the server removes the stored file), tools (工具 tab lists live/cached descriptors, disabling removes the tool from a real model request's `tools[]`, re-enabling restores it, card counts change 2/2→1/2, 需要审批 persists then clears to `{}`), approvals (a restricted session shows the 等待审批 composer, the tool has not run while pending, 允许一次 executes it and the result reaches the model; a 完全权限 session runs the same tool with no composer), scoping (fake OpenAI-compatible provider: `mcp__<key>__echo` present for a standard-preset session and absent for a minimal-preset session, plus a scripted tool-call round-trip), hygiene (cleanup of scopes/processes/files/ports, production MainPID/cgroup untouched) |
+| `test/e2e/run.mjs` | 119 checks: boot (fresh `web` profile + the real packed tarball in transient systemd scopes, authenticated URL), bundle (sidebar row directly below 自动化任务, page opens without console/page errors), CRUD (stdio + HTTP servers, live tool counts, wrong-port 连接失败 + 详情, edit-to-recover, enable round-trip, delete), icons (fixture-declared server icon renders in the card, the form has no emoji palette, an upload changes the card bytes, 恢复自动 returns to the server icon, deleting the server removes the stored file), tools (工具 tab lists live/cached descriptors, disabling removes the tool from a real model request's `tools[]`, re-enabling restores it, card counts change 2/2→1/2, 需要审批 persists then clears to `{}`), approvals (a restricted session shows the 等待审批 composer, the tool has not run while pending, 允许一次 executes it and the result reaches the model; a 完全权限 session runs the same tool with no composer), other MCP (a real preset mounts `foreign` through `@deepseek-ai/dsh-mcp-client`; after one live external-preset session `GET /external` reports the 预设自带 preset, server, descriptions and param chips; the tab renders the cards but no add/edit/delete/test controls; disabling a tool on the tab and saving makes a fresh external-preset model request omit it, re-enabling restores it; an approval ask under a restricted preset is approved once and the tool result reaches the model; the same tool runs directly under 完全权限; settings reset to defaults; the owned tab still works), scoping (fake OpenAI-compatible provider: `mcp__<key>__echo` present for a standard-preset session and absent for a minimal-preset session, plus a scripted tool-call round-trip), hygiene (cleanup of scopes/processes/files/ports, production MainPID/cgroup untouched) |
 
 The unit suites are offline and finish in seconds; they need no Host. `test/e2e/fixture-selftest.mjs`
-is a standalone check that drives the fixture MCP servers with the same `@modelcontextprotocol/client`
-version the plugin depends on — run it directly after changing a fixture or the SDK. The e2e fixtures
-live in `test/fixtures/`: a stdio MCP server with echo/fail tools and instructions, a Streamable HTTP
-MCP server with add/echo/fail tools and instructions, and a fake OpenAI-compatible endpoint that
-records every request (notably `tools[].function.name` and the messages) and can answer with a scripted
-tool call. The e2e suite is the only one that boots DSH: it uses a fresh `$DSH_HOME` and profile under
-`/var/tmp`, runs the runner, the test DSH and the fixtures in transient systemd scopes (`MemoryMax=1G`
-for the runner/DSH, `256M` for the fixtures, `MemorySwapMax=0`), installs the real packed tarball, and
-never touches the user's running instance or `/root/.dsh`. The fixture MCP servers declare icons (a
+is a standalone check (21 checks) that drives the fixture MCP servers with the same
+`@modelcontextprotocol/client` version the plugin depends on — run it directly after changing a
+fixture or the SDK. The e2e fixtures live in `test/fixtures/`: a stdio MCP server with echo/fail
+tools and instructions, a Streamable HTTP MCP server with add/echo/fail tools and instructions, an
+external preset server (`foreign` with add/ping tools) mounted through `@deepseek-ai/dsh-mcp-client`
+for the preset-owned scenario, and a fake OpenAI-compatible endpoint that records every request
+(notably `tools[].function.name` and the messages) and can answer with a scripted tool call. The e2e
+suite is the only one that boots DSH: it uses a fresh `$DSH_HOME` and profile under `/var/tmp`, runs
+the runner, the test DSH and the fixtures in transient systemd scopes (`MemoryMax=1G` for the
+runner/DSH, `256M` for the fixtures, `MemorySwapMax=0`), installs the real packed tarball, and never
+touches the user's running instance or `/root/.dsh`. The fixture MCP servers declare icons (a
 `data:` PNG over stdio, an HTTP URL over Streamable HTTP) and expose separate tools for the per-tool
-checks; the approval scenarios switch a real session's permission preset and wait for the DSH approval
-composer. On success it publishes six sanitized screenshots to `docs/screenshots/`. `--keep` leaves
-the scopes and the run directory for debugging; `--verbose` adds step logging. It is opt-in — not part
-of `npm run check` — and needs Playwright with Chromium plus registry access for the profile install.
-That isolation is a property of the test harness, not of the plugin.
+checks; the approval scenarios switch a real session's permission preset and wait for the DSH
+approval composer. On success it publishes seven sanitized screenshots to `docs/screenshots/`.
+`--keep` leaves the scopes and the run directory for debugging; `--verbose` adds step logging. It is
+opt-in — not part of `npm run check` — and needs Playwright with Chromium plus registry access for
+the profile install. That isolation is a property of the test harness, not of the plugin.
 
 ## Failure modes
 
@@ -697,6 +830,12 @@ That isolation is a property of the test harness, not of the plugin.
 | Approval-required call fails without a composer | no approval service, no permission service, no agent/execution context, or the request was rejected/cancelled | the call is denied before the MCP server is contacted; the model gets a readable error |
 | **工具** tab shows an old list | the server is disconnected and the tab is rendering `toolCache` (`更新于 …`) | reconnect or open the tab on a connected server; settings themselves are current |
 | **保存工具设置** answers `404` | the server was deleted in another window | nothing is written; reload the page |
+| **其他 MCP** tab is empty | no preset mounts `@deepseek-ai/dsh-mcp-client`, or discovery saw no external tools yet | open a session of such a preset, then press **重新扫描**; presets with an MCP client are listed with `hasPresetMcp` only after `inspectCompositions()` sees one |
+| A preset in **其他 MCP** shows the placeholder instead of tools | it mounts an MCP client but has no live Agent yet, so `tools.view` cannot list inherited tools | the placeholder is correct: open one session using that preset, or rescan after one exists |
+| An external tool is disabled on the page but a fresh session still advertises it | the per-preset settings were not saved, or the new Agent was created before the restrict recompute landed | press **保存工具设置**, then start a new session or rescan; only Agents of the owning preset are affected |
+| An external **需要审批** tool is denied without a composer | the Host's approval policy is `never`, or the call has no approval channel/session | the ask is passed to the Host and denied by policy; the plugin cannot override `never` |
+| External routes answer `500 unavailable` | the Host half mounted without a working external controller (older/corrupt state) | reload after fixing the data directory; discovery and settings are unavailable until it mounts |
+| `400 invalid-tool-name` / `invalid-preset` on external save | the page sent a non-`mcp__` name, a tool name from another preset, or a preset id that disappeared | reload the page and reopen the tab; only names in that preset's discovered set are accepted |
 | Card shows the name's first letter | server not connected, declares no `serverInfo.icons`, the icon URL failed its 5 s/512 KiB/raster checks, or the upload file is missing | draws the fallback letter; the next successful fetch or an upload replaces it |
 | Icon upload answers `400 invalid-icon` | wrong data-URL shape, non-canonical base64, decoded bytes over 512 KiB, or bytes that do not match the declared raster type | nothing is stored; the page shows the reason and keeps the saved server |
 | Icon GET answers `404 no-icon` | no upload and no usable auto icon | the page falls back to the first letter; never treated as a connection error |
@@ -713,7 +852,7 @@ than a silent success.
 
 ## What we did not build
 
-- **MCP resources, resource templates, prompt templates and sampling.** 0.3.0 manages tools and
+- **MCP resources, resource templates, prompt templates and sampling.** 0.4.0 manages tools and
   server instructions only. A server that offers only resources has nothing to expose here (a
   `resource_link` or embedded resource returned *inside* a tool result is projected as text or a
   diagnostic, not managed as a resource).
@@ -724,22 +863,30 @@ than a silent success.
   there are no per-tool preset rules, per-tool timeouts, per-tool schemas or a plugin-owned allowlist.
   Approval delegates to the Host and never replaces its permission system.
 - **OAuth authorization-code / PKCE flows.** Only a static bearer token and the client-credentials
-  grant. A server that requires an interactive browser login cannot be connected in 0.3.0.
+  grant. A server that requires an interactive browser login cannot be connected in 0.4.0.
 - **Built-in artwork or emoji icons.** The icon is either declared by the MCP server or uploaded by
   the operator (ADR 6). There is no emoji picker, no bundled icon set, no SVG upload, and no
   user-entered emoji string.
 - **Per-agent or per-session icons.** An icon belongs to the server, not to the viewer or the
   session; every agent sees the same tile.
 - **Importing, reading or migrating YAML-configured MCP servers.** `@deepseek-ai/dsh-mcp-client`
-  rows in the profile keep working untouched and are not shown in the panel (ADR 2).
+  rows in the profile keep working untouched and are never edited here. The **其他 MCP** tab may
+  hide or gate their tools at runtime, but it never imports, owns or rewrites the rows, their
+  connections or their credentials (ADR 2, ADR 8).
+- **Managing preset-owned servers.** The external tab has no add/edit/delete/test/reconnect path,
+  and the plugin never starts, stops or authenticates a preset's MCP connection.
+- **Configuring the Host's approval policy.** For an external tool marked **需要审批** the plugin
+  only emits an ask through `tools/pre-execute`; whether the ask can be displayed (for example with
+  a `never` policy) is decided by DSH, not here.
 - **Editing presets for the user.** The plugin reads the preset roster and registers tools on
   agents; it never creates or rewrites a preset.
 - **Per-session exposure.** Exposure is decided per agent preset, not per session or per message.
 - **A CRUD CLI.** `bin/mcp-manager.mjs` is maintenance only (`status`, `path`, `clean`); server
   management is the Web page and its HTTP API.
-- **Tool-level permission mapping.** The manager adds no approval layer and no sandbox of its own:
-  a tool call is dispatched to the connected server, and the Host's own tool-execution and
-  permission path decides what is allowed. A stdio server runs as a child of the Host, with the
-  Host user's privileges.
+- **Tool-level permission mapping.** The manager adds no sandbox of its own: a tool call is
+  dispatched to the connected server, and the Host's own tool-execution and permission path decides
+  what is allowed. The one exception is the external **需要审批** ask, which is delegated to the
+  Host's approval pipeline rather than enforced locally. A stdio server runs as a child of the Host,
+  with the Host user's privileges.
 - **Multiple connections per server, load balancing or health probing beyond the one supervisor.**
   One enabled server means one connection.
