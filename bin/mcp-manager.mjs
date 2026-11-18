@@ -21,6 +21,7 @@ import { join, resolve } from 'node:path';
 
 const DATA_DIR_NAME = 'better-mcp-manager';
 const STORE_FILE = 'servers.json';
+const PREFERENCES_FILE = 'preferences.json';
 
 /**
  * Resolve the data directory exactly like `lib/store.js`.
@@ -59,6 +60,23 @@ function readStore(file) {
 }
 
 /**
+ * Read the UI preferences file, treating a missing or damaged file as the
+ * defaults: the sidebar module is off unless a valid document says otherwise.
+ * @param {string} file - Preferences path.
+ * @returns {{ sidebarEntry: boolean }} the effective preferences.
+ */
+function readPreferences(file) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { sidebarEntry: false };
+    if (parsed.version !== 1) return { sidebarEntry: false };
+    return { sidebarEntry: parsed.sidebarEntry === true };
+  } catch {
+    return { sidebarEntry: false };
+  }
+}
+
+/**
  * Print usage.
  * @returns {void}
  */
@@ -85,9 +103,12 @@ function usage() {
  */
 function status(dir) {
   const file = join(dir, STORE_FILE);
+  const preferences = readPreferences(join(dir, PREFERENCES_FILE));
+  const preferenceLine = `sidebar entry module: ${preferences.sidebarEntry ? 'on' : 'off (default)'}\n`;
   process.stdout.write(`data directory: ${dir}\n`);
   if (!existsSync(dir)) {
     process.stdout.write('state: absent (the plugin has never stored a server, or clean already ran)\n');
+    process.stdout.write(preferenceLine);
     return 0;
   }
   let mode = '';
@@ -100,10 +121,12 @@ function status(dir) {
   const read = readStore(file);
   if (read.state === 'missing') {
     process.stdout.write(`store: ${file} does not exist\n`);
+    process.stdout.write(preferenceLine);
     return 0;
   }
   if (read.state === 'invalid') {
     process.stdout.write(`store: ${file} is damaged (${read.reason})\n`);
+    process.stdout.write(preferenceLine);
     return 1;
   }
   const enabled = read.servers.filter((server) => server?.enabled === true).length;
@@ -113,6 +136,7 @@ function status(dir) {
     const state = server?.enabled === true ? 'enabled' : 'disabled';
     process.stdout.write(`  - ${String(server?.id ?? '?')}  ${String(server?.name ?? '?')}  [${String(server?.transport ?? '?')}, ${state}]\n`);
   }
+  process.stdout.write(preferenceLine);
   return 0;
 }
 

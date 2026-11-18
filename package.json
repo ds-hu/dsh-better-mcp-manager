@@ -1,7 +1,7 @@
 {
   "name": "@ds-hu/dsh-better-mcp-manager",
-  "version": "0.4.1",
-  "description": "MCP manager for the DeepSeek Harness Web GUI: add, edit, test and remove MCP servers, choose which agent presets get each server’s tools, manage per-tool exposure and approval, and manage the tools of MCP servers that other presets mount.",
+  "version": "0.5.0",
+  "description": "MCP manager for the DeepSeek Harness Web GUI, in Settings: add, edit, test and remove MCP servers, choose which agent presets get each server’s tools, manage per-tool exposure and approval, and manage the tools of MCP servers that other presets mount. The sidebar entry is an optional module.",
   "type": "module",
   "publishConfig": {
     "access": "public"

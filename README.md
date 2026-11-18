@@ -1,10 +1,10 @@
 # MCP Manager for DeepSeek Harness
 
-**MCP 管理 / MCP Manager** — manage MCP servers from the DeepSeek Harness Web GUI, and decide
+**MCP 管理 / MCP Manager** — manage MCP servers from DeepSeek Harness **Settings**, and decide
 per agent preset whose tools each server hands out.
 
 <p align="center">
-  <img src="docs/screenshots/mcp-manager-sidebar.png" alt="The browser page with MCP 管理 in the sidebar directly below 自动化任务; the page lists three server cards in different states" width="860">
+  <img src="docs/screenshots/mcp-manager-settings.png" alt="The DSH Settings dialog open on the MCP 管理 section; the manager lists three server cards in different states in the settings content column" width="860">
 </p>
 
 <p>
@@ -17,10 +17,13 @@ per agent preset whose tools each server hands out.
 ## What it is
 
 DSH can already use tools from external MCP servers, configured as YAML rows in a profile. This
-plugin turns that into a page: a sidebar entry **MCP 管理** (directly below **自动化任务**) opens a
-full-page manager where you add, edit, group, enable, test and delete MCP servers, and can see for
-each one whether it is connected, which transport it uses, how many tools it offers, and why it
-failed when it did.
+plugin turns that into a management page in DSH's **Settings** panel: **Settings → MCP 管理** opens
+the manager inside the settings dialog, where you add, edit, group, enable, test and delete MCP
+servers, and can see for each one whether it is connected, which transport it uses, how many tools
+it offers, and why it failed when it did.
+
+The old sidebar entry is now an **optional module**, off by default, that you switch on from inside
+the manager (see [Opening the manager](#opening-the-manager)). A fresh install adds no sidebar row.
 
 The part that is not just a form: **each server chooses which agent presets receive its tools**.
 A database MCP server can be given to a backend preset, a browser server to a research preset, and
@@ -35,8 +38,11 @@ ever taking over their connection or credentials.
 
 ## Features
 
-- **Full-page manager** in the sidebar, directly below 自动化任务. Rounded cards, iOS-like toggles
-  and segmented controls, light and dark themes.
+- **The manager lives in DSH Settings**: **Settings → MCP 管理**, in the settings dialog's content
+  column. Rounded cards, iOS-like toggles and segmented controls, light and dark themes.
+- **Optional sidebar entry**: a switch inside the manager shows **MCP 管理** in the sidebar directly
+  below 自动化任务. It is off by default, takes effect immediately, and the choice is persisted by
+  the Host — not in this browser — so every browser and profile on this `$DSH_HOME` sees it.
 - **CRUD + enable/disable** for MCP servers. A disabled server keeps its settings and status, and
   can be re-enabled in one click.
 - **Three transports**: HTTP (Streamable HTTP), SSE, and 内置 / stdio (a local command).
@@ -60,8 +66,41 @@ ever taking over their connection or credentials.
 - **Per-server tool timeout**, default 60 seconds.
 
 <p align="center">
-  <img src="docs/screenshots/mcp-manager-list.png" alt="Mixed-state server list: a connected 内置 server showing its server-provided icon and 工具 2/2, a disabled HTTP server, and a retrying HTTP server with 工具 0/0 and an error bubble" width="820">
+  <img src="docs/screenshots/mcp-manager-list.png" alt="Mixed-state server list in the manager: a connected 内置 server showing its server-provided icon and 工具 2/2, a disabled HTTP server, and a retrying HTTP server with 工具 0/0 and an error bubble" width="820">
 </p>
+
+## Opening the manager
+
+**The default entry is a DSH Settings section.** Open **Settings** from the **设置 / Settings**
+control at the bottom of the sidebar (or with DSH's Settings shortcut), then choose **MCP 管理** in
+the Settings navigation. The manager renders in the settings content column, so the dialog and its section list
+stay available while you work; **Escape** closes it. There is no sidebar entry to click on a fresh
+install — Settings is where you start. The section is **MCP 管理** in Chinese and **MCP Manager** in
+English.
+
+**The sidebar entry is an independent, optional module.** Inside **Settings → MCP 管理**, the switch
+**在侧边栏显示 MCP 管理入口** (English UI: **Show MCP Manager in the sidebar**) adds an **MCP 管理**
+row to the sidebar, directly below **自动化任务**. Clicking the row opens the same manager as its own
+page. Turning the switch off unregisters the row and the page immediately; if the page was open,
+DSH falls back to the Conversation. The section in Settings is always there — only the sidebar
+module is optional.
+
+<p align="center">
+  <img src="docs/screenshots/mcp-manager-sidebar.png" alt="The sidebar with the optional MCP 管理 row enabled directly below 自动化任务, and the manager open as its own page" width="860">
+</p>
+
+The switch is a **Host-side preference**, stored with the rest of the plugin data (see
+[Data and security](#data-and-security)): it is shared by every browser and every profile under the
+same `$DSH_HOME`, survives a page reload and a Host restart, and is *not* a per-browser
+`localStorage` value.
+
+> **Requirement:** the Settings section needs the DSH Settings shell, which the shipped Web app
+> composes. A deployment that composes no settings shell has no Settings navigation entry for the
+> section; the optional sidebar module, once enabled, still opens the manager on its own page.
+
+**Upgrading from 0.4.x?** The manager used to be a sidebar page only. 0.5.0 moves the default entry
+into Settings, so an existing sidebar row disappears after the upgrade until you switch it back on in
+**Settings → MCP 管理**. The stored servers, tool settings and external MCP choices are unchanged.
 
 ## Install
 
@@ -75,14 +114,16 @@ Or use the Web GUI's Plugin Manager (Plugins page → install a bundle), or let 
 with `plugin_manager` (`action: install_bundle`). Reload the Web page; with HMR off, restart the
 DSH Web process. Requirements: DSH 0.2.x with the Web profile, Node.js ≥ 20.19.
 
-After install, **MCP 管理** appears in the sidebar directly below **自动化任务**. The page is
-global — it is the same server list for every session (and every profile sharing this `$DSH_HOME`).
+After install, open **Settings → MCP 管理** (see [Opening the manager](#opening-the-manager)); the
+manager is global — it is the same server list for every session (and every profile sharing this
+`$DSH_HOME`). A fresh install deliberately shows no sidebar row: the sidebar entry is an optional
+module you can switch on from inside the manager.
 
 ## Quick start
 
 ### 1. Add an HTTP MCP server
 
-Press **+ 添加 MCP**, keep 传输类型 on **HTTP**, and fill in:
+Open **Settings → MCP 管理**, press **+ 添加 MCP**, keep 传输类型 on **HTTP**, and fill in:
 
 - **名称** — anything you recognise, e.g. `Docs search`;
 - **服务器图标** — leave **自动（来自 MCP 服务端）**, or use **上传图标** / **恢复自动**
@@ -141,7 +182,7 @@ first. See [Tools](#tools) for what enable and approval actually do.
 
 ### 5. Watch the status
 
-The card's status line updates every 2.5 seconds while the page is open:
+The card's status line updates every 2.5 seconds while the manager is open:
 
 ```
 已连接 · HTTP · 工具 19/19
@@ -205,7 +246,7 @@ survive reconnects and restarts.
   opened for a connected server; a tool added on the server side appears after that refresh.
 - **Saving.** **保存工具设置** stores only deviations from the defaults (a disabled tool, an
   approval-required tool), re-binds every live agent immediately and updates the card counts. The
-  page stays on the tab and confirms **工具设置已保存** or shows the failure.
+  manager stays on the tab and confirms **工具设置已保存** or shows the failure.
 
 <p align="center">
   <img src="docs/screenshots/mcp-manager-form-tools.png" alt="The 工具 tab: 工具列表 with 已启用 2/2, 全部开启/全部关闭, per-tool switches and 需要审批, parameter chips and 保存工具设置" width="820">
@@ -213,13 +254,13 @@ survive reconnects and restarts.
 
 ## Other MCP
 
-Some MCP servers are not added on this page: an agent preset or another plugin can mount its own
+Some MCP servers are not added in this manager: an agent preset or another plugin can mount its own
 `@deepseek-ai/dsh-mcp-client` rows. Those servers stay owned by that preset. This manager never
 edits that YAML, never connects or disconnects those servers, and never reads their credentials —
 but it can do the two things a Host plugin may safely do at runtime: **remove an inherited tool from
 the model's tool list** and **make a call ask for approval** outside full-access sessions.
 
-The page has two tabs: **本插件 MCP** (everything described above) and **其他 MCP**:
+The manager has two tabs: **本插件 MCP** (everything described above) and **其他 MCP**:
 
 - **Grouped by preset, marked 预设自带, shown as a compact list.** Each preset that mounts MCP
   servers gets a group with its name, id, the **预设自带** badge and its tool count; under it, one
@@ -255,15 +296,21 @@ The page has two tabs: **本插件 MCP** (everything described above) and **其�
 
 ## Data and security
 
-- All plugin state is two JSON files inside `$DSH_HOME/better-mcp-manager/` (mode `0700`):
-  `servers.json` for the servers this plugin owns and `external.json` for preset-owned MCP tool
-  settings and descriptors, plus uploaded icons in `icons/` (each file `0600`). Nothing is written
-  to the profile, to preset YAML or to the sessions directory. Mounting the plugin creates the data
+- All plugin state is three JSON files inside `$DSH_HOME/better-mcp-manager/` (mode `0700`):
+  `servers.json` for the servers this plugin owns, `external.json` for preset-owned MCP tool settings
+  and descriptors, and `preferences.json` for UI preferences (today: whether the optional sidebar
+  entry is on), plus uploaded icons in `icons/` (each file `0600`). Nothing is written to the
+  profile, to preset YAML or to the sessions directory. Mounting the plugin creates the data
   directory; `servers.json` appears when you save the first server, `external.json` on the first save
-  on the 其他 MCP tab. Server-declared HTTP icons are fetched by the Host and cached in memory only —
-  they are never written to disk. Per-tool enable/approval choices and the cached tool descriptors
-  (name, public name, description, parameter names, timestamps) are stored in those JSON files; the
-  caches never contain headers, tokens or other credentials.
+  on the 其他 MCP tab, and `preferences.json` the first time you change the sidebar-entry switch.
+  Server-declared HTTP icons are fetched by the Host and cached in memory only — they are never
+  written to disk. Per-tool enable/approval choices and the cached tool descriptors (name, public
+  name, description, parameter names, timestamps) are stored in those JSON files; the caches never
+  contain headers, tokens or other credentials.
+- **The sidebar-entry preference is Host-side, not browser-side.** It lives in `preferences.json`
+  (`{ "version": 1, "sidebarEntry": false }`) and is served by
+  `GET`/`PUT /better-mcp-manager/api/preferences`, so every browser — and every profile sharing this
+  `$DSH_HOME` — follows the same choice. There is no per-browser `localStorage` switch.
 - **Secrets are stored in `servers.json` in plaintext**: custom header values, a bearer token and a
   `client_credentials` secret. Protect the machine and the file; do not commit it, paste it into an
   issue, or copy it to a shared host.
@@ -278,13 +325,13 @@ The page has two tabs: **本插件 MCP** (everything described above) and **其�
 - **A stdio server is a program you ask DSH to run.** Only add commands you trust. HTTP servers
   receive the headers and tokens you configure, including for their declared icon URL.
 
-The JSON file is small and readable; keep a copy of the directory if you want to restore the list
-and the icons, or delete it with the clean CLI (below) to remove every trace.
+The JSON files are small and readable; keep a copy of the directory if you want to restore the list,
+the preference and the icons, or delete it with the clean CLI (below) to remove every trace.
 
 ## Uninstall
 
 Remove the bundle, then delete the one data directory (server list, per-tool settings, preset-owned
-MCP settings and uploaded icons):
+MCP settings, the sidebar-entry preference and uploaded icons):
 
 ```bash
 # 1. remove the bundle — CLI, Plugins page (Remove), or plugin_manager remove_bundle
@@ -298,19 +345,27 @@ From a checkout, the same command is `node bin/mcp-manager.mjs clean --yes`. The
 is `rm -rf "$DSH_HOME/better-mcp-manager"`. The remove command drops the dependency and the bundle
 row itself, so nothing is left in the profile: no install scripts ran, and there are no services or
 timers to clean up. `clean` is the only remaining step, and only because the server list is yours to
-keep or delete; it removes the whole directory, including `icons/`. Reload the page afterwards: a
-page that was already open remembers the old sidebar entry until it reloads.
+keep or delete; it removes the whole directory, including `preferences.json` and `icons/`. Reload
+the page afterwards: a page that was already open keeps showing the old Settings section and, if it
+was on, the old sidebar entry until it reloads.
 
 `clean` **requires `--yes`** — without it the command refuses and exits non-zero, so it is safe to
 run by accident. It also refuses any directory that is not a `better-mcp-manager` data directory,
 and prints the path it removed. `node bin/mcp-manager.mjs status` (the default command) shows what
-is stored (directory mode, schema, servers, enabled count), and `node bin/mcp-manager.mjs path`
-prints the data directory. Both only read.
+is stored (directory mode, schema, servers, enabled count, and whether the optional sidebar module
+is on), and `node bin/mcp-manager.mjs path` prints the data directory. Both only read.
 
 ## Compatibility and limitations
 
-- **Tools and server instructions only.** 0.4.1 does not expose MCP resources, resource templates,
-  prompt templates or sampling. A server that offers only resources has nothing to show here.
+- **The Settings section needs the DSH Settings shell.** The shipped Web app composes it; a
+  deployment that composes no settings shell has no navigation entry for the section. The optional
+  sidebar module, once enabled, still opens the manager on its own page.
+- **The sidebar entry is opt-in and Host-side.** A fresh install adds no sidebar row. The switch in
+  the manager writes a Host preference shared by every browser and every profile under the same
+  `$DSH_HOME`; it is not per-browser `localStorage`, and a different `$DSH_HOME` has its own choice.
+- **Tools and server instructions only.** The manager does not expose MCP resources, resource
+  templates, prompt templates or sampling. A server that offers only resources has nothing to show
+  here.
 - **One connection per enabled server**, shared by every agent the server is exposed to. Tools are
   registered per agent preset and per tool: only the enabled tools of an allowed server reach an
   agent.
@@ -321,7 +376,7 @@ prints the data directory. Both only read.
   **需要审批** tool runs without asking; every other preset asks. If the Host exposes no approval
   service (or the call has no agent), an approval-required tool is denied rather than allowed.
 - **OAuth settings are bearer or client-credentials only.** There is no authorization-code/PKCE
-  flow, so a server that requires an interactive browser login cannot be connected in 0.4.1.
+  flow, so a server that requires an interactive browser login cannot be connected here.
 - **No YAML import or migration.** MCP servers configured through the built-in
   `@deepseek-ai/dsh-mcp-client` rows keep working untouched. The **其他 MCP** tab can hide or gate
   their tools, but it never imports, edits or owns those rows; deleting anything on this page never
@@ -372,13 +427,17 @@ prints the data directory. Both only read.
 | **其他 MCP** shows a preset but no tools | The preset mounts an MCP client but no live session of it exists yet. Open one session with that preset; the placeholder explains this. |
 | A toggle in **其他 MCP** does nothing | Press that preset's **保存工具设置** — switches are local until saved (the save button enables only when something changed). |
 | A **需要审批** external tool is denied without a prompt | Your DSH approval policy may be `never`, which denies asks rather than displaying them. Change the policy in DSH or run in a restricted preset that can ask. |
+| There is no **MCP 管理** row in the sidebar | That row belongs to the optional sidebar module, which is off by default. Open **Settings → MCP 管理** and turn on **在侧边栏显示 MCP 管理入口**; the switch stores a Host preference, so it survives reloads. |
+| **MCP 管理** is missing from the Settings navigation | The deployment may compose no DSH Settings shell (the shipped Web app includes it), or the Host half is not running: check that the bundle is enabled and `GET /better-mcp-manager/api/health` answers. |
+| The sidebar switch is already on in another browser | That is expected: the preference is stored by the Host in `preferences.json`, so every browser and profile on this `$DSH_HOME` shares it (other open tabs pick it up on their next load). |
+| Turning the sidebar switch off while the page is open shows the conversation | That is the documented fallback: the module unregisters its page and row immediately; reopen the manager from **Settings → MCP 管理**. |
 | The page shows an empty list with no error | The Host half is not running: check that the bundle is enabled and `GET /better-mcp-manager/api/health` answers. |
 
 ## Documentation
 
 | Document | What is in it |
 |---|---|
-| [docs/TECHNICAL.md](docs/TECHNICAL.md) | Architecture, icon model, tool management, preset-owned MCP, approval seams, data model, HTTP API, security, lifecycle, uninstall, testing |
+| [docs/TECHNICAL.md](docs/TECHNICAL.md) | Architecture, the Settings entry and optional sidebar module, icon model, tool management, preset-owned MCP, approval seams, data model, HTTP API, security, lifecycle, uninstall, testing |
 | [CONTEXT.md](CONTEXT.md) | The vocabulary and invariants this plugin is built on |
 | [docs/adr](docs/adr) | Why the design is what it is |
 | [docs/API-CONTRACT.md](docs/API-CONTRACT.md) | The frozen Host/Client/data contract |

@@ -59,6 +59,16 @@ function store(servers) {
   return `${JSON.stringify({ version: 1, servers }, null, 2)}\n`;
 }
 
+/** One valid UI preferences document (the optional sidebar module toggle). */
+function preferences(sidebarEntry) {
+  return `${JSON.stringify({ version: 1, sidebarEntry }, null, 2)}\n`;
+}
+
+/** The last line a command printed (the sidebar module line closes `status`). */
+function lastLine(stdout) {
+  return stdout.trimEnd().split('\n').at(-1);
+}
+
 const enabled = { id: 'srv_1f3c9a2b70', key: 'alpha', name: 'Alpha', enabled: true, transport: 'http', headers: [], oauth: { mode: 'none' } };
 const disabled = { id: 'srv_2a4d8e0c13', key: 'beta', name: 'Beta', enabled: false, transport: 'sse', headers: [], oauth: { mode: 'none' } };
 
@@ -74,6 +84,7 @@ test('cli: status on a never-used home reports absence without failing', async (
   const result = run({ args: ['status'], env: { DSH_HOME: home } });
   assert.equal(result.status, 0);
   assert.match(result.stdout, /state: absent/u);
+  assert.equal(lastLine(result.stdout), 'sidebar entry module: off (default)', 'with no data the module is off');
 });
 
 test('cli: status reads the store and counts enabled servers', async (t) => {
@@ -98,6 +109,46 @@ test('cli: status reports a damaged store with exit code 1', async (t) => {
   assert.match(result.stdout, /damaged/u);
 });
 
+test('cli: status prints the optional sidebar module state after the servers block', async (t) => {
+  const { home, dataDir } = await isolatedHome(t);
+  await mkdir(dataDir, { recursive: true, mode: 0o700 });
+  await writeFile(join(dataDir, 'servers.json'), store([enabled]));
+  const preferencesFile = join(dataDir, 'preferences.json');
+
+  await writeFile(preferencesFile, preferences(true));
+  const on = run({ args: ['status'], env: { DSH_HOME: home } });
+  assert.equal(on.status, 0);
+  assert.match(on.stdout, /sidebar entry module: on/u);
+  assert.ok(on.stdout.indexOf('servers: 1') < on.stdout.indexOf('sidebar entry module:'), 'the module line follows the servers block');
+  assert.equal(lastLine(on.stdout), 'sidebar entry module: on');
+
+  await writeFile(preferencesFile, preferences(false));
+  const off = run({ args: ['status'], env: { DSH_HOME: home } });
+  assert.equal(off.status, 0);
+  assert.equal(lastLine(off.stdout), 'sidebar entry module: off (default)');
+});
+
+test('cli: status treats a missing or damaged preferences file as the sidebar module off', async (t) => {
+  const { home, dataDir } = await isolatedHome(t);
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(join(dataDir, 'servers.json'), store([enabled]));
+  const preferencesFile = join(dataDir, 'preferences.json');
+
+  const missing = run({ args: ['status'], env: { DSH_HOME: home } });
+  assert.equal(missing.status, 0);
+  assert.equal(lastLine(missing.stdout), 'sidebar entry module: off (default)');
+
+  await writeFile(preferencesFile, '{ this is not json');
+  const corrupt = run({ args: ['status'], env: { DSH_HOME: home } });
+  assert.equal(corrupt.status, 0, 'a damaged UI preference must not fail the whole status');
+  assert.equal(lastLine(corrupt.stdout), 'sidebar entry module: off (default)');
+
+  await writeFile(preferencesFile, JSON.stringify({ version: 9, sidebarEntry: true }));
+  const unknown = run({ args: ['status'], env: { DSH_HOME: home } });
+  assert.equal(unknown.status, 0);
+  assert.equal(lastLine(unknown.stdout), 'sidebar entry module: off (default)', 'an unknown schema falls back to the default');
+});
+
 test('cli: clean refuses without --yes and keeps the data', async (t) => {
   const { home, dataDir } = await isolatedHome(t);
   await mkdir(dataDir, { recursive: true });
@@ -112,6 +163,7 @@ test('cli: clean --yes removes the data directory', async (t) => {
   const { home, dataDir } = await isolatedHome(t);
   await mkdir(dataDir, { recursive: true });
   await writeFile(join(dataDir, 'servers.json'), store([]));
+  await writeFile(join(dataDir, 'preferences.json'), preferences(true));
   const result = run({ args: ['clean', '--yes'], env: { DSH_HOME: home } });
   assert.equal(result.status, 0);
   assert.match(result.stdout, /removed/u);

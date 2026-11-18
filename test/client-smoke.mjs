@@ -7,8 +7,10 @@
  * at it, so this script is its compiler. It runs the real file in a `vm` with a
  * fake browser, calls the real factory with a fake `require`, calls the real
  * `apply` with a mock Cordis context, and asserts the registrations the Web
- * shell depends on were actually made — both slots, the locale dictionaries,
- * the stylesheet, and the timers that must not outlive dispose.
+ * shell depends on were actually made — the always-present Settings section and
+ * its icon, the optional sidebar module the Host preference switches on and
+ * off live, the locale dictionaries, the stylesheet, and the timers that must
+ * not outlive dispose.
  *
  * Some checks are static (`require()` allow-list, API base string): the client
  * may never require anything but `react`, and it may only talk to the Host
@@ -141,6 +143,22 @@ if (source !== '') {
     assert.ok(viewBody.includes('external-back'), 'the detail view has a back button');
     assert.ok(viewBody.includes('external-enable-all') && viewBody.includes('external-disable-all'), 'the detail view has the batch buttons');
     assert.ok(viewBody.includes('external-count'), 'the detail view shows the tools.count line');
+  });
+
+  check('the Settings entry and the optional sidebar module carry their test hooks', () => {
+    for (const token of ['"settings.section"', '"settings.section.icon"', '"sidebar.panellist"', '"main"']) {
+      assert.ok(source.includes(`ctx.slots.inject(${token}`) || source.includes(`inject(${token}`), `lib/client.js never injects the ${token} slot type`);
+    }
+    for (const testId of ['sidebar-entry-row', 'sidebar-entry-toggle']) {
+      assert.ok(source.includes(`"${testId}"`), `lib/client.js is missing data-testid="${testId}"`);
+    }
+    assert.match(source, /"data-mode"/u, 'the manager root must carry data-mode so Settings mode can be styled/asserted');
+    assert.match(source, /role:\s*"switch"/u, 'the sidebar-entry control must be a switch');
+    assert.match(source, /"aria-checked"/u, 'the sidebar-entry switch must expose aria-checked');
+    assert.match(source, /\/preferences/u, 'the client must call the Host preference endpoint');
+    assert.match(source, /sidebarEntry/u, 'the client must follow the Host sidebarEntry preference');
+    assert.match(source, /SETTINGS_ORDER\s*=\s*30|order:\s*30/u, 'the Settings section order must be 30');
+    assert.match(source, /SIDEBAR_ORDER\s*=\s*20|order:\s*20/u, 'the optional sidebar row order must be 20');
   });
 
   check('the browser half never imports a Harness package', () => {
@@ -277,24 +295,51 @@ function createReact() {
   };
 }
 
+const PREFERENCES_URL = '/better-mcp-manager/api/preferences';
+
+/** Yield a few event-loop turns so mocked fetches and their promise chains settle. */
+async function settle(turns = 8) {
+  for (let turn = 0; turn < turns; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 /**
  * Load the browser bundle exactly the way the shell does and apply it.
- * @returns {object} the loaded plugin plus everything it registered.
+ *
+ * The mock Cordis slot ledger mirrors the real dynamic API: `inject(name, cb)`
+ * invokes the callback immediately and returns its cleanup, and `register()`
+ * returns a disposer that removes exactly that entry. That lets the checks
+ * observe the optional sidebar module appearing and disappearing live.
+ *
+ * @param {{ sidebarEntry?: boolean }} [options] - Host preference answered by the mock.
+ * @returns {Promise<object>} the loaded plugin plus everything it registered.
  */
-function loadBundle() {
+async function loadBundle({ sidebarEntry = false } = {}) {
   const appended = [];
   const timers = createTimers();
   const document = createDocument(appended);
   const fetchCalls = [];
+  const preferences = { sidebarEntry: sidebarEntry === true };
+  const respond = (payload) => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => payload,
+    text: async () => JSON.stringify(payload),
+  });
   const fetch = async (url, init) => {
-    fetchCalls.push({ url: String(url), init });
-    return {
-      ok: true,
-      status: 200,
-      headers: { get: () => 'application/json' },
-      json: async () => ({ ok: true, servers: [], presets: [], groups: [], version: '0.1.0' }),
-      text: async () => '{"ok":true}',
-    };
+    const target = String(url);
+    const method = String(init?.method ?? 'GET').toUpperCase();
+    fetchCalls.push({ url: target, init });
+    if (target === PREFERENCES_URL) {
+      if (method === 'PUT') {
+        const body = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+        if (typeof body.sidebarEntry === 'boolean') preferences.sidebarEntry = body.sidebarEntry;
+      }
+      return respond({ ok: true, preferences: { sidebarEntry: preferences.sidebarEntry } });
+    }
+    return respond({ ok: true, servers: [], presets: [], groups: [], version: '0.1.0' });
   };
   const sandbox = {
     console,
@@ -399,17 +444,34 @@ function loadBundle() {
     slots: {
       inject(name, callback) {
         log.injected.push(name);
-        callback();
+        const start = log.slots.length;
+        const cleanup = callback();
+        const created = log.slots.slice(start);
+        let disposed = false;
+        return () => {
+          if (disposed) return;
+          disposed = true;
+          if (typeof cleanup === 'function') cleanup();
+          for (const entry of created) {
+            const index = log.slots.indexOf(entry);
+            if (index >= 0) log.slots.splice(index, 1);
+          }
+        };
       },
       register(definition, component) {
-        log.slots.push({ definition, component });
+        const entry = { definition, component };
+        log.slots.push(entry);
         return () => {
-          log.slots = log.slots.filter((entry) => entry.definition !== definition);
+          const index = log.slots.indexOf(entry);
+          if (index >= 0) log.slots.splice(index, 1);
         };
       },
     },
   };
   loaded.apply(ctx);
+  // The initial preferences read is asynchronous on purpose; let it settle so
+  // the default (off) still mounts nothing.
+  await settle();
   return { registration, exports: loaded, log, timers, appended, disposers, dictionaries };
 }
 
@@ -419,10 +481,37 @@ function loadBundle() {
 
 let bundle = null;
 try {
-  bundle = source === '' ? null : loadBundle();
+  bundle = source === '' ? null : await loadBundle();
 } catch (error) {
   loadError = error;
   process.stdout.write(`FAIL lib/client.js could not be loaded\n     ${String(error.stack ?? error.message).split('\n').slice(0, 8).join('\n     ')}\n`);
+}
+
+/* A second instance whose Host preference is already true at load time. */
+let prefOnBundle = null;
+let prefOnError = null;
+if (source !== '') {
+  try {
+    prefOnBundle = await loadBundle({ sidebarEntry: true });
+  } catch (error) {
+    prefOnError = error;
+  }
+}
+
+/**
+ * Run one async labelled assertion without aborting the audit.
+ * @param {string} label - What is being checked.
+ * @param {() => Promise<void>} fn - The check.
+ * @returns {Promise<void>} resolves when done.
+ */
+async function checkAsync(label, fn) {
+  try {
+    await fn();
+    process.stdout.write(`ok   ${label}\n`);
+  } catch (error) {
+    failures.push(`${label}: ${error.message}`);
+    process.stdout.write(`FAIL ${label}\n     ${String(error.message).split('\n').join('\n     ')}\n`);
+  }
 }
 
 /**
@@ -454,38 +543,68 @@ check('the plugin asks for the slots and locale services', () => {
   assert.ok(loaded.exports.inject.includes('locale'), `inject must include "locale", got ${JSON.stringify(loaded.exports.inject)}`);
 });
 
-check('exactly two slots are registered', () => {
+check('the default entry is the Settings section and its icon, nothing else', () => {
   const loaded = bundleOrFail();
   const names = loaded.log.injected.slice().sort();
-  assert.deepEqual(names, ['main', 'sidebar.panellist'], 'the client registers the sidebar entry and the page, nothing else');
+  assert.deepEqual(names, ['settings.section', 'settings.section.icon'], 'a fresh install registers the Settings section (and its nav icon) only; the sidebar module is opt-in');
   assert.equal(loaded.log.slots.length, 2, `expected two slot registrations, got ${loaded.log.slots.length}`);
-  assert.deepEqual(loaded.log.slots.map((slot) => slot.definition.name).sort(), ['main', 'sidebar.panellist']);
+  assert.deepEqual(loaded.log.slots.map((slot) => slot.definition.name).sort(), ['settings.section', 'settings.section.icon']);
+  assert.equal(loaded.log.slots.some((slot) => slot.definition.name === 'main' || slot.definition.name === 'sidebar.panellist'), false, 'no sidebar/module entry may exist while the Host preference is off');
 });
 
-check('the sidebar panellist entry is registered as agreed', () => {
+check('the Settings section is registered as agreed', () => {
   const loaded = bundleOrFail();
-  const slot = loaded.log.slots.find((entry) => entry.definition.name === 'sidebar.panellist');
-  assert.ok(slot, 'sidebar.panellist was not registered');
+  const slot = loaded.log.slots.find((entry) => entry.definition.name === 'settings.section');
+  assert.ok(slot, 'settings.section was not registered');
   const { definition, component } = slot;
-  assert.equal(definition.id, 'mcp-manager', 'sidebar.panellist id must be "mcp-manager" (docs/API-CONTRACT.md §5)');
-  assert.equal(definition.order, 20, 'sidebar.panellist order must be 20');
-  assert.equal(definition.locale, 'mcpManager', 'the panel locale namespace must be "mcpManager"');
-  assert.equal(typeof definition.label, 'function', 'the panel needs a label function for the sidebar');
-  assert.equal(typeof component, 'function', 'the sidebar entry needs an icon/component');
+  assert.equal(definition.id, 'mcp-manager', 'settings.section id must be "mcp-manager"');
+  assert.equal(definition.order, 30, 'settings.section order must be 30');
+  assert.equal(definition.locale, 'mcpManager', 'the section locale namespace must be "mcpManager"');
+  assert.equal(typeof definition.label, 'function', 'the section needs a label thunk for the nav rail');
+  assert.equal(typeof component, 'function', 'the section needs a component');
   const label = definition.label();
   assert.equal(typeof label, 'string', 'label() must return a translated string');
-  assert.ok(label.trim().length > 0, 'label() returned an empty string');
   assert.notEqual(label, 'panel', 'label() returned the raw key; the locale dictionary is not wired up');
+  assert.match(label, /MCP\s*管理/u, 'the zh nav label must read MCP 管理');
 });
 
-check('the main page is registered under the same key', () => {
+check('the Settings section icon is registered under the same id', () => {
   const loaded = bundleOrFail();
-  const slot = loaded.log.slots.find((entry) => entry.definition.name === 'main');
-  assert.ok(slot, 'the main slot was not registered');
+  const slot = loaded.log.slots.find((entry) => entry.definition.name === 'settings.section.icon');
+  assert.ok(slot, 'settings.section.icon was not registered; the nav would fall back to the gear glyph');
   const { definition, component } = slot;
-  assert.equal(definition.key, 'mcp-manager', 'the main page key must be "mcp-manager"');
-  assert.equal(definition.locale, 'mcpManager', 'the page locale namespace must be "mcpManager"');
-  assert.equal(typeof component, 'function', 'the main slot needs a page component');
+  assert.equal(definition.id, 'mcp-manager', 'settings.section.icon id must match the section id');
+  assert.equal(definition.order, 30, 'settings.section.icon order must be 30');
+  assert.equal(definition.locale, 'mcpManager', 'the icon locale namespace must be "mcpManager"');
+  assert.equal(typeof component, 'function', 'the icon slot needs a component');
+});
+
+check('a Host preference of sidebarEntry=true mounts the optional module on load', () => {
+  assert.equal(prefOnError, null, prefOnError === null ? '' : `the sidebar-enabled bundle did not load: ${prefOnError.message}`);
+  const loaded = prefOnBundle;
+  assert.ok(loaded, 'the sidebar-enabled bundle did not load');
+  const names = loaded.log.injected.slice().sort();
+  assert.deepEqual(names, ['main', 'settings.section', 'settings.section.icon', 'sidebar.panellist'], 'the preference must add the panel row and the main page on top of the Settings entry');
+  assert.equal(loaded.log.slots.length, 4, `expected four slot registrations, got ${loaded.log.slots.length}`);
+  assert.equal(loaded.exports.__mcpTest.isSidebarEntryMounted(), true);
+  assert.equal(loaded.exports.__mcpTest.getPreferences().sidebarEntry, true);
+
+  const panellist = loaded.log.slots.find((entry) => entry.definition.name === 'sidebar.panellist');
+  assert.ok(panellist, 'sidebar.panellist was not registered');
+  assert.equal(panellist.definition.id, 'mcp-manager', 'sidebar.panellist id must be "mcp-manager" (docs/API-CONTRACT.md §5)');
+  assert.equal(panellist.definition.order, 20, 'sidebar.panellist order must be 20');
+  assert.equal(panellist.definition.locale, 'mcpManager', 'the panel locale namespace must be "mcpManager"');
+  assert.equal(typeof panellist.definition.label, 'function', 'the panel needs a label function for the sidebar');
+  assert.equal(typeof panellist.component, 'function', 'the sidebar entry needs an icon/component');
+  const label = panellist.definition.label();
+  assert.equal(typeof label, 'string', 'label() must return a translated string');
+  assert.notEqual(label, 'panel', 'label() returned the raw key; the locale dictionary is not wired up');
+
+  const main = loaded.log.slots.find((entry) => entry.definition.name === 'main');
+  assert.ok(main, 'the main slot was not registered while the module is on');
+  assert.equal(main.definition.key, 'mcp-manager', 'the main page key must be "mcp-manager"');
+  assert.equal(main.definition.locale, 'mcpManager', 'the page locale namespace must be "mcpManager"');
+  assert.equal(typeof main.component, 'function', 'the main slot needs a page component');
 });
 
 check('one locale namespace carries zh and en dictionaries', () => {
@@ -506,6 +625,73 @@ check('the zh and en dictionaries cover the same keys', () => {
   const missingInZh = enKeys.filter((key) => !zhKeys.includes(key));
   assert.deepEqual(missingInEn, [], `keys missing from en: ${missingInEn.join(', ')}`);
   assert.deepEqual(missingInZh, [], `keys missing from zh: ${missingInZh.join(', ')}`);
+});
+
+check('the Settings entry row copy matches the contract in both languages', () => {
+  const loaded = bundleOrFail();
+  const { zh, en } = loaded.log.locale[0].dictionary;
+  assert.equal(zh['entry.sidebar'], '在侧边栏显示 MCP 管理入口', 'the zh switch label is part of the locked contract');
+  assert.equal(en['entry.sidebar'], 'Show MCP Manager in the sidebar', 'the en switch label is part of the locked contract');
+  for (const [locale, dictionary] of [['zh', zh], ['en', en]]) {
+    for (const key of ['entry.sidebarHint', 'entry.loadFailed', 'entry.saveFailed']) {
+      assert.equal(typeof dictionary[key], 'string', `${locale}["${key}"] is missing; the Settings row needs its hint/error copy`);
+      assert.ok(dictionary[key].trim().length > 0, `${locale}["${key}"] is empty`);
+    }
+  }
+  assert.match(zh['entry.loadFailed'], /\{message\}/u, 'entry.loadFailed must carry the {message} placeholder');
+  assert.match(en['entry.saveFailed'], /\{message\}/u, 'entry.saveFailed must carry the {message} placeholder');
+});
+
+check('the client exposes the sidebar-entry preference hooks', () => {
+  const api = bundleOrFail().exports.__mcpTest;
+  for (const name of ['loadPreferences', 'setSidebarEntryPreference', 'isSidebarEntryMounted', 'getPreferences']) {
+    assert.equal(typeof api[name], 'function', `__mcpTest.${name} must be a function for the offline suite`);
+  }
+});
+
+check('the initial Host preference read settles with the module off by default', () => {
+  const loaded = bundleOrFail();
+  const reads = loaded.log.fetchCalls.filter((call) => call.url === PREFERENCES_URL && String(call.init?.method ?? 'GET').toUpperCase() === 'GET');
+  assert.ok(reads.length >= 1, 'apply must read GET /better-mcp-manager/api/preferences so the Host decides whether the sidebar module exists');
+  assert.equal(loaded.exports.__mcpTest.getPreferences().sidebarEntry, false);
+  assert.equal(loaded.exports.__mcpTest.isSidebarEntryMounted(), false);
+});
+
+await checkAsync('setSidebarEntryPreference(true) mounts the module live and PUTs the preference', async () => {
+  const loaded = bundleOrFail();
+  const api = loaded.exports.__mcpTest;
+  const before = loaded.log.fetchCalls.length;
+  await api.setSidebarEntryPreference(true);
+  await settle();
+  const puts = loaded.log.fetchCalls.slice(before).filter((call) => call.url === PREFERENCES_URL && String(call.init?.method ?? 'GET').toUpperCase() === 'PUT');
+  assert.equal(puts.length, 1, `expected exactly one PUT /preferences, got ${puts.length}`);
+  assert.deepEqual(JSON.parse(puts[0].init.body), { sidebarEntry: true }, 'the PUT body must be exactly { sidebarEntry: true }');
+  assert.deepEqual(loaded.log.slots.map((slot) => slot.definition.name).sort(), ['main', 'settings.section', 'settings.section.icon', 'sidebar.panellist'], 'turning the switch on must register the sidebar module immediately');
+  assert.equal(api.isSidebarEntryMounted(), true);
+  assert.equal(api.getPreferences().sidebarEntry, true);
+});
+
+await checkAsync('setSidebarEntryPreference(false) unmounts both sidebar registrations live', async () => {
+  const loaded = bundleOrFail();
+  const api = loaded.exports.__mcpTest;
+  const before = loaded.log.fetchCalls.length;
+  await api.setSidebarEntryPreference(false);
+  await settle();
+  const puts = loaded.log.fetchCalls.slice(before).filter((call) => call.url === PREFERENCES_URL && String(call.init?.method ?? 'GET').toUpperCase() === 'PUT');
+  assert.equal(puts.length, 1, `expected exactly one PUT /preferences, got ${puts.length}`);
+  assert.deepEqual(JSON.parse(puts[0].init.body), { sidebarEntry: false }, 'the PUT body must be exactly { sidebarEntry: false }');
+  assert.deepEqual(loaded.log.slots.map((slot) => slot.definition.name).sort(), ['settings.section', 'settings.section.icon'], 'turning the switch off must unregister both entries immediately');
+  assert.equal(api.isSidebarEntryMounted(), false);
+  assert.equal(api.getPreferences().sidebarEntry, false);
+});
+
+await checkAsync('the module remounts cleanly after a second switch-on', async () => {
+  const loaded = bundleOrFail();
+  const api = loaded.exports.__mcpTest;
+  await api.setSidebarEntryPreference(true);
+  await settle();
+  assert.equal(loaded.log.slots.length, 4, `expected four slot registrations after remount, got ${loaded.log.slots.length}`);
+  assert.deepEqual(loaded.log.slots.map((slot) => slot.definition.name).sort(), ['main', 'settings.section', 'settings.section.icon', 'sidebar.panellist'], 'the same four entries must be re-registered (no duplicates, no strays)');
 });
 
 check('the dictionaries carry every label the panel needs', () => {

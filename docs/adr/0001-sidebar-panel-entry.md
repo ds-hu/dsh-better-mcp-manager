@@ -1,7 +1,13 @@
 # 1. MCP 管理 is a sidebar panel entry with a main page, directly under 自动化任务
 
 Date: 2026-11-16
-Status: accepted
+Status: superseded by [ADR 9](0009-settings-entry-with-optional-sidebar-module.md)
+
+> **Superseded in 0.5.0.** The sidebar entry described here is no longer the only entry. The manager
+> now lives in a DSH **Settings** section by default (always registered), and this sidebar row became
+> an independent optional module, off by default, configured by a Host-side preference. The reasoning
+> below is kept as history; [ADR 9](0009-settings-entry-with-optional-sidebar-module.md) records the
+> decision that replaced it.
 
 ## Context
 

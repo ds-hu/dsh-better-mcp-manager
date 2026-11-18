@@ -95,6 +95,33 @@ function shippedSourceFiles() {
   return files;
 }
 
+/**
+ * Extract a top-level function body from source text, brace-balanced.
+ *
+ * The client is a classic script without a parser API here; this is enough for
+ * the one structural question "what does apply() itself register?" without
+ * pulling in a full AST dependency.
+ * @param {string} text - Source file contents.
+ * @param {string} header - Function header text, e.g. "function apply(".
+ * @returns {string} the body including its braces, or '' when absent.
+ */
+function functionBody(text, header) {
+  const start = text.indexOf(header);
+  if (start < 0) return '';
+  const open = text.indexOf('{', start + header.length);
+  if (open < 0) return '';
+  let depth = 0;
+  for (let index = open; index < text.length; index += 1) {
+    const character = text[index];
+    if (character === '{') depth += 1;
+    else if (character === '}') {
+      depth -= 1;
+      if (depth === 0) return text.slice(open, index + 1);
+    }
+  }
+  return '';
+}
+
 /* ---------------------------------------------------------------- */
 /* Host module                                                       */
 /* ---------------------------------------------------------------- */
@@ -133,6 +160,7 @@ check('the Host half asks for the web server service', () => {
 /* ---------------------------------------------------------------- */
 
 const manifest = JSON.parse(read('package.json'));
+const clientSource = read('lib/client.js');
 const patchPath = 'cordis.patch.yml';
 const hostPatch = existsSync(join(root, patchPath)) ? read(patchPath) : '';
 
@@ -198,6 +226,45 @@ check('the web client entry is declared', () => {
     manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-locale'),
     `dsh.client.inject must include the locale client package, got ${JSON.stringify(manifest.dsh.client.inject)}`,
   );
+});
+
+check('the browser half declares the Settings entry and the optional sidebar module', () => {
+  assert.match(clientSource, /ctx\.slots\.inject\(\s*["']settings\.section["']/u, 'lib/client.js must register the always-present settings.section contribution');
+  assert.match(clientSource, /ctx\.slots\.inject\(\s*["']settings\.section\.icon["']/u, 'lib/client.js must register the matching settings.section.icon contribution');
+  assert.match(clientSource, /["']sidebar\.panellist["']/u, 'lib/client.js must be able to register the optional sidebar row');
+  assert.match(clientSource, /ctx\.slots\.inject\(\s*["']main["']/u, 'lib/client.js must be able to register the optional main page');
+  assert.match(clientSource, /"data-mode"/u, 'the manager root must expose data-mode so Settings embedding is distinguishable');
+  for (const testId of ['sidebar-entry-row', 'sidebar-entry-toggle']) {
+    assert.match(clientSource, new RegExp(`"${testId}"`, 'u'), `lib/client.js is missing data-testid="${testId}"`);
+  }
+  assert.match(clientSource, /role:\s*"switch"/u, 'the sidebar-entry control must be a switch');
+  for (const hook of ['loadPreferences', 'setSidebarEntryPreference', 'isSidebarEntryMounted', 'getPreferences']) {
+    assert.match(clientSource, new RegExp(hook, 'u'), `lib/client.js must expose __mcpTest.${hook}`);
+  }
+});
+
+check('the optional sidebar module is gated behind the Host preference', () => {
+  const applyBody = functionBody(clientSource, 'function apply(');
+  assert.ok(applyBody.length > 0, 'lib/client.js must define function apply(ctx)');
+  assert.match(applyBody, /["']settings\.section["']/u, 'apply must register the Settings section unconditionally');
+  assert.match(applyBody, /["']settings\.section\.icon["']/u, 'apply must register the Settings section icon unconditionally');
+  assert.match(applyBody, /loadPreferences/u, 'apply must read the Host preference that decides whether the sidebar module exists');
+  assert.match(clientSource, /\/preferences/u, 'lib/client.js must call the Host preference API');
+  assert.match(clientSource, /sidebarEntry/u, 'the sidebar module must follow the Host sidebarEntry preference');
+
+  // If apply registers the module inline, the same body must consult the
+  // preference; a module mounted from a helper must be driven by it too.
+  if (/["']sidebar\.panellist["']|["']main["']/u.test(applyBody)) {
+    assert.match(applyBody, /sidebarEntry|preferences/u, 'an inline sidebar registration in apply must be gated by the preference');
+  }
+  const index = clientSource.indexOf('"sidebar.panellist"');
+  assert.ok(index > 0, 'the sidebar.panellist registration must exist in lib/client.js');
+  const window = clientSource.slice(Math.max(0, index - 2500), index + 2500);
+  assert.match(window, /sidebarEntry|preferences/u, 'the sidebar module registration must live near its preference gate, not be an unconditional fixture');
+  assert.equal((clientSource.match(/ctx\.slots\.inject\(\s*["']sidebar\.panellist["']/gu) ?? []).length, 1, 'the sidebar row must be injected from exactly one place');
+  assert.equal((clientSource.match(/name:\s*["']sidebar\.panellist["']/gu) ?? []).length, 1, 'the sidebar row definition must exist exactly once');
+  assert.equal((clientSource.match(/ctx\.slots\.inject\(\s*["']main["']/gu) ?? []).length, 1, 'the sidebar main page must be injected from exactly one place');
+  assert.equal((clientSource.match(/name:\s*["']main["']/gu) ?? []).length, 1, 'the main page definition must exist exactly once');
 });
 
 check('files[] covers every runtime artefact', () => {
@@ -352,13 +419,13 @@ check('every write target is computed from the data directory', () => {
 check('the shared constants match package.json and the contract', () => {
   if (versionModule.error) throw new Error(`lib/version.js could not be imported: ${versionModule.error.message}`);
   const constants = versionModule.module;
-  assert.equal(manifest.version, '0.4.1', 'this is the 0.4.1 compact external-MCP release (docs/API-CONTRACT.md is frozen for 0.4.1)');
+  assert.equal(manifest.version, '0.5.0', 'this is the 0.5.0 Settings-entry release (docs/API-CONTRACT.md is frozen for 0.5.0)');
   assert.equal(constants.PLUGIN_VERSION, manifest.version, 'PLUGIN_VERSION must equal package.json version');
   const contract = read('docs/API-CONTRACT.md');
-  assert.match(contract, /frozen for 0\.4\.1/u, 'docs/API-CONTRACT.md must be frozen for 0.4.1');
+  assert.match(contract, /frozen for 0\.5\.0/u, 'docs/API-CONTRACT.md must be frozen for 0.5.0');
   assert.equal(constants.DATA_DIR_NAME, 'better-mcp-manager', 'DATA_DIR_NAME must be the frozen data directory name');
   assert.equal(constants.API_PREFIX, '/better-mcp-manager/api', 'API_PREFIX must match the frozen API base');
-  assert.equal(constants.PANEL_ID, 'mcp-manager', 'PANEL_ID must be the frozen sidebar id');
+  assert.equal(constants.PANEL_ID, 'mcp-manager', 'PANEL_ID must be the frozen panel id used by both the Settings section and the optional sidebar row');
   assert.equal(constants.CLIENT_LOCALE_NS, 'mcpManager', 'CLIENT_LOCALE_NS must be the frozen locale namespace');
 });
 

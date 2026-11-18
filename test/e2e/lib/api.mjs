@@ -107,6 +107,16 @@ export class InstanceApi {
     return (await this.get('/better-mcp-manager/api/agents')).payload;
   }
 
+  /** `GET /preferences` — Host-owned UI preferences (0.5.0: `{ sidebarEntry }`). */
+  async preferences() {
+    return (await this.get('/better-mcp-manager/api/preferences')).payload;
+  }
+
+  /** `PUT /preferences` — persist `{ sidebarEntry }` before answering. */
+  async setPreferences({ sidebarEntry }) {
+    return (await this.put('/better-mcp-manager/api/preferences', { sidebarEntry })).payload;
+  }
+
   async serverDetail(id) {
     return (await this.get(`/better-mcp-manager/api/servers/${encodeURIComponent(id)}`)).payload;
   }

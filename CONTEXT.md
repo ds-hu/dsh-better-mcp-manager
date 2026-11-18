@@ -175,11 +175,35 @@ Per-server authentication beyond custom headers: `none`, `bearer` (a static toke
 `Authorization: Bearer` header unless a custom `Authorization` header already exists — custom
 headers win), or `client_credentials` (fetch a token from `tokenUrl` with `clientId`,
 `clientSecret`, `scope`, cache it until `expires_in - 60s`, retry once on a 401). There is no
-authorization-code flow in 0.4.1. Secrets are stored in the data file, never written to logs.
+authorization-code flow. Secrets are stored in the data file, never written to logs.
+
+### UI surfaces and the sidebar preference
+
+The plugin has two client surfaces built from the same manager component:
+
+- **Settings section** — the default entry, always registered: `settings.section` with id
+  `mcp-manager`, `order: 30` (plus a matching `settings.section.icon`), label `t('panel')`, rendering
+  the manager inside the DSH Settings dialog content column. A fresh install has no sidebar row;
+  this section is where the manager is opened. It needs the DSH Settings shell (standard in the
+  shipped Web app); a deployment that composes no settings shell has no navigation entry for it.
+- **Optional sidebar module** — an independent module, off by default: while the Host preference
+  `sidebarEntry` is true it registers `sidebar.panellist` (id `mcp-manager`, `order: 20`, directly
+  below 自动化任务) plus the matching `main` page (key `mcp-manager`), and unregisters both live when
+  the switch goes off, falling back to the Conversation. It is a preference of the plugin, not a
+  second page variant: both surfaces render the same `MCPManagerPage` (the settings one in an
+  embedded presentation, `data-mode="settings"`).
+- **Sidebar-entry preference** — `preferences.json` in the plugin data directory
+  (`{ "version": 1, "sidebarEntry": false }`), read and written by the Host through
+  `GET`/`PUT /better-mcp-manager/api/preferences`. It is **Host-side and per `$DSH_HOME`**, shared by
+  every browser and profile, never per-browser `localStorage`. The Settings-mode page exposes it as
+  the **在侧边栏显示 MCP 管理入口** / **Show MCP Manager in the sidebar** switch
+  (`sidebar-entry-row` / `sidebar-entry-toggle`), disabled while the initial read or a write is in
+  flight; a failed read leaves the module off and reports the reason, and the module follows the last
+  accepted Host value. A missing file means the default: off.
 
 ### Store and data directory
 
-Two JSON documents plus uploaded icon files in one directory:
+Three JSON documents plus uploaded icon files in one directory:
 
 ```
 $DSH_HOME/better-mcp-manager/     mode 0700
@@ -187,13 +211,16 @@ $DSH_HOME/better-mcp-manager/     mode 0700
 │   { "version": 3, "servers": [ ... ] }
 ├── external.json                 mode 0600, atomic replace
 │   { "version": 1, "presets": { "<presetId>": { updatedAt, overrides, servers } } }
+├── preferences.json              mode 0600, atomic replace
+│   { "version": 1, "sidebarEntry": false }
 └── icons/                        mode 0700, created on the first upload
     └── <server id>.<ext>         mode 0600, exactly one file per server
 ```
 
 The directory is created when the plugin mounts; `servers.json` appears on the first owned-server
-save, `external.json` on the first 其他 MCP save, and `icons/` on the first upload. It is
-**per DSH home, not per profile**: profiles under the same `$DSH_HOME` share one list.
+save, `external.json` on the first 其他 MCP save, `preferences.json` on the first sidebar-switch
+change, and `icons/` on the first upload. It is **per DSH home, not per profile**: profiles under the
+same `$DSH_HOME` share one list and one sidebar-entry preference.
 `DSH_MCP_MANAGER_DATA_DIR` overrides the location (test/scratch use; the CLI resolves it the same
 way). The store is the only source of truth for owned servers; live status is derived and recomputed.
 A schema-version-1 or -2 `servers.json` is migrated **in memory** on load (legacy emoji-string icons
@@ -201,8 +228,11 @@ become `{ kind: "auto" }`; missing tool settings become `{}` / `null`) and is re
 by the next save, never by a read. `external.json` has schema version 1 and is normalized on load:
 only valid `mcp__` names, valid preset ids, ≤100 presets, ≤200 servers per preset, ≤300 tools per
 server, ≤2000 override entries per preset, description ≤2000 chars and ≤64 params; a corrupt or
-unknown-version file is quarantined and the state starts empty. The **clean** CLI deletes the whole
-directory, including `external.json` and `icons/`.
+unknown-version file is quarantined and the state starts empty. `preferences.json` is normalized on
+load: a missing file means `{ sidebarEntry: false }`; a damaged, unparseable or unknown-shape file is
+reported through the logger and reset to the default (no quarantine file), and the next write
+replaces it. The **clean** CLI deletes the whole directory, including `external.json`,
+`preferences.json` and `icons/`.
 
 ## Invariants
 
@@ -237,8 +267,9 @@ directory, including `external.json` and `icons/`.
     `toolOverrides`/`toolCache`; they change only through the tool endpoints, so a save cannot
     overwrite a per-tool decision or corrupt the cache.
 13. **Uninstall is two steps and leaves nothing else**: remove the bundle (the code, the row, the
-    route, the client) and run `clean` for the one directory, which includes `icons/`. Mounting
-    without configuring writes no file (the directory itself is created on mount).
+    route, the client) and run `clean` for the one directory, which includes `external.json`,
+    `preferences.json` and `icons/`. Mounting without configuring writes no file (the directory
+    itself is created on mount).
 14. **External names never include this plugin's own tools.** Ownership is decided by
     `exposure.ownToolNames()` plus the Agent's restrictable `mcp__` names; a name registered by this
     plugin is never treated as preset-owned, never restricted by the external controller, and never
@@ -254,13 +285,20 @@ directory, including `external.json` and `icons/`.
 17. **`external.json` holds descriptors and deviations only, never credentials.** It stores the last
     discovered tool descriptors plus `enabled:false`/`approval:true` overrides; losing it resets
     choices to defaults, and discovery cannot happen without a live Agent of that preset.
+18. **The Settings section is always registered; the sidebar module is optional and Host-configured.**
+    The client always registers `settings.section` (id `mcp-manager`, order 30) and its
+    `settings.section.icon`; `sidebar.panellist` (id `mcp-manager`, order 20) and the `main` page
+    exist only while the Host preference `sidebarEntry` is true (default false), and switching it
+    off unregisters both immediately. The preference is Host-side, per `$DSH_HOME`, shared by every
+    browser and profile — never per-browser `localStorage` and never stored in a profile settings
+    document.
 
 ## File map
 
 | Path | Role |
 |---|---|
 | `lib/index.js` | Host plugin entry: `apply(ctx)` / dispose, wires store, manager, binder, API, external controller, tool-cache persistence |
-| `lib/store.js` | data directory resolution, load/save, atomic replace, mode `0600`, serialized `patch`, schema v1/v2→v3 migration |
+| `lib/store.js` | data directory resolution, load/save, atomic replace, mode `0600`, serialized `patch`, schema v1/v2→v3 migration; loads/saves `preferences.json` (default `{ sidebarEntry: false }`) |
 | `lib/model.js` | validation and normalisation of drafts, key allocation, preset predicate, icon normalisation, per-tool overrides and cache |
 | `lib/icons.js` | uploaded icons: data-URL decoding, raster magic checks, `icons/` storage (0600), deletion |
 | `lib/mcp.js` | one MCP client per server: transports, OAuth, connect/list/call, backoff, status counts, auto-icon fetch/cache |
@@ -268,12 +306,12 @@ directory, including `external.json` and `icons/`.
 | `lib/presets.js` | `agent/created` binding, live-agent re-exposure, per-tool enable filtering, `systemPrompt.section` instructions, `ownToolNames()`, `composedPreset`/`agentTools` helpers |
 | `lib/tool-definition.js` | hand-built `ToolDefinition` for a discovered MCP tool, approval flag included |
 | `lib/result-projection.js` | MCP result → ordered text/image/diagnostic tool result; restricted-mode approval seam |
-| `lib/api.js` | HTTP router for `/better-mcp-manager/api/*`, including icon, tool and external endpoints |
+| `lib/api.js` | HTTP router for `/better-mcp-manager/api/*`, including icon, tool, external and preference endpoints |
 | `lib/http.js` | same-origin JSON guard, 64 KiB body cap (1 MiB for icon uploads), JSON responses |
-| `lib/client.js` | browser half: `sidebar.panellist` entry, `main` page, 本插件 MCP / 其他 MCP tabs, polling, two form tabs, styles, locale dictionaries |
+| `lib/client.js` | browser half: always-registered `settings.section` + `settings.section.icon`; Host-preference controller; optional live `sidebar.panellist` + `main` module; 本插件 MCP / 其他 MCP tabs, polling, two form tabs, styles, locale dictionaries |
 | `bin/mcp-manager.mjs` | maintenance CLI: `status` (default), `path`, `clean [--yes]` |
-| `locale/en.json`, `locale/zh.json` | plugin-page metadata (title/description); the page's UI copy lives in `lib/client.js` |
-| `icon.svg` | sidebar artwork and plugin-page icon |
+| `locale/en.json`, `locale/zh.json` | plugin-page metadata (title/description, Settings default and optional sidebar entry); the manager's UI copy lives in `lib/client.js` |
+| `icon.svg` | plugin-page metadata icon (the client's sidebar/settings glyphs are inline React SVG) |
 | `cordis.patch.yml` | the bundle's single Host row (`id` = Host `name`) |
 | `test/` | unit, structural, client-smoke, packaging and e2e checks |
 | `docs/API-CONTRACT.md` | frozen internal contract; change it before changing either half |
@@ -288,11 +326,17 @@ The plugin is a guest in the Host and uses only public context capabilities:
   The row's `id` must equal the Host module's exported `name` (checked by `test/mount-check.mjs`).
 - **Web client** — `package.json` → `dsh.client` (`platform: web`, `inject` of the shell's sidebar
   and locale services) loads `lib/client.js` as a browser module.
-- **Panels** — `ctx.slots.inject('sidebar.panellist')` with `id: 'mcp-manager'`, `order: 20`,
-  `label: () => t('panel')`; `ctx.slots.inject('main')` with `key: 'mcp-manager'`. 自动化任务 is
-  order 10 and Plugins is order 0, which is what puts MCP 管理 directly below 自动化任务.
+- **Settings section** — always: `ctx.slots.inject('settings.section')` with `id: 'mcp-manager'`,
+  `order: 30`, `label: () => t('panel')`; plus `settings.section.icon` with the same `id`/`order`.
+  The shell (and so the navigation entry) only exists when the deployment composes the settings
+  shell, which the shipped Web app does.
+- **Optional sidebar module** — only while the Host preference says so:
+  `ctx.slots.inject('sidebar.panellist')` with `id: 'mcp-manager'`, `order: 20`,
+  `label: () => t('panel')`, and `ctx.slots.inject('main')` with `key: 'mcp-manager'`. 自动化任务 is
+  order 10 and Plugins is order 0, so order 20 puts MCP 管理 directly below 自动化任务. Both slot
+  injections are disposed live when the switch goes off.
 - **HTTP** — one `ctx.webServer` route with `kind: 'prefix'` at `/better-mcp-manager/api`, plus the
-  Host's own web auth.
+  Host's own web auth. `GET`/`PUT /preferences` read/write the sidebar-entry preference.
 - **Agent events** — `agent/created`, `agent/disposed`, `agent-preset/selected`, `tools/change`,
   and the Host-wide `tools/pre-execute` policy used for external approval.
 - **Agent-preset service** — `ctx.agentPresets.list()` for the roster,
@@ -318,6 +362,20 @@ The plugin is a guest in the Host and uses only public context capabilities:
 - **The production instance is not the test bed.** `http://127.0.0.1:3080` and `/root/.dsh` belong
   to the running user; e2e runs a throwaway `$DSH_HOME` and profile in its own systemd scope. That
   isolation is a test harness property, not a plugin feature.
+- **The default entry is the Settings section, not the sidebar.** Since 0.5.0 the client always
+  registers `settings.section` (+ icon) and the sidebar row/page is an optional module, off by
+  default. Never document or test a fresh install as having a sidebar entry.
+- **The sidebar module is a preference, not a page variant.** `preferences.json` says whether it
+  exists; the switch registers/unregisters `sidebar.panellist` + `main` live. It is Host-side and
+  per `$DSH_HOME` (shared by every browser and profile), never per-browser `localStorage` and never
+  stored in a profile settings document.
+- **The Settings shell is a deployment dependency.** The section has no navigation entry in a
+  deployment that composes no settings shell (the shipped Web app does). Keep that stated as a
+  requirement, not as a bug; the optional sidebar module still opens the manager when enabled.
+- **One manager component, two presentations.** The Settings section renders the same
+  `MCPManagerPage` in its embedded presentation (`data-mode="settings"`, no scroll container, no
+  initial focus grab); the sidebar page is the full-page presentation. Do not fork the manager for
+  the Settings surface.
 - **Status is not stored.** "Connected" is a live claim about a socket; a page reload asks again.
   Never persist status into the JSON store or treat a stale status as truth.
 - **Two agents may share a server.** They share the one connection but not registrations. A tool
@@ -335,8 +393,9 @@ The plugin is a guest in the Host and uses only public context capabilities:
   connection closes, live agents lose its tools, and the record plus its settings stay.
 - **A failing server still saves and lists.** Save is a store write first; connection failure
   becomes status, not a rollback. The user can fix the URL while the server is failing.
-- **The panel polls `GET /servers` every 2.5 s while mounted** and immediately after every mutation.
-  Timers must be cleared on unmount; a leaked timer keeps the browser busy after dispose.
+- **The mounted manager polls `GET /servers` every 2.5 s** and immediately after every mutation.
+  Timers must be cleared on unmount; a leaked timer keeps the browser busy after dispose. The
+  Settings section and the sidebar page are independent mounts, so two views can poll at once.
 - **`GET /servers/:id` returns raw tool names, not schemas.** The detail view is diagnostics; the
   **工具** tab reads `GET /servers/:id/tools` and never edits a tool's schema.
 - **Disabling a tool is not a page filter.** The tool is absent from registration, so no agent sees

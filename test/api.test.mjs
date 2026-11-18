@@ -9,14 +9,14 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createApi } from '../lib/api.js';
 import { InputError, MAX_ICON_BYTES } from '../lib/model.js';
-import { createStore } from '../lib/store.js';
+import { createStore, PREFERENCES_FILE, PREFERENCES_VERSION } from '../lib/store.js';
 import { PLUGIN_VERSION } from '../lib/version.js';
 
 const PREFIX = '/better-mcp-manager/api';
@@ -61,12 +61,12 @@ function makeResponse() {
 }
 
 /** One disposable API harness. */
-async function harness(t, { roster, bare = false, connection, autoIcon, external } = {}) {
+async function harness(t, { roster, bare = false, connection, autoIcon, external, load = true } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'mcp-manager-api-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const clock = { value: Date.parse('2026-11-16T10:00:00Z') };
   const store = createStore({ dir, now: () => clock.value });
-  await store.load();
+  if (load) await store.load();
 
   const state = { synced: 0, refreshes: 0, reconnects: [] };
   /** @type {Map<string, any>} */
@@ -1082,4 +1082,107 @@ test('api: GET/POST external endpoints scan and PUT saves one preset', async (t)
   ]) {
     assertError(await call(request), 404, 'not-found');
   }
+});
+
+/* ---------------------------------------------------------------- */
+/* 0.5.0 Host-owned UI preferences (the optional sidebar module)     */
+/* ---------------------------------------------------------------- */
+
+test('api: GET /preferences defaults to the sidebar module off', async (t) => {
+  const { call, dir, store } = await harness(t);
+  const result = await call({ path: '/preferences' });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body, { ok: true, preferences: { sidebarEntry: false } });
+  assert.deepEqual(store.preferences(), { sidebarEntry: false });
+  assert.equal(existsSync(join(dir, PREFERENCES_FILE)), false, 'a read must not create the file');
+});
+
+test('api: GET /preferences waits for the store load instead of answering the defaults', async (t) => {
+  const { call, dir, store } = await harness(t, { load: false });
+  await writeFile(join(dir, PREFERENCES_FILE), `${JSON.stringify({ version: PREFERENCES_VERSION, sidebarEntry: true }, null, 2)}\n`, { mode: 0o600 });
+  assert.deepEqual(store.preferences(), { sidebarEntry: false }, 'the in-memory state is still the default before the load runs');
+
+  const result = await call({ path: '/preferences' });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body, { ok: true, preferences: { sidebarEntry: true } }, 'an early GET must read the file, not the not-yet-loaded default');
+  assert.deepEqual(store.preferences(), { sidebarEntry: true });
+});
+
+test('api: PUT /preferences persists the toggle before answering and GET reads it back', async (t) => {
+  const { call, dir } = await harness(t);
+  const enabled = await call({ method: 'PUT', path: '/preferences', headers: JSON_HEADERS, body: JSON.stringify({ sidebarEntry: true }) });
+  assert.equal(enabled.status, 200);
+  assert.deepEqual(enabled.body, { ok: true, preferences: { sidebarEntry: true } });
+  const file = join(dir, PREFERENCES_FILE);
+  assert.equal((await stat(file)).mode & 0o777, 0o600, 'preferences are private');
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { version: PREFERENCES_VERSION, sidebarEntry: true }, 'the answer is written only after the file exists');
+
+  const read = await call({ path: '/preferences' });
+  assert.deepEqual(read.body, { ok: true, preferences: { sidebarEntry: true } });
+
+  const off = await call({ method: 'PUT', path: '/preferences', headers: JSON_HEADERS, body: JSON.stringify({ sidebarEntry: false }) });
+  assert.equal(off.status, 200);
+  assert.deepEqual(off.body.preferences, { sidebarEntry: false });
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { version: PREFERENCES_VERSION, sidebarEntry: false });
+  assert.deepEqual((await readdir(dir)).sort(), ['preferences.json'].sort(), 'a preference save writes no other file');
+});
+
+test('api: PUT /preferences ignores unknown keys and rejects invalid bodies', async (t) => {
+  const { call, dir, store } = await harness(t);
+  const extra = await call({
+    method: 'PUT',
+    path: '/preferences',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ sidebarEntry: true, theme: 'dark', keep: [1, 2, 3] }),
+  });
+  assert.equal(extra.status, 200);
+  assert.deepEqual(extra.body.preferences, { sidebarEntry: true });
+  assert.deepEqual(
+    JSON.parse(await readFile(join(dir, PREFERENCES_FILE), 'utf8')),
+    { version: PREFERENCES_VERSION, sidebarEntry: true },
+    'unknown keys are ignored, not persisted',
+  );
+
+  for (const body of [{}, { sidebarEntry: 'yes' }, { sidebarEntry: 1 }, { sidebarEntry: null }, { sidebarEntry: undefined }]) {
+    const result = await call({ method: 'PUT', path: '/preferences', headers: JSON_HEADERS, body: JSON.stringify(body) });
+    assertError(result, 400, 'invalid-preferences');
+  }
+  assert.deepEqual(store.preferences(), { sidebarEntry: true }, 'rejected bodies change nothing');
+
+  assertError(await call({ method: 'PUT', path: '/preferences', headers: JSON_HEADERS, body: '[]' }), 400, 'invalid-body');
+  assertError(await call({ method: 'PUT', path: '/preferences', headers: JSON_HEADERS, body: 'null' }), 400, 'invalid-body');
+  assertError(await call({ method: 'PUT', path: '/preferences', headers: JSON_HEADERS, body: '{ nope' }), 400, 'invalid-json');
+  assert.deepEqual(store.preferences(), { sidebarEntry: true });
+});
+
+test('api: PUT /preferences is same-origin only and refuses other methods', async (t) => {
+  const { call, store } = await harness(t);
+  const body = JSON.stringify({ sidebarEntry: true });
+  assertError(
+    await call({ method: 'PUT', path: '/preferences', headers: { ...JSON_HEADERS, origin: 'https://evil.example' }, body }),
+    403,
+    'cross-origin',
+  );
+  assert.deepEqual(store.preferences(), { sidebarEntry: false }, 'a cross-origin PUT changes nothing');
+
+  const sameOrigin = await call({ method: 'PUT', path: '/preferences', headers: { ...JSON_HEADERS, origin: 'http://127.0.0.1:3080' }, body });
+  assert.equal(sameOrigin.status, 200);
+  assert.deepEqual(sameOrigin.body.preferences, { sidebarEntry: true });
+
+  for (const method of ['POST', 'PATCH', 'DELETE']) {
+    assertError(await call({ method, path: '/preferences', headers: JSON_HEADERS, body }), 405, 'method-not-allowed');
+  }
+  assertError(await call({ method: 'PUT', path: '/preferences', body }), 415, 'unsupported-media-type');
+});
+
+test('api: a preference save never rewrites servers.json or its schema', async (t) => {
+  const { call, dir } = await harness(t);
+  const id = await createServer(call);
+  const saved = await call({ method: 'PUT', path: '/preferences', headers: JSON_HEADERS, body: JSON.stringify({ sidebarEntry: true }) });
+  assert.equal(saved.status, 200);
+
+  const raw = JSON.parse(await readFile(join(dir, 'servers.json'), 'utf8'));
+  assert.equal(raw.version, 3, '0.5.0 adds a file, it does not bump the servers schema');
+  assert.deepEqual(raw.servers.map((server) => server.id), [id], 'the server list is untouched');
+  assert.deepEqual((await readdir(dir)).sort(), [PREFERENCES_FILE, 'servers.json'].sort());
 });

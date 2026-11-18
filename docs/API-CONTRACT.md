@@ -3,7 +3,7 @@
 This file is the single source of truth shared by the Host half (`lib/index.js` and friends),
 the Client half (`lib/client.js`) and the tests (`test/`). Change it before changing either side.
 
-Status: **frozen for 0.4.1**. Everything below is what 0.4.1 ships.
+Status: **frozen for 0.5.0**. Everything below is what 0.5.0 ships.
 
 ---
 
@@ -16,8 +16,9 @@ Status: **frozen for 0.4.1**. Everything below is what 0.4.1 ships.
 | Cleanup CLI | `bin/mcp-manager.mjs` | the user, after `remove_bundle` | the data directory only |
 
 The Host half never writes `cordis.patch.yml`, never mounts Loader rows and never edits agent-preset
-YAML. Everything the user configures lives in one JSON file under
-`$DSH_HOME/better-mcp-manager/servers.json` (mode `0600`, atomic replace).
+YAML. Everything the user configures — and the one UI preference — lives in three JSON documents
+under `$DSH_HOME/better-mcp-manager/` (each mode `0600`, atomic replace): `servers.json` (§2.1),
+`external.json` (§2.8) and `preferences.json` (§2.9).
 
 ## 2. Data model
 
@@ -240,6 +241,26 @@ approval.
   200 servers per preset, 300 tools per server, description 2000 chars, 64 params) and carry no
   credentials. The cleanup CLI removes this file with the rest of the data directory.
 
+### 2.9 UI preferences (sidebar entry)
+
+A third document in the data directory stores the client's Host-owned UI preferences. Today it has
+exactly one key: whether the optional sidebar module is enabled.
+
+```jsonc
+{ "version": 1, "sidebarEntry": false }
+```
+
+- **`sidebarEntry`** — boolean, default `false`. `false` means the client registers only the always-on
+  `settings.section` (§5); `true` means it also registers `sidebar.panellist` and the `main` page.
+  The preference is read/written by the Host, not by browser storage.
+- **Ownership and sharing.** The file is per `$DSH_HOME` (like `servers.json`), not per browser and
+  not per profile: every browser and every profile under the same DSH home follows the same value.
+- **Lifecycle.** A missing file means the default. A damaged, unparseable or unknown-shape file is
+  logged and reset to the default without a quarantine file (the server and external stores keep
+  their quarantines); the next write replaces it. Writes go through the same serialized,
+  atomic temp-file + `rename` queue as the other stores and are awaited before the API answers.
+- **Removal.** The `clean` CLI deletes the whole data directory, `preferences.json` included.
+
 ## 3. Host HTTP API
 
 Base: `/better-mcp-manager/api`, same-origin only. `kind: 'prefix'` route on `ctx.webServer`.
@@ -272,6 +293,8 @@ Base: `/better-mcp-manager/api`, same-origin only. `kind: 'prefix'` route on `ct
 | DELETE | `/servers/:id/icon` | — | `{ ok, server }`; deletes the stored file and resets `icon = { kind: "auto" }` |
 | GET | `/presets` | — | `{ ok, presets: [Preset] }` where `Preset = { id, name, description, order }` |
 | GET | `/agents` | — | `{ ok, agents: [{ sessionId, preset, servers: [key], tools: [publicName] }] }` — live exposure diagnostics |
+| GET | `/preferences` | — | `{ ok, preferences: { sidebarEntry: boolean } }` — the UI preferences document (§2.9); defaults when the file is absent or damaged, never an error |
+| PUT | `/preferences` | `{ sidebarEntry: boolean }` | `{ ok, preferences: { sidebarEntry } }`; persisted before answering, unknown keys ignored, a missing/non-boolean `sidebarEntry` → `400 invalid-preferences` |
 | GET | `/health` | — | `{ ok, version, pid, uptimeMs }` |
 
 `Preset` display names come from `ctx.agentPresets.list()` (`id`, `name ?? id`, `description`,
@@ -282,30 +305,78 @@ selection needs agent presets.
 Save/update mutates the store first (atomic), then applies the connection change. A server whose
 connection fails still saves and lists.
 
+`PUT /preferences` is same-origin checked and body-bearing (JSON, ≤ 64 KiB) like every other
+mutation. Its body must be a JSON object with a boolean `sidebarEntry`; unknown extra keys are
+ignored. A missing or non-boolean `sidebarEntry` answers `400 invalid-preferences` and writes nothing
+(a body that is not a JSON object at all fails earlier with `400 invalid-body`, and malformed JSON
+with `400 invalid-json`). The answered `preferences` object is the storage view — the client applies
+exactly that value to the live slots. A missing/damaged preferences file is never an API error: `GET`
+answers the defaults and the next `PUT` replaces the file.
+
 ## 4. Host lifecycle
 
-- Mount: load store → start one connection supervisor per **enabled** server → register the HTTP
-  route → bind live agents → listen for `agent/created` / `agent/disposed` /
-  `agent-preset/selected`.
+- Mount: load the store (all three documents: `servers.json`, `external.json`, `preferences.json`;
+  a missing or damaged preferences file means `{ sidebarEntry: false }`) → start one connection
+  supervisor per **enabled** server → register the HTTP route → bind live agents → listen for
+  `agent/created` / `agent/disposed` / `agent-preset/selected`. Preferences writes go through the
+  store's serialized queue like every other store write.
 - Supervisor: connect → initialize → `tools/list` → cache tools + `getInstructions()`; keep the
   connection; a dropped connection retries with backoff 1s, 2s, 4s, 8s, 16s, 30s (cap), forever,
   until disabled/removed/disposed. A manual reconnect resets the budget.
 - Any tool-list change notification re-lists tools and re-exposes live agents.
 - Dispose: clear timers, close clients/transports (5s cap), unregister the route, release all
-  `agent.ctx` registrations, clear derived state. Nothing survives in memory.
+  `agent.ctx` registrations, wait for queued store writes (including a pending preferences write),
+  clear derived state. Nothing survives in memory.
 - Two servers can never share a `key` (enforced at save).
 
 ## 5. Client requirements
 
-Register two slots, both under `ctx.slots.inject(...)`:
+The client renders one manager component in two independent surfaces: an always-registered Settings
+section and an optional sidebar module. Both render the same view; only the shell around it differs.
 
-- `sidebar.panellist` — `id: 'mcp-manager'`, `order: 20`, `locale`, `label: () => t('panel')`
-  (自动化任务 is order 10, Plugins is 0, so 20 puts MCP 管理 directly below 自动化任务).
-- `main` — `key: 'mcp-manager'`, the page component.
+### 5.1 Always registered — the Settings section
 
-Page (dark and light theme, tokens only — no literal colors outside artwork):
+- `settings.section` — `id: 'mcp-manager'`, `order: 30`, `locale: 'mcpManager'`,
+  `label: () => t('panel')`. The component receives the shell's `{ close }` owner props and renders
+  the manager in its embedded presentation: same `.mm-root` root and `mcp-page` / `mcp-list` test
+  ids, with `data-mode="settings"` on the root (no fixed-viewport scroll container; the settings
+  content column scrolls).
+- `settings.section.icon` — same `id` and `order`; the shell renders the matching navigation icon.
+  An icon id with no matching section never renders.
+- The section is the **default entry**. It is registered unconditionally, on a fresh install with
+  the default preference, and does not depend on any store data.
+- **Deployment requirement.** The section needs the DSH Settings shell; the shipped Web app composes
+  it. A deployment that composes no settings shell has no navigation entry for the section. The
+  optional sidebar module, when enabled, still renders the manager as its own page.
 
-1. Header: title 管理 / MCP 管理 + subtitle count; primary `+ 添加 MCP` button.
+### 5.2 Optional — the sidebar module, gated by the Host preference
+
+- While the Host preference `sidebarEntry` is `true` (§2.9), also register
+  `sidebar.panellist` — `id: 'mcp-manager'`, `order: 20`, `locale`, `label: () => t('panel')`
+  (自动化任务 is order 10, Plugins is 0, so 20 puts MCP 管理 directly below 自动化任务) — and
+  `main` — `key: 'mcp-manager'`. When the preference turns `false`, dispose both registrations live:
+  the row disappears and, if its page was open, DSH falls back to the Conversation.
+- Default is **off**: a fresh install registers no `sidebar.panellist` and no `main` slot. The apply
+  path reads `GET /preferences`; a failed read keeps the module off and reports the error in the
+  switch row.
+- The switch exists only in the Settings-mode page: a row `[data-testid="sidebar-entry-row"]`
+  containing a `role="switch"` button `[data-testid="sidebar-entry-toggle"]` with `aria-checked`,
+  label **在侧边栏显示 MCP 管理入口** / **Show MCP Manager in the sidebar**, and a one-line hint
+  that the module is off by default while the Settings entry is always available. The switch is
+  disabled while the initial read or a save is in flight.
+- Toggling calls `PUT /preferences` and applies the **accepted** answer live; a failed save leaves
+  the live module on the last applied value and reports the reason. There is no optimistic
+  local-only state.
+- The preference is Host-side and shared per `$DSH_HOME`; the client must not mirror it into
+  `localStorage`, `sessionStorage` or a profile settings document.
+
+### 5.3 The manager view (both surfaces)
+
+Dark and light theme, tokens only — no literal colors outside artwork:
+
+1. Header: title 管理 / MCP 管理 + subtitle count; primary `+ 添加 MCP` button. In Settings mode the
+   sidebar-entry row (§5.2) renders between the header and the page tabs; the sidebar page does not
+   render it.
 2. Server cards grouped by `group` (ungrouped shown last as 其他（未分组）). Each card:
    icon tile (color + image from `iconUrl`, falling back to the name’s first letter), name, status line (`已连接 · HTTP · 工具 17/19` (enabled/discovered),
    `连接失败 · HTTP · 工具 0`, `已停用 · SSE`), status dot (green/red/gray/amber), `···` menu
@@ -333,25 +404,42 @@ Page (dark and light theme, tokens only — no literal colors outside artwork):
    error+retry (`external-retry`) and saved/failed notices are required. The external tab never offers
    add/edit/delete/test of those servers.
 5. Empty state with an add CTA; loading skeleton/spinner; retry on network failure.
-6. Poll `GET /servers` every 2.5s while the page is mounted (and immediately after every mutation);
-   stop when unmounted.
+6. Poll `GET /servers` every 2.5s while a manager view is mounted (and immediately after every
+   mutation); stop when unmounted. The Settings section and the sidebar page are independent mounts,
+   so both may poll while both exist.
 7. All copy through `ctx.locale.register(NS, { zh, en })`; locale namespace `mcpManager`.
 8. Cleanup: one `<style data-plugin-css>` tag per plugin instance, removed on dispose; every timer
-   cleared in `ctx.effect` cleanup.
+   cleared in `ctx.effect` cleanup; the optional module's two slot registrations are disposed on
+   toggle-off and again on plugin dispose, and the always-on section registrations are released in
+   `ctx.effect` cleanups.
 
 ## 6. Test surface
 
 - Unit (plain `node --test`, no Host): store/validation, key allocation, preset predicate, tool
-  name derivation, per-tool settings/cache, preset-owned discovery/restriction/pre-execute/state
-  persistence (`test/external.test.mjs`), API router with mock `req`/`res`, MCP result projection
-  (text/resource/image diagnostic), client-credentials refresh.
+  name derivation, per-tool settings/cache, the preferences document (defaults when absent,
+  corrupt-file tolerance with defaults, atomic `0600` write, schema shape), preset-owned
+  discovery/restriction/pre-execute/state persistence (`test/external.test.mjs`), API router with
+  mock `req`/`res` (including `GET`/`PUT /preferences` and `400 invalid-preferences`), MCP result
+  projection (text/resource/image diagnostic), client-credentials refresh, CLI `status` reporting
+  the sidebar-entry preference.
 - Mount check: patch row id === Host `name`, exports resolve, no `@deepseek-ai/*` import in `lib/`,
-  no writes outside the data dir, locale/icon exported and packed.
-- Client smoke: run `lib/client.js` in a `vm` with a fake `window.__ModuleLoader__` + fake React,
-  assert both slots register, dictionaries cover zh/en, no timer outlives dispose.
+  no writes outside the data dir, locale/icon exported and packed, version `0.5.0` and this
+  contract's "frozen for 0.5.0" line, and structural checks that `lib/client.js` registers
+  `settings.section` / `settings.section.icon` and gates `sidebar.panellist` / `main` behind the
+  preference.
+- Client smoke: run `lib/client.js` in a `vm` with a fake `window.__ModuleLoader__` + fake React;
+  assert the default registration set is `settings.section` + `settings.section.icon` only (no
+  `main`, no `sidebar.panellist`), that a `sidebarEntry: true` answer registers all four, that
+  `setSidebarEntryPreference(true/false)` registers/unregisters the module live and calls
+  `PUT /preferences` with the right body, that the switch row/testids and copy exist, that
+  dictionaries cover zh/en with key parity, and that no timer outlives dispose.
 - E2E (isolated DSH_HOME + its own systemd scope, never the production instance): install the packed
   tarball into a fresh `web` profile, boot on a free port, drive the real page with Playwright,
+  verify the sidebar has no MCP 管理 row by default, the Settings dialog offers the MCP 管理 section
+  and the manager renders inside it, and the first server is created there; toggle the optional
+  module on and off (row directly below 自动化任务, live removal, Host persistence across a reload);
   verify connect/fail/tool-count/preset scoping against local fixture MCP servers and a fake
   OpenAI-compatible endpoint that records the tool schemas it receives; a preset-mounted fixture MCP
   drives the 其他 MCP tab, disabled-tool removal from `tools[]`, and the restricted/full-access
-  approval split end to end.
+  approval split end to end. The run publishes nine screenshots, including the Settings hero and the
+  optional sidebar module.

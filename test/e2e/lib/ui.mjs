@@ -14,6 +14,16 @@ import { sleep, waitFor } from './util.mjs';
 
 const SIDEBAR_AUTOMATION = '自动化任务';
 const SIDEBAR_MCP = /MCP\s*管理/;
+const SIDEBAR_NAV_LABEL = '全局面板';
+const SETTINGS_TITLE = '设置';
+const SETTINGS_TRIGGER = '设置';
+// The shipped `web` template has no dsh-pocket launcher: ui-settings-account
+// occupies the sidebar-foot `settings.launcher`/`sidebar.settings` seat with an
+// account menu (labelled 账号菜单, showing 更多 while signed out), and 设置 is one
+// of its menu items. A profile with a standalone Settings control still matches
+// the direct button first.
+const ACCOUNT_MENU_LABEL = '账号菜单';
+const ACCOUNT_MENU_TRIGGER = /账号菜单|更多|More|Account/u;
 const MODE_BUTTON = /标准模式|极简模式|PTC 模式|创造模式|外部MCP测试/;
 const PRESET_LABELS = {
   standard: '标准模式',
@@ -169,21 +179,34 @@ export async function waitForBodyText(page, text, { timeoutMs = 60_000 } = {}) {
 
 // ── sidebar ─────────────────────────────────────────────────────────────────
 
+/** The sidebar's global-panel navigation landmark (role/name, no shell classes). */
+export function sidebarPanelNav(page) {
+  return page.getByRole('navigation', { name: SIDEBAR_NAV_LABEL });
+}
+
+/** Whether the optional sidebar module's MCP 管理 row exists right now. */
+export async function sidebarHasMcp(page) {
+  const nav = sidebarPanelNav(page);
+  if ((await nav.count()) === 0) return false;
+  return (await nav.getByRole('button', { name: SIDEBAR_MCP }).count()) > 0;
+}
+
 /**
  * Assert the plugin panel row sits immediately below 自动化任务.
  * Reads the real DOM order of the sidebar's panel-row buttons, so a wrong
- * `order` (e.g. 30) or a missing registration fails with evidence.
+ * `order` (e.g. 30) or a missing registration fails with evidence. With the
+ * optional module off the row legitimately does not exist: mcpIndex is -1 and
+ * mcpBox is null.
  */
 export async function sidebarPanelOrder(page) {
   return page.evaluate(
-    ({ automation, mcpPattern }) => {
+    ({ automation, mcpPattern, navLabel }) => {
       const mcpRegExp = new RegExp(mcpPattern);
       const text = (element) => (element.getAttribute('aria-label') || element.innerText || '').trim();
-      const buttons = Array.from(document.querySelectorAll('button'));
-      const automationButton = buttons.find((button) => text(button) === automation);
-      const mcpButton = buttons.find((button) => mcpRegExp.test(text(button)));
-      const container = automationButton?.parentElement;
-      const rows = container === null || container === undefined ? [] : Array.from(container.querySelectorAll(':scope > button'));
+      const nav = Array.from(document.querySelectorAll('nav')).find((element) => element.getAttribute('aria-label') === navLabel);
+      const rows = nav === undefined ? [] : Array.from(nav.querySelectorAll(':scope > button'));
+      const automationButton = rows.find((button) => text(button) === automation);
+      const mcpButton = rows.find((button) => mcpRegExp.test(text(button)));
       return {
         rows: rows.map((row) => text(row)).filter((label) => label !== ''),
         automationIndex: rows.indexOf(automationButton),
@@ -192,45 +215,219 @@ export async function sidebarPanelOrder(page) {
         mcpBox: mcpButton === undefined ? null : mcpButton.getBoundingClientRect().toJSON(),
       };
     },
-    { automation: SIDEBAR_AUTOMATION, mcpPattern: SIDEBAR_MCP.source },
+    { automation: SIDEBAR_AUTOMATION, mcpPattern: SIDEBAR_MCP.source, navLabel: SIDEBAR_NAV_LABEL },
   );
 }
 
-/** Click the plugin's sidebar entry and wait for the management page. */
+/** Click the plugin's sidebar entry (the optional module) and wait for the management page. */
 export async function openMcpPage(page) {
-  await page.getByRole('button', { name: SIDEBAR_MCP }).first().click();
+  await sidebarPanelNav(page).getByRole('button', { name: SIDEBAR_MCP }).first().click();
   const list = page.locator('[data-testid="mcp-list"]');
   await list.waitFor({ state: 'visible', timeout: 20_000 });
   await page.locator('[data-testid="mcp-page"]').waitFor({ state: 'attached', timeout: 20_000 });
   return list;
 }
 
+// ── DSH Settings dialog (default entry, 0.5.0) ─────────────────────────────
+
+/** The open Settings dialog, matched by its accessible name. */
+export function settingsDialog(page) {
+  return page.getByRole('dialog', { name: SETTINGS_TITLE });
+}
+
+/** Reload the authenticated page and wait for the shell/composer again. */
+export async function reloadApp(page) {
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+  await page.getByRole('button', { name: '新建会话' }).first().waitFor({ state: 'visible', timeout: 60_000 });
+  await dismissFirstRun(page);
+}
+
+/**
+ * Evidence for a failed Settings open: every button label plus the start of the
+ * body text. A shell change then fails with the DOM it actually rendered.
+ */
+async function settingsDiagnostics(page) {
+  const buttons = await page
+    .locator('button')
+    .evaluateAll((elements) => elements.map((element) => (element.getAttribute('aria-label') || element.innerText || '').trim()).filter((label) => label !== ''))
+    .catch(() => []);
+  const menuItems = await page
+    .getByRole('menuitem')
+    .evaluateAll((elements) => elements.map((element) => (element.innerText || '').trim()).filter((label) => label !== ''))
+    .catch(() => []);
+  const body = await page.locator('body').innerText().catch(() => '');
+  return `buttons: ${JSON.stringify(buttons.slice(0, 40))}; menu items: ${JSON.stringify(menuItems.slice(0, 20))}; body: ${body.replace(/\s+/gu, ' ').slice(0, 2048)}`;
+}
+
+/**
+ * Open the DSH Settings dialog.
+ *
+ * The direct bottom Settings control is tried first (a profile composing a
+ * launcher package has it); otherwise 设置 is selected from the sidebar-foot
+ * account menu, which is what the bare `web` template renders.
+ */
+export async function openSettings(page) {
+  const dialog = settingsDialog(page);
+  if ((await dialog.count()) > 0) return dialog;
+
+  let openedFromDirectControl = false;
+  try {
+    const direct = page.getByRole('button', { name: SETTINGS_TRIGGER, exact: true }).first();
+    await direct.waitFor({ state: 'visible', timeout: 3_000 });
+    await direct.click();
+    openedFromDirectControl = true;
+  } catch {
+    // The bare `web` template has no standalone control; fall through to the
+    // account menu below.
+  }
+
+  if (!openedFromDirectControl) {
+    // The account menu trigger's accessible name is 账号菜单 in every signed
+    // state; the text form 更多 is only a signed-out fallback (and the sidebar's
+    // panel "更多" row shares it, so it must be the last such button).
+    const triggers = [
+      page.getByRole('button', { name: ACCOUNT_MENU_LABEL, exact: true }).first(),
+      page.getByRole('button', { name: ACCOUNT_MENU_TRIGGER }).last(),
+    ];
+    let menuOpened = false;
+    let lastError = null;
+    for (const trigger of triggers) {
+      try {
+        await trigger.waitFor({ state: 'visible', timeout: 5_000 });
+        await trigger.click();
+        menuOpened = true;
+        break;
+      } catch (error) {
+        lastError = error;
+        await page.keyboard.press('Escape').catch(() => {});
+      }
+    }
+    if (!menuOpened) {
+      throw new Error(`could not find the Settings control or the sidebar account menu: ${await settingsDiagnostics(page)}`, { cause: lastError ?? undefined });
+    }
+    const menuItem = page.getByRole('menuitem', { name: SETTINGS_TRIGGER }).first();
+    try {
+      await menuItem.waitFor({ state: 'visible', timeout: 10_000 });
+      await menuItem.click();
+    } catch (error) {
+      // Some menu primitives render the label without the menuitem role.
+      const textItem = page.getByRole('menu').getByText(SETTINGS_TRIGGER, { exact: true }).first();
+      try {
+        await textItem.waitFor({ state: 'visible', timeout: 5_000 });
+        await textItem.click();
+      } catch {
+        throw new Error(`the account menu has no 设置 item: ${await settingsDiagnostics(page)}`, { cause: error });
+      }
+    }
+  }
+
+  try {
+    await dialog.waitFor({ state: 'visible', timeout: 20_000 });
+  } catch (error) {
+    throw new Error(`the Settings dialog did not open: ${await settingsDiagnostics(page)}`, { cause: error });
+  }
+  return dialog;
+}
+
+/** Select one section cell in the Settings navigation rail and wait for its content. */
+export async function selectSettingsSection(page, name) {
+  const dialog = settingsDialog(page);
+  const cell = dialog.getByRole('button', { name }).first();
+  await cell.waitFor({ state: 'visible', timeout: 20_000 });
+  await cell.click();
+  return dialog;
+}
+
+/** Open Settings and select the plugin's MCP 管理 section. */
+export async function openMcpSettings(page) {
+  const dialog = await openSettings(page);
+  await selectSettingsSection(page, SIDEBAR_MCP);
+  const root = dialog.locator('[data-testid="mcp-page"]');
+  await root.waitFor({ state: 'visible', timeout: 20_000 });
+  await dialog.locator('[data-testid="mcp-list"]').waitFor({ state: 'visible', timeout: 20_000 });
+  return dialog;
+}
+
+/** The management page rendered inside the Settings dialog (never the sidebar copy). */
+export function settingsPageRoot(page) {
+  return settingsDialog(page).locator('[data-testid="mcp-page"]');
+}
+
+/** Close Settings with Escape, the documented dismissal path. */
+export async function closeSettings(page) {
+  const dialog = settingsDialog(page);
+  if ((await dialog.count()) === 0) return false;
+  await page.keyboard.press('Escape');
+  await dialog.waitFor({ state: 'detached', timeout: 15_000 });
+  return true;
+}
+
+/** Read the Settings-only sidebar-entry row: presence, switch state and copy. */
+export async function sidebarEntryRowState(page) {
+  const row = settingsPageRoot(page).locator('[data-testid="sidebar-entry-row"]');
+  const toggle = settingsPageRoot(page).locator('[data-testid="sidebar-entry-toggle"]');
+  return {
+    rows: await row.count(),
+    toggles: await toggle.count(),
+    checked: (await toggle.getAttribute('aria-checked').catch(() => undefined)) ?? undefined,
+    disabled: await toggle.isDisabled().catch(() => undefined),
+    label: (await row.innerText().catch(() => '')) ?? '',
+  };
+}
+
+/**
+ * Flip the optional sidebar module through the Settings switch.
+ * Waits for the switch to settle (it is disabled while the PUT is in flight)
+ * and for the requested aria-checked state.
+ */
+export async function setSidebarEntryEnabled(page, enabled) {
+  const toggle = settingsPageRoot(page).locator('[data-testid="sidebar-entry-toggle"]');
+  await toggle.waitFor({ state: 'visible', timeout: 20_000 });
+  await waitFor(async () => ((await toggle.isDisabled()) === false ? true : undefined), {
+    timeoutMs: 20_000,
+    intervalMs: 100,
+    label: 'sidebar-entry switch to become editable',
+  });
+  const target = enabled ? 'true' : 'false';
+  if ((await toggle.getAttribute('aria-checked')) !== target) await toggle.click();
+  await waitFor(async () => ((await toggle.getAttribute('aria-checked')) === target ? true : undefined), {
+    timeoutMs: 20_000,
+    intervalMs: 100,
+    label: `sidebar-entry switch aria-checked=${target}`,
+  });
+  return toggle;
+}
+
 // ── management page: cards ──────────────────────────────────────────────────
 
-export function card(page, name) {
-  return page.locator(`[data-testid="server-card"][data-server-name="${name}"]`);
+/**
+ * One server card. `scope` narrows the search to a subtree when the manager is
+ * embedded (the Settings dialog) or when both presentations are on screen.
+ */
+export function card(page, name, scope = page) {
+  return scope.locator(`[data-testid="server-card"][data-server-name="${name}"]`);
 }
 
-export async function cardNames(page) {
-  return page.locator('[data-testid="server-card"]').evaluateAll((cards) => cards.map((entry) => entry.getAttribute('data-server-name')));
+export async function cardNames(page, scope = page) {
+  return scope.locator('[data-testid="server-card"]').evaluateAll((cards) => cards.map((entry) => entry.getAttribute('data-server-name')));
 }
 
-export async function cardState(page, name) {
-  const locator = card(page, name);
+export async function cardState(page, name, scope = page) {
+  const locator = card(page, name, scope);
   await locator.waitFor({ state: 'attached', timeout: 20_000 });
   return locator.locator('[data-testid="status-dot"]').getAttribute('data-state');
 }
 
-export async function cardText(page, name) {
-  return card(page, name).innerText();
+export async function cardText(page, name, scope = page) {
+  return card(page, name, scope).innerText();
 }
 
 /**
  * Visual icon state of one card: the server-icon <img> (loaded bytes via
  * naturalWidth) or the first-letter fallback element.
  */
-export async function cardIcon(page, name) {
-  const locator = card(page, name);
+export async function cardIcon(page, name, scope = page) {
+  const locator = card(page, name, scope);
   // One DOM snapshot instead of count-then-read: the card swaps the <img> for
   // the first-letter fallback when the icon request 404s, so a per-locator read
   // can race the re-render. evaluateAll never waits for the element to exist.
@@ -257,30 +454,30 @@ export async function cardIcon(page, name) {
 }
 
 /** Poll a card's derived status until it reaches one of `states`. */
-export async function waitCardState(page, name, states, { timeoutMs = 30_000 } = {}) {
+export async function waitCardState(page, name, states, { timeoutMs = 30_000, scope = page } = {}) {
   const accepted = Array.isArray(states) ? states : [states];
   return waitFor(
     async () => {
-      const state = await cardState(page, name);
+      const state = await cardState(page, name, scope);
       return accepted.includes(state) ? state : undefined;
     },
     { timeoutMs, intervalMs: 300, label: `card "${name}" state ${accepted.join('/')}` },
   );
 }
 
-export async function waitCardText(page, name, text, { timeoutMs = 30_000 } = {}) {
+export async function waitCardText(page, name, text, { timeoutMs = 30_000, scope = page } = {}) {
   return waitFor(
     async () => {
-      const content = await cardText(page, name).catch(() => '');
+      const content = await cardText(page, name, scope).catch(() => '');
       return content.includes(text) ? content : undefined;
     },
     { timeoutMs, intervalMs: 300, label: `card "${name}" to contain ${JSON.stringify(text)}` },
   );
 }
 
-async function openCardMenu(page, name, itemTestId) {
+async function openCardMenu(page, name, itemTestId, scope = page) {
   await clearOverlays(page);
-  const menu = card(page, name).locator('[data-testid="server-menu"]');
+  const menu = card(page, name, scope).locator('[data-testid="server-menu"]');
   await menu.click();
   const item = page.locator(`[data-testid="${itemTestId}"]`);
   await item.waitFor({ state: 'visible', timeout: 10_000 });
@@ -289,10 +486,11 @@ async function openCardMenu(page, name, itemTestId) {
 
 // ── management page: form ───────────────────────────────────────────────────
 
-export async function openAddForm(page) {
+/** Open the add form inside `scope` (the page, or the Settings-mode manager root). */
+export async function openAddForm(page, scope = page) {
   await clearOverlays(page);
-  await page.locator('[data-testid="add-mcp"]').click();
-  await page.locator('[data-testid="form-name"]').waitFor({ state: 'visible', timeout: 15_000 });
+  await scope.locator('[data-testid="add-mcp"]').click();
+  await scope.locator('[data-testid="form-name"]').waitFor({ state: 'visible', timeout: 15_000 });
 }
 
 // ── management page: icon controls (0.2.0) ─────────────────────────────────
@@ -336,9 +534,9 @@ export async function resetIconToAuto(page) {
   await sleep(500);
 }
 
-export async function formValues(page) {
+export async function formValues(page, scope = page) {
   const read = async (testId) => {
-    const locator = page.locator(`[data-testid="${testId}"]`);
+    const locator = scope.locator(`[data-testid="${testId}"]`);
     return (await locator.count()) === 0 ? undefined : locator.first().inputValue().catch(() => undefined);
   };
   return {
@@ -356,8 +554,8 @@ export async function formValues(page) {
  * `presets` may be "all" or an array of preset ids; preset checkboxes exist
  * only after the 指定预设 radio is selected.
  */
-export async function fillServerForm(page, spec) {
-  const testId = (id) => page.locator(`[data-testid="${id}"]`);
+export async function fillServerForm(page, spec, scope = page) {
+  const testId = (id) => scope.locator(`[data-testid="${id}"]`);
   await testId('form-name').waitFor({ state: 'visible', timeout: 15_000 });
   await testId('form-name').fill(spec.name);
   if (spec.group !== undefined && spec.group !== '') await testId('form-group').fill(spec.group);
@@ -385,7 +583,7 @@ export async function fillServerForm(page, spec) {
       if (!(await checkbox.isChecked())) throw new Error(`preset checkbox ${presetId} did not stay checked`);
     }
   }
-  return formValues(page);
+  return formValues(page, scope);
 }
 
 /** Close an open server form by saving it (used after icon-only actions). */
@@ -401,43 +599,43 @@ export async function closeFormIfOpen(page) {
   return true;
 }
 
-export async function saveForm(page, { expectError = false } = {}) {
-  await page.locator('[data-testid="form-save"]').click();
+export async function saveForm(page, { expectError = false, scope = page } = {}) {
+  await scope.locator('[data-testid="form-save"]').click();
   if (expectError) {
     await sleep(1000);
     return;
   }
-  await waitFor(async () => (await page.locator('[data-testid="form-name"]').count()) === 0, {
+  await waitFor(async () => (await scope.locator('[data-testid="form-name"]').count()) === 0, {
     timeoutMs: 20_000,
     label: 'form to close after save',
   });
 }
 
-export async function editServer(page, name) {
-  await openCardMenu(page, name, 'menu-edit');
-  await page.locator('[data-testid="form-name"]').waitFor({ state: 'visible', timeout: 15_000 });
-  await waitFor(async () => (await page.locator('[data-testid="form-name"]').inputValue()) === name, {
+export async function editServer(page, name, scope = page) {
+  await openCardMenu(page, name, 'menu-edit', scope);
+  await scope.locator('[data-testid="form-name"]').waitFor({ state: 'visible', timeout: 15_000 });
+  await waitFor(async () => (await scope.locator('[data-testid="form-name"]').inputValue()) === name, {
     timeoutMs: 10_000,
     label: `edit form for ${name}`,
   });
 }
 
-export async function updateUrl(page, url) {
-  const field = page.locator('[data-testid="form-url"]');
+export async function updateUrl(page, url, scope = page) {
+  const field = scope.locator('[data-testid="form-url"]');
   await field.waitFor({ state: 'visible', timeout: 10_000 });
   await field.fill(url);
 }
 
-export async function toggleServer(page, name) {
-  await openCardMenu(page, name, 'menu-toggle');
+export async function toggleServer(page, name, scope = page) {
+  await openCardMenu(page, name, 'menu-toggle', scope);
 }
 
-export async function deleteServerViaCard(page, name) {
-  await openCardMenu(page, name, 'menu-delete');
+export async function deleteServerViaCard(page, name, scope = page) {
+  await openCardMenu(page, name, 'menu-delete', scope);
   const confirm = page.locator('[data-testid="confirm-dialog"]');
   await confirm.waitFor({ state: 'visible', timeout: 10_000 });
   await page.locator('[data-testid="confirm-delete"]').click();
-  await waitFor(async () => (await card(page, name).count()) === 0, {
+  await waitFor(async () => (await card(page, name, scope).count()) === 0, {
     timeoutMs: 20_000,
     label: `card "${name}" to disappear after delete`,
   });
@@ -445,8 +643,8 @@ export async function deleteServerViaCard(page, name) {
 
 // ── management page: error detail / test dialogs ────────────────────────────
 
-export async function openErrorDetail(page, name) {
-  const link = card(page, name).locator('[data-testid="detail-error"]');
+export async function openErrorDetail(page, name, scope = page) {
+  const link = card(page, name, scope).locator('[data-testid="detail-error"]');
   await link.waitFor({ state: 'visible', timeout: 20_000 });
   await link.click();
   const dialog = page.locator('[data-testid="error-dialog"]');
@@ -467,8 +665,8 @@ export async function openErrorDetail(page, name) {
  * live card (which the contract renders as 重连中 while a retry is scheduled),
  * this dialog shows the literal 连接失败 for a failing connection.
  */
-export async function testServerViaCard(page, name) {
-  await openCardMenu(page, name, 'menu-test');
+export async function testServerViaCard(page, name, scope = page) {
+  await openCardMenu(page, name, 'menu-test', scope);
   const dialog = page.locator('[data-testid="test-dialog"]');
   await dialog.waitFor({ state: 'visible', timeout: 10_000 });
   await waitFor(
@@ -553,6 +751,16 @@ export async function screenshotViewport(page, path) {
   await mkdir(dirname(path), { recursive: true });
   await page.screenshot({ path, animations: 'disabled' });
   return path;
+}
+
+/**
+ * Full-viewport screenshot with the Settings dialog open on the MCP section:
+ * the primary docs image for 0.5.0 (Settings is the default entry).
+ */
+export async function screenshotSettingsViewport(page, path) {
+  const dialog = settingsDialog(page);
+  await dialog.waitFor({ state: 'visible', timeout: 10_000 });
+  return screenshotViewport(page, path);
 }
 
 // ── management page: 工具 tab (0.3.0) ───────────────────────────────────────

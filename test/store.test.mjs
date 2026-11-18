@@ -11,7 +11,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { normalizeDraft } from '../lib/model.js';
-import { createStore, resolveDataDir, STORE_FILE, STORE_VERSION } from '../lib/store.js';
+import { createStore, PREFERENCES_FILE, PREFERENCES_VERSION, resolveDataDir, STORE_FILE, STORE_VERSION } from '../lib/store.js';
 
 /** A disposable data directory removed when the test finishes. */
 async function tempDir(t) {
@@ -366,4 +366,121 @@ test('store: patch is a serialized read-modify-write that reports what happened'
   await reopened.load();
   assert.equal(reopened.get(second.id).mark, 5);
   await reopened.close();
+});
+
+/* ---------------------------------------------------------------- */
+/* 0.5.0 UI preferences (the optional sidebar module toggle)          */
+/* ---------------------------------------------------------------- */
+
+test('store: preferences default to off and a load writes no file', async (t) => {
+  const dir = await tempDir(t);
+  const warnings = [];
+  const store = createStore({ dir, logger: (level, message) => warnings.push([level, message]) });
+  const summary = await store.load();
+  assert.deepEqual(summary, { loaded: 0, dropped: 0 }, 'the server report shape is unchanged');
+  assert.deepEqual(store.preferences(), { sidebarEntry: false });
+  assert.equal(store.preferencesPath(), join(dir, PREFERENCES_FILE));
+  assert.equal(existsSync(join(dir, PREFERENCES_FILE)), false, 'load must not create preferences.json');
+  assert.deepEqual(await readdir(dir), []);
+  assert.deepEqual(warnings, []);
+  await store.close();
+});
+
+test('store: setPreferences persists mode 0600 preferences.json and round-trips', async (t) => {
+  const dir = await tempDir(t);
+  const preferencesFile = join(dir, PREFERENCES_FILE);
+  const store = createStore({ dir });
+  await store.load();
+
+  assert.deepEqual(await store.setPreferences({ sidebarEntry: true }), { sidebarEntry: true });
+  assert.deepEqual(store.preferences(), { sidebarEntry: true });
+  assert.deepEqual(await readdir(dir), [PREFERENCES_FILE], 'no temporary file may survive the write');
+  assert.equal((await stat(preferencesFile)).mode & 0o777, 0o600, 'preferences are private');
+  assert.deepEqual(JSON.parse(await readFile(preferencesFile, 'utf8')), { version: PREFERENCES_VERSION, sidebarEntry: true });
+  await store.close();
+
+  const reopened = createStore({ dir });
+  const summary = await reopened.load();
+  assert.deepEqual(summary, { loaded: 0, dropped: 0 });
+  assert.deepEqual(reopened.preferences(), { sidebarEntry: true }, 'the toggle survives a reload');
+  assert.deepEqual(await reopened.setPreferences({ sidebarEntry: false }), { sidebarEntry: false });
+  await reopened.close();
+
+  const again = createStore({ dir });
+  await again.load();
+  assert.deepEqual(again.preferences(), { sidebarEntry: false });
+  assert.deepEqual(JSON.parse(await readFile(preferencesFile, 'utf8')), { version: PREFERENCES_VERSION, sidebarEntry: false });
+  await again.close();
+});
+
+test('store: a preferences-only directory loads without changing the server report', async (t) => {
+  const dir = await tempDir(t);
+  await writeFile(join(dir, PREFERENCES_FILE), JSON.stringify({ version: PREFERENCES_VERSION, sidebarEntry: true }), { mode: 0o600 });
+  const warnings = [];
+  const store = createStore({ dir, logger: (level, message) => warnings.push([level, message]) });
+  const summary = await store.load();
+  assert.deepEqual(summary, { loaded: 0, dropped: 0 }, 'a missing servers.json still reports the backward-compatible shape');
+  assert.deepEqual(store.preferences(), { sidebarEntry: true });
+  assert.deepEqual(warnings, [], 'a missing servers.json with valid preferences is not a warning');
+  assert.deepEqual(await readdir(dir), [PREFERENCES_FILE], 'a read must never create servers.json');
+  await store.close();
+});
+
+test('store: damaged preferences are ignored with a warning and replaced by the next write', async (t) => {
+  const cases = [
+    { text: '{ this is not json', reason: /not valid JSON/u },
+    { text: JSON.stringify({ version: PREFERENCES_VERSION, sidebarEntry: 'yes' }), reason: /unknown shape or version/u },
+    { text: JSON.stringify({ version: 99, sidebarEntry: true }), reason: /unknown shape or version/u },
+    { text: JSON.stringify(['sidebarEntry']), reason: /unknown shape or version/u },
+  ];
+  for (const { text, reason } of cases) {
+    const dir = await tempDir(t);
+    const preferencesFile = join(dir, PREFERENCES_FILE);
+    await writeFile(preferencesFile, text, { mode: 0o600 });
+    const warnings = [];
+    const store = createStore({ dir, logger: (level, message) => warnings.push([level, message]) });
+    await store.load();
+    assert.deepEqual(store.preferences(), { sidebarEntry: false }, `damaged preferences must reset to the defaults: ${text}`);
+    assert.ok(
+      warnings.some(([level, message]) => level === 'warn' && message.includes(PREFERENCES_FILE) && reason.test(message)),
+      `the damage must be logged, got ${JSON.stringify(warnings)}`,
+    );
+    assert.equal(existsSync(preferencesFile), true, 'a damaged preferences file is never quarantined');
+    assert.deepEqual(await readdir(dir), [PREFERENCES_FILE], 'resetting creates no side file');
+    assert.deepEqual(await store.setPreferences({ sidebarEntry: true }), { sidebarEntry: true });
+    assert.deepEqual(JSON.parse(await readFile(preferencesFile, 'utf8')), { version: PREFERENCES_VERSION, sidebarEntry: true }, 'the next write replaces the damaged file');
+    await store.close();
+  }
+});
+
+test('store: preference and server writes share one queue, and close() awaits both', async (t) => {
+  const dir = await tempDir(t);
+  const store = createStore({ dir });
+  await store.load();
+  const record = draft('Queued with preferences');
+  const writes = Promise.all([store.put(record), store.setPreferences({ sidebarEntry: true })]);
+  await Promise.resolve();
+  await store.close();
+  await writes;
+  const raw = JSON.parse(await readFile(join(dir, STORE_FILE), 'utf8'));
+  assert.equal(raw.version, STORE_VERSION);
+  assert.equal(raw.servers.length, 1);
+  assert.equal(raw.servers[0].id, record.id);
+  assert.deepEqual(JSON.parse(await readFile(join(dir, PREFERENCES_FILE), 'utf8')), { version: PREFERENCES_VERSION, sidebarEntry: true });
+  assert.deepEqual((await readdir(dir)).sort(), [PREFERENCES_FILE, STORE_FILE].sort(), 'no temporary file remains');
+});
+
+test('store: the servers schema stays version 3 when preferences are written', async (t) => {
+  const dir = await tempDir(t);
+  const store = createStore({ dir });
+  await store.load();
+  const record = draft('Schema check');
+  await store.put(record);
+  await store.setPreferences({ sidebarEntry: true });
+  await store.close();
+  const raw = JSON.parse(await readFile(join(dir, STORE_FILE), 'utf8'));
+  assert.equal(STORE_VERSION, 3, '0.5.0 adds a second file, not a new servers schema');
+  assert.equal(raw.version, STORE_VERSION);
+  assert.deepEqual(raw.servers.map((server) => server.id), [record.id], 'the server list is written exactly as before');
+  assert.deepEqual(JSON.parse(await readFile(join(dir, PREFERENCES_FILE), 'utf8')), { version: PREFERENCES_VERSION, sidebarEntry: true });
 });

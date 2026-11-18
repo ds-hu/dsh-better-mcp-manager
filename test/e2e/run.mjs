@@ -9,10 +9,16 @@
  *   boot       an isolated profile (fresh copy of the shipped `web` template,
  *              the packed tarball installed with `dsh plugin add`) boots in its
  *              own systemd scope and prints an authenticated URL;
- *   bundle     the sidebar row `MCP 管理` sits directly below `自动化任务` and
- *              opens the management page with no console/page errors;
- *   CRUD       stdio + streamable-HTTP servers connect with live tool counts,
- *              a wrong port surfaces a failing (重连中) card whose 详情 dialog
+ *   entry      a fresh profile has no sidebar row: the manager is a DSH Settings
+ *              section (`设置 → MCP 管理`) that renders the full page inside the
+ *              dialog, with no console/page errors;
+ *   sidebar    the Settings-only switch mounts the optional sidebar module live,
+ *              the Host persists `sidebarEntry` (GET/PUT /preferences and
+ *              preferences.json), a reload keeps the row, and switching it off
+ *              unregisters it again;
+ *   CRUD       stdio + streamable-HTTP servers connect with live tool counts
+ *              (the first one is added through the Settings page), a wrong port
+ *              surfaces a failing (重连中) card whose 详情 dialog
  *              and 测试连接 dialog carry the real error, editing to the right
  *              port recovers, the enable switch round-trips, and deleting
  *              removes the card;
@@ -206,6 +212,19 @@ async function main() {
       );
       reporter.check('data directory is under the isolated DSH_HOME', catalog?.dataDir === DATA_DIR, catalog?.dataDir);
 
+      const preferences = await api.preferences();
+      reporter.check(
+        'GET /preferences answers the Host-owned default { sidebarEntry: false }',
+        preferences?.ok === true && preferences?.preferences?.sidebarEntry === false,
+        redact(JSON.stringify(preferences)),
+      );
+      const invalidPreference = await api.request('PUT', '/better-mcp-manager/api/preferences', { body: { sidebarEntry: 'yes' }, expectOk: false });
+      reporter.check(
+        'PUT /preferences rejects an invalid body with 400 invalid-preferences and keeps the old value',
+        invalidPreference.status === 400 && invalidPreference.payload?.code === 'invalid-preferences' && (await api.preferences()).preferences?.sidebarEntry === false,
+        `HTTP ${invalidPreference.status} ${redact(invalidPreference.text).slice(0, 160)}`,
+      );
+
       const bootScan = await scanBootLog({ logPath: dsh.logPath, errPath: dsh.errPath });
       reporter.check(
         'no plugin mount errors or duplicate rows in the boot log',
@@ -223,8 +242,8 @@ async function main() {
       reporter.check('unknown non-API plugin path never answers 5xx', unknownPage.status < 500, `HTTP ${unknownPage.status}`);
     });
 
-    // ── phase 3: browser — bundle loads ──────────────────────────────────
-    await reporter.step('sidebar entry + management page render in the real browser', async () => {
+    // ── phase 3: browser — the default entry is a Settings section ───────
+    await reporter.step('default entry is Settings → MCP 管理; the sidebar module is off', async () => {
       const browser = await launchBrowser({ reporter });
       resources.browser = browser;
       const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: 'zh-CN', timezoneId: 'UTC' });
@@ -233,16 +252,24 @@ async function main() {
       await ui.openApp(page, dsh.url);
 
       const order = await ui.sidebarPanelOrder(page);
-      reporter.check(
-        'sidebar shows MCP 管理 directly below 自动化任务',
-        order.automationIndex >= 0 && order.mcpIndex === order.automationIndex + 1 && order.mcpBox !== null && order.automationBox !== null && order.mcpBox.y > order.automationBox.y,
-        `rows: ${order.rows.join(' | ')}`,
-      );
+      reporter.check('a fresh profile shows no MCP 管理 row in the sidebar', (await ui.sidebarHasMcp(page)) === false && order.mcpIndex === -1 && order.mcpBox === null, `rows: ${order.rows.join(' | ')}`);
+      reporter.check('the sidebar still renders 自动化任务 without the optional module', order.automationIndex >= 0, `rows: ${order.rows.join(' | ')}`);
 
-      await ui.openMcpPage(page);
-      reporter.check('clicking MCP 管理 opens the management page', (await page.locator('[data-testid="mcp-page"]').count()) === 1);
+      const defaults = await api.preferences();
+      reporter.check('GET /preferences reports the default sidebarEntry=false', defaults?.ok === true && defaults?.preferences?.sidebarEntry === false, redact(JSON.stringify(defaults)));
+
+      await ui.openMcpSettings(page);
+      const root = ui.settingsPageRoot(page);
+      reporter.check('the Settings navigation has an MCP 管理 cell that opens the manager', (await page.locator('[data-testid="mcp-page"]').count()) === 1);
+      reporter.check('the manager renders inside the Settings dialog in settings mode', (await root.getAttribute('data-mode')) === 'settings', `data-mode=${await root.getAttribute('data-mode')}`);
+      const row = await ui.sidebarEntryRowState(page);
       reporter.check(
-        'no console errors or page errors while opening the plugin page',
+        'the Settings-only row offers the sidebar-entry switch, off by default',
+        row.rows === 1 && row.toggles === 1 && row.checked === 'false' && row.label.includes('在侧边栏显示 MCP 管理入口'),
+        redact(row.label.replaceAll('\n', ' ')),
+      );
+      reporter.check(
+        'no console errors or page errors while opening the Settings entry',
         diagnostics.consoleErrors.length === 0 && diagnostics.pageErrors.length === 0,
         redact([...diagnostics.consoleErrors, ...diagnostics.pageErrors].slice(0, 3).join(' | ')),
       );
@@ -254,23 +281,28 @@ async function main() {
     const httpName = 'E2E HTTP 服务器';
     const brokenName = 'E2E 故障服务器';
 
-    await reporter.step('add the stdio fixture through the form with preset scoping', async () => {
-      await ui.openAddForm(page);
+    await reporter.step('add the stdio fixture through the Settings page with preset scoping', async () => {
+      // The first server is created through the default entry (Settings); the
+      // optional sidebar module does not exist yet.
+      const settingsRoot = ui.settingsPageRoot(page);
+      await ui.openAddForm(page, settingsRoot);
       const values = await ui.fillServerForm(page, {
         name: stdioName,
         transport: 'stdio',
         command: stdioSpec.command,
         args: stdioSpec.args,
         presets: ['standard'],
-      });
+      }, settingsRoot);
       reporter.check('form accepted name/command/args and 指定预设+标准模式', values.name === stdioName && values.command === stdioSpec.command && values.args === stdioSpec.args.join('\n'));
 
       screenshotArtifacts.push(await ui.screenshotPresetSection(page, join(ARTIFACT_DIR, 'mcp-manager-form-presets.png')));
 
-      await ui.saveForm(page);
-      await ui.waitCardState(page, stdioName, 'connected');
-      const text = await ui.waitCardText(page, stdioName, '工具 2/2');
-      reporter.check('saved stdio server shows 已连接 · 内置 · 工具 2/2', text.includes('已连接') && text.includes('内置') && text.includes('工具 2/2'), text.replaceAll('\n', ' '));
+      await ui.saveForm(page, { scope: settingsRoot });
+      await ui.waitCardState(page, stdioName, 'connected', { scope: settingsRoot });
+      const text = await ui.waitCardText(page, stdioName, '工具 2/2', { scope: settingsRoot });
+      reporter.check('saved stdio server shows 已连接 · 内置 · 工具 2/2 inside the Settings dialog', text.includes('已连接') && text.includes('内置') && text.includes('工具 2/2'), text.replaceAll('\n', ' '));
+      const namesInSettings = await ui.cardNames(page, settingsRoot);
+      reporter.check('the Settings-mode list renders exactly the new server card', namesInSettings.includes(stdioName), namesInSettings.join(' | '));
 
       const catalog = await api.servers();
       const record = catalog.servers.find((server) => server.name === stdioName);
@@ -326,15 +358,16 @@ async function main() {
 
     let httpId;
     await reporter.step('wrong port surfaces a failing card with 详情 + 测试连接 diagnostics', async () => {
+      const settingsRoot = ui.settingsPageRoot(page);
       const deadPort = await freePort();
-      await ui.openAddForm(page);
+      await ui.openAddForm(page, settingsRoot);
       await ui.fillServerForm(page, {
         name: httpName,
         transport: 'http',
         url: `http://127.0.0.1:${deadPort}/mcp`,
         presets: 'all',
-      });
-      await ui.saveForm(page);
+      }, settingsRoot);
+      await ui.saveForm(page, { scope: settingsRoot });
 
       // Capture the record before any UI-word assertion: later steps depend on its id.
       const catalog = await api.servers();
@@ -347,8 +380,8 @@ async function main() {
         JSON.stringify({ state: record.status?.state, code: record.status?.error?.code, nextRetryAt: record.status?.nextRetryAt }),
       );
 
-      const state = await ui.waitCardState(page, httpName, ['error', 'retrying'], { timeoutMs: 40_000 });
-      const card = await ui.waitCardText(page, httpName, 'ECONNREFUSED');
+      const state = await ui.waitCardState(page, httpName, ['error', 'retrying'], { timeoutMs: 40_000, scope: settingsRoot });
+      const card = await ui.waitCardText(page, httpName, 'ECONNREFUSED', { scope: settingsRoot });
       reporter.check(
         'failing card shows the contract word 重连中 and the real ECONNREFUSED error bubble',
         card.includes('重连中') && /ECONNREFUSED/.test(card),
@@ -356,7 +389,7 @@ async function main() {
       );
       reporter.check('failing card status dot reports retrying/error', state === 'retrying' || state === 'error', `data-state=${state}`);
 
-      const error = await ui.openErrorDetail(page, httpName);
+      const error = await ui.openErrorDetail(page, httpName, settingsRoot);
       screenshotArtifacts.push(await ui.screenshotElement(error.dialog, join(ARTIFACT_DIR, 'mcp-manager-error-detail.png'), { maxHeight: 310 }));
       reporter.check(
         '详情 dialog shows 错误码 connect-failed, 错误信息 with ECONNREFUSED and 下次重试',
@@ -365,7 +398,7 @@ async function main() {
       );
       await error.close();
 
-      const test = await ui.testServerViaCard(page, httpName);
+      const test = await ui.testServerViaCard(page, httpName, settingsRoot);
       reporter.check(
         'menu → 测试连接 dialog shows the literal 连接失败 with the error message',
         test.text.includes('连接失败') && /ECONNREFUSED/.test(test.text),
@@ -375,12 +408,13 @@ async function main() {
     });
 
     await reporter.step('editing the URL to the live port recovers to 已连接 + 工具 3/3', async () => {
-      await ui.editServer(page, httpName);
-      await ui.updateUrl(page, fixtures.mcpUrl);
-      await ui.saveForm(page);
-      await ui.waitCardState(page, httpName, 'connected');
-      const text = await ui.waitCardText(page, httpName, '工具 3/3');
-      reporter.check('edited HTTP server shows 已连接 · HTTP · 工具 3/3', text.includes('已连接') && text.includes('HTTP') && text.includes('工具 3/3'), text.replaceAll('\n', ' '));
+      const settingsRoot = ui.settingsPageRoot(page);
+      await ui.editServer(page, httpName, settingsRoot);
+      await ui.updateUrl(page, fixtures.mcpUrl, settingsRoot);
+      await ui.saveForm(page, { scope: settingsRoot });
+      await ui.waitCardState(page, httpName, 'connected', { scope: settingsRoot });
+      const text = await ui.waitCardText(page, httpName, '工具 3/3', { scope: settingsRoot });
+      reporter.check('edited HTTP server shows 已连接 · HTTP · 工具 3/3 in the Settings-mode list', text.includes('已连接') && text.includes('HTTP') && text.includes('工具 3/3'), text.replaceAll('\n', ' '));
 
       if (httpId === undefined) throw new Error('no HTTP server id captured for the edit step');
       const detail = await api.serverDetail(httpId);
@@ -396,24 +430,116 @@ async function main() {
     });
 
     await reporter.step('the enable switch round-trips through 已停用 and back to 已连接', async () => {
-      await ui.toggleServer(page, httpName);
-      await ui.waitCardState(page, httpName, 'disabled');
-      await ui.waitCardText(page, httpName, '已停用');
+      const settingsRoot = ui.settingsPageRoot(page);
+      await ui.toggleServer(page, httpName, settingsRoot);
+      await ui.waitCardState(page, httpName, 'disabled', { scope: settingsRoot });
+      await ui.waitCardText(page, httpName, '已停用', { scope: settingsRoot });
       let catalog = await api.servers();
       reporter.check('disabling the server persists enabled=false', catalog.servers.find((server) => server.name === httpName)?.enabled === false);
 
-      await ui.toggleServer(page, httpName);
-      await ui.waitCardState(page, httpName, 'connected');
-      await ui.waitCardText(page, httpName, '工具 3/3');
+      await ui.toggleServer(page, httpName, settingsRoot);
+      await ui.waitCardState(page, httpName, 'connected', { scope: settingsRoot });
+      await ui.waitCardText(page, httpName, '工具 3/3', { scope: settingsRoot });
       catalog = await api.servers();
       reporter.check('re-enabling the server reconnects it and persists enabled=true', catalog.servers.find((server) => server.name === httpName)?.enabled === true && catalog.servers.find((server) => server.name === httpName)?.status?.state === 'connected');
 
       // Leave it disabled for the mixed-state screenshot below.
-      await ui.toggleServer(page, httpName);
-      await ui.waitCardState(page, httpName, 'disabled');
+      await ui.toggleServer(page, httpName, settingsRoot);
+      await ui.waitCardState(page, httpName, 'disabled', { scope: settingsRoot });
+    });
+
+    await reporter.step('the optional sidebar module: toggle on, persist, reload, toggle off and back on', async () => {
+      // Settings is still open on the MCP section from the CRUD steps above.
+      await ui.setSidebarEntryEnabled(page, true);
+      const enabledRow = await ui.sidebarEntryRowState(page);
+      reporter.check('the Settings switch reports aria-checked=true after the Host write settles', enabledRow.checked === 'true', JSON.stringify(enabledRow));
+
+      const order = await ui.sidebarPanelOrder(page);
+      reporter.check(
+        'the sidebar MCP 管理 row appears directly below 自动化任务',
+        order.automationIndex >= 0 && order.mcpIndex === order.automationIndex + 1 && order.mcpBox !== null && order.automationBox !== null && order.mcpBox.y > order.automationBox.y,
+        `rows: ${order.rows.join(' | ')}`,
+      );
+
+      const enabledPreferences = await api.preferences();
+      reporter.check('GET /preferences reports sidebarEntry=true after the switch-on', enabledPreferences?.ok === true && enabledPreferences?.preferences?.sidebarEntry === true, redact(JSON.stringify(enabledPreferences)));
+      const enabledFile = await waitFor(
+        async () => {
+          try {
+            const parsed = JSON.parse(await readFile(join(DATA_DIR, 'preferences.json'), 'utf8'));
+            return parsed?.sidebarEntry === true ? parsed : undefined;
+          } catch {
+            return undefined;
+          }
+        },
+        { timeoutMs: 15_000, intervalMs: 250, label: 'preferences.json to record sidebarEntry=true' },
+      );
+      reporter.check(
+        'preferences.json is persisted in the isolated data directory as { version: 1, sidebarEntry: true }',
+        enabledFile?.version === 1 && enabledFile?.sidebarEntry === true,
+        redact(JSON.stringify(enabledFile)),
+      );
+
+      // Host persistence must survive a full page reload: the preference is not
+      // browser state, so a fresh page reads the same value back.
+      await ui.reloadApp(page);
+      reporter.check('the sidebar entry survives a page reload (Host persistence)', (await ui.sidebarHasMcp(page)) === true);
+      const reloadedOrder = await ui.sidebarPanelOrder(page);
+      reporter.check(
+        'the reloaded row is still directly below 自动化任务',
+        reloadedOrder.automationIndex >= 0 && reloadedOrder.mcpIndex === reloadedOrder.automationIndex + 1,
+        `rows: ${reloadedOrder.rows.join(' | ')}`,
+      );
+
+      // Switch it off again: the row must disappear live, then stay gone once
+      // the dialog is closed, and the Host view/file must say false.
+      await ui.openMcpSettings(page);
+      const reloadedRow = await ui.sidebarEntryRowState(page);
+      reporter.check('after the reload the switch reads its Host value as checked', reloadedRow.checked === 'true', JSON.stringify(reloadedRow));
+      await ui.setSidebarEntryEnabled(page, false);
+      reporter.check('the switch reports aria-checked=false after switching off', (await ui.sidebarEntryRowState(page)).checked === 'false');
+      reporter.check('the sidebar row disappears live while the Settings dialog is still open', (await ui.sidebarHasMcp(page)) === false);
+      const disabledPreferences = await api.preferences();
+      reporter.check('GET /preferences reports sidebarEntry=false again', disabledPreferences?.preferences?.sidebarEntry === false, redact(JSON.stringify(disabledPreferences)));
+      const disabledFile = await waitFor(
+        async () => {
+          try {
+            const parsed = JSON.parse(await readFile(join(DATA_DIR, 'preferences.json'), 'utf8'));
+            return parsed?.sidebarEntry === false ? parsed : undefined;
+          } catch {
+            return undefined;
+          }
+        },
+        { timeoutMs: 15_000, intervalMs: 250, label: 'preferences.json to record sidebarEntry=false' },
+      );
+      reporter.check('preferences.json is updated to sidebarEntry=false', disabledFile?.version === 1 && disabledFile?.sidebarEntry === false, redact(JSON.stringify(disabledFile)));
+
+      await ui.closeSettings(page);
+      reporter.check('the row stays gone after closing Settings', (await ui.sidebarHasMcp(page)) === false);
+
+      // Leave the run in the documented optional-module-on state so the rest of
+      // the flow and the sidebar screenshot exercise the sidebar presentation
+      // (the profile is throwaway).
+      await ui.openMcpSettings(page);
+      await ui.setSidebarEntryEnabled(page, true);
+      await ui.closeSettings(page);
+      reporter.check('the optional module is back on for the rest of the run', (await ui.sidebarHasMcp(page)) === true);
+      // Icon-endpoint 404s are expected noise in a profile whose fixtures declare
+      // no icons; the final network check classifies those precisely, so this
+      // mid-run check only rejects real page errors and other console errors.
+      const toggleConsole = diagnostics.consoleErrors.filter(
+        (text) => !/Failed to load resource: the server responded with a status of 404/u.test(text),
+      );
+      reporter.check(
+        'the toggle round-trip left no console/page errors (icon-fallback 404 noise excluded)',
+        toggleConsole.length === 0 && diagnostics.pageErrors.length === 0,
+        redact([...toggleConsole, ...diagnostics.pageErrors].slice(0, 3).join(' | ')),
+      );
     });
 
     await reporter.step('mixed-state list screenshot + delete removes the card', async () => {
+      // Downstream steps use the now-enabled sidebar entry.
+      await ui.openMcpPage(page);
       const deadPort = await freePort();
       await ui.openAddForm(page);
       await ui.fillServerForm(page, {
@@ -442,6 +568,11 @@ async function main() {
       screenshotArtifacts.push(await ui.screenshotPageSurface(page, join(ARTIFACT_DIR, 'mcp-manager-list.png')));
       // Whole viewport: sidebar with 自动化任务 directly above the active MCP 管理 row.
       screenshotArtifacts.push(await ui.screenshotViewport(page, join(ARTIFACT_DIR, 'mcp-manager-sidebar.png')));
+      // Hero image for 0.5.0: the Settings dialog on the MCP section, with the
+      // optional sidebar row visible in the sidebar behind it.
+      await ui.openMcpSettings(page);
+      screenshotArtifacts.push(await ui.screenshotSettingsViewport(page, join(ARTIFACT_DIR, 'mcp-manager-settings.png')));
+      await ui.closeSettings(page);
 
       await ui.deleteServerViaCard(page, brokenName);
       const remaining = await ui.cardNames(page);
@@ -1253,21 +1384,16 @@ async function main() {
       );
     });
 
-    const icon404s = diagnostics.httpErrors.filter((entry) => entry.status === 404 && /\/better-mcp-manager\/api\/servers\/[^/]+\/icon/.test(entry.url));
-    const unexpectedHttp = diagnostics.httpErrors.filter((entry) => !icon404s.includes(entry));
-    const explainedConsole = diagnostics.consoleErrors.filter(
-      (text) => icon404s.length > 0 && /Failed to load resource: the server responded with a status of 404/.test(text),
-    );
-    const unexpectedConsole = diagnostics.consoleErrors.filter((text) => !explainedConsole.includes(text));
+    const finalNoise = unexplainedDiagnostics(diagnostics);
     reporter.check(
       'no unexpected console/page/network errors (icon 404 fallbacks are the only allowed noise)',
-      unexpectedConsole.length === 0 && diagnostics.pageErrors.length === 0 && unexpectedHttp.length === 0,
+      finalNoise.unexpectedConsole.length === 0 && finalNoise.pageErrors.length === 0 && finalNoise.unexpectedHttp.length === 0,
       redact(
         [
-          ...unexpectedConsole,
-          ...diagnostics.pageErrors,
-          ...unexpectedHttp.map((entry) => `HTTP ${entry.status} ${entry.url}`),
-          `expected icon 404s: ${icon404s.length}`,
+          ...finalNoise.unexpectedConsole,
+          ...finalNoise.pageErrors,
+          ...finalNoise.unexpectedHttp.map((entry) => `HTTP ${entry.status} ${entry.url}`),
+          `expected icon 404s: ${finalNoise.icon404s.length}`,
         ].slice(0, 4).join(' | '),
       ),
     );
@@ -1308,7 +1434,17 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
   // Publish screenshots only from a fully successful UI pass (the caller has
   // already recorded failures; a missing artifact is a failure, not silence).
   await reporter.step('publish sanitized screenshots to docs/screenshots', async () => {
-    const wanted = ['mcp-manager-list.png', 'mcp-manager-sidebar.png', 'mcp-manager-error-detail.png', 'mcp-manager-form-presets.png', 'mcp-manager-form-icon.png', 'mcp-manager-form-tools.png', 'mcp-manager-external.png', 'mcp-manager-external-tools.png'];
+    const wanted = [
+      'mcp-manager-settings.png',
+      'mcp-manager-sidebar.png',
+      'mcp-manager-list.png',
+      'mcp-manager-error-detail.png',
+      'mcp-manager-form-presets.png',
+      'mcp-manager-form-icon.png',
+      'mcp-manager-form-tools.png',
+      'mcp-manager-external.png',
+      'mcp-manager-external-tools.png',
+    ];
     const published = [];
     for (const name of wanted) {
       const source = screenshotArtifacts.find((file) => basename(file) === name);
@@ -1320,7 +1456,7 @@ async function finish({ before, dsh, fixtures, page, screenshotArtifacts }) {
       await copyFile(source, target);
       published.push(`${name} (${formatBytes(size)})`);
     }
-    reporter.check('eight sanitized screenshots published under docs/screenshots', published.length === 8, published.join(', '));
+    reporter.check('nine sanitized screenshots published under docs/screenshots', published.length === 9, published.join(', '));
   });
 
   if (clean) {
@@ -1440,6 +1576,31 @@ function portClosed(port) {
 }
 
 /** 16x16 PNG dimensions, read from the IHDR chunk. */
+/**
+ * Browser diagnostics that no known benign noise explains. A server without a
+ * usable icon legitimately 404s its icon endpoint, and the browser logs one
+ * generic "Failed to load resource" console error per such response; those are
+ * expected while a card shows its first-letter fallback.
+ * @param {{ consoleErrors: string[], pageErrors: string[], httpErrors: {status: number, url: string}[] }} diagnostics - collector output.
+ * @returns {object} unexplained console/page/network entries, plus the benign icon 404s.
+ */
+function unexplainedDiagnostics(diagnostics) {
+  const icon404s = diagnostics.httpErrors.filter(
+    (entry) => entry.status === 404 && /\/better-mcp-manager\/api\/servers\/[^/]+\/icon/u.test(entry.url),
+  );
+  const explainedConsole = new Set(
+    diagnostics.consoleErrors.filter(
+      (text) => icon404s.length > 0 && /Failed to load resource: the server responded with a status of 404/u.test(text),
+    ),
+  );
+  return {
+    unexpectedConsole: diagnostics.consoleErrors.filter((text) => !explainedConsole.has(text)),
+    unexpectedHttp: diagnostics.httpErrors.filter((entry) => !icon404s.includes(entry)),
+    pageErrors: diagnostics.pageErrors,
+    icon404s,
+  };
+}
+
 function pngSize(bytes) {
   return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20), size: bytes.length };
 }
