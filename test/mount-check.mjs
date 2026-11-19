@@ -194,6 +194,22 @@ check('the Loader row name is the package name', () => {
   assert.equal(hostName, 'dsh-better-mcp-manager', 'the plugin id is frozen by docs/API-CONTRACT.md §1');
 });
 
+check('the row config key is the package name plus the patch row id', () => {
+  const rowId = /^\s*-\s+id:\s*(.+)$/mu.exec(hostPatch)?.[1]?.trim();
+  assert.ok(rowId, `no row id in ${patchPath}`);
+  const expected = `${manifest.name}#${rowId}`;
+  const bundle = /const\s+BUNDLE_NAME\s*=\s*"([^"]+)"/u.exec(clientSource)?.[1];
+  const row = /const\s+ROW_ID\s*=\s*"([^"]+)"/u.exec(clientSource)?.[1];
+  assert.equal(bundle, manifest.name, 'lib/client.js BUNDLE_NAME must equal package.json name');
+  assert.equal(row, rowId, 'lib/client.js ROW_ID must equal the cordis.patch.yml row id');
+  assert.match(
+    clientSource,
+    /const\s+ROW_CONFIG_KEY\s*=\s*BUNDLE_NAME\s*\+\s*"#"\s*\+\s*ROW_ID/u,
+    'ROW_CONFIG_KEY must be composed as BUNDLE_NAME + "#" + ROW_ID so package/row renames stay in sync',
+  );
+  assert.match(clientSource, /key:\s*ROW_CONFIG_KEY/u, `the plugins.row.config registration must pass key: ROW_CONFIG_KEY (composes to ${expected})`);
+});
+
 /* ---------------------------------------------------------------- */
 /* package.json exports / client entry / files                       */
 /* ---------------------------------------------------------------- */
@@ -228,16 +244,22 @@ check('the web client entry is declared', () => {
   );
 });
 
-check('the browser half declares the Settings entry and the optional sidebar module', () => {
-  assert.match(clientSource, /ctx\.slots\.inject\(\s*["']settings\.section["']/u, 'lib/client.js must register the always-present settings.section contribution');
-  assert.match(clientSource, /ctx\.slots\.inject\(\s*["']settings\.section\.icon["']/u, 'lib/client.js must register the matching settings.section.icon contribution');
+check('the browser half registers the native plugin row page and the optional sidebar module', () => {
+  assert.match(clientSource, /ctx\.slots\.inject\(\s*["']plugins\.row\.config["']/u, 'lib/client.js must register the native plugin row config page');
+  assert.equal((clientSource.match(/ctx\.slots\.inject\(\s*["']plugins\.row\.config["']/gu) ?? []).length, 1, 'the plugin row config page must be injected from exactly one place');
+  assert.equal((clientSource.match(/name:\s*["']plugins\.row\.config["']/gu) ?? []).length, 1, 'the plugin row config definition must exist exactly once');
+  assert.equal(/["']settings\.section(?:\.icon)?["']/u.test(clientSource), false, '0.6.0 removed the generic Settings section registration');
   assert.match(clientSource, /["']sidebar\.panellist["']/u, 'lib/client.js must be able to register the optional sidebar row');
   assert.match(clientSource, /ctx\.slots\.inject\(\s*["']main["']/u, 'lib/client.js must be able to register the optional main page');
-  assert.match(clientSource, /"data-mode"/u, 'the manager root must expose data-mode so Settings embedding is distinguishable');
-  for (const testId of ['sidebar-entry-row', 'sidebar-entry-toggle']) {
+  assert.match(clientSource, /"data-mode"/u, 'the manager root must expose data-mode so module and panel mode are distinguishable');
+  assert.match(clientSource, /moduleMode\s*\?\s*"module"\s*:\s*"panel"/u, 'the root must render data-mode=module on the plugin row page and data-mode=panel in the sidebar');
+  for (const testId of ['sidebar-entry-row', 'sidebar-entry-toggle', 'mcp-module-summary']) {
     assert.match(clientSource, new RegExp(`"${testId}"`, 'u'), `lib/client.js is missing data-testid="${testId}"`);
   }
   assert.match(clientSource, /role:\s*"switch"/u, 'the sidebar-entry control must be a switch');
+  assert.match(clientSource, /MCPManagerModulePage/u, 'the row page component must be the module page');
+  assert.match(clientSource, /"page\.serversTitle"/u, 'the module page needs its compact h2 section head copy');
+  assert.match(clientSource, /"module\.summary"/u, 'the row summary copy is part of the plugin page contract');
   for (const hook of ['loadPreferences', 'setSidebarEntryPreference', 'isSidebarEntryMounted', 'getPreferences']) {
     assert.match(clientSource, new RegExp(hook, 'u'), `lib/client.js must expose __mcpTest.${hook}`);
   }
@@ -246,8 +268,10 @@ check('the browser half declares the Settings entry and the optional sidebar mod
 check('the optional sidebar module is gated behind the Host preference', () => {
   const applyBody = functionBody(clientSource, 'function apply(');
   assert.ok(applyBody.length > 0, 'lib/client.js must define function apply(ctx)');
-  assert.match(applyBody, /["']settings\.section["']/u, 'apply must register the Settings section unconditionally');
-  assert.match(applyBody, /["']settings\.section\.icon["']/u, 'apply must register the Settings section icon unconditionally');
+  assert.match(applyBody, /["']plugins\.row\.config["']/u, 'apply must register the native plugin row page unconditionally');
+  assert.doesNotMatch(applyBody, /["']settings\.section(?:\\.icon)?["']/u, 'apply must not register a generic Settings section in 0.6.0');
+  assert.match(applyBody, /key:\s*ROW_CONFIG_KEY/u, 'apply must register the row page under the composed row config key');
+  assert.match(applyBody, /locale:\s*NS/u, 'the row page must declare the plugin locale namespace');
   assert.match(applyBody, /loadPreferences/u, 'apply must read the Host preference that decides whether the sidebar module exists');
   assert.match(clientSource, /\/preferences/u, 'lib/client.js must call the Host preference API');
   assert.match(clientSource, /sidebarEntry/u, 'the sidebar module must follow the Host sidebarEntry preference');
@@ -419,13 +443,13 @@ check('every write target is computed from the data directory', () => {
 check('the shared constants match package.json and the contract', () => {
   if (versionModule.error) throw new Error(`lib/version.js could not be imported: ${versionModule.error.message}`);
   const constants = versionModule.module;
-  assert.equal(manifest.version, '0.5.0', 'this is the 0.5.0 Settings-entry release (docs/API-CONTRACT.md is frozen for 0.5.0)');
+  assert.equal(manifest.version, '0.6.0', 'this is the 0.6.0 native-plugin-row-settings-page release (docs/API-CONTRACT.md is frozen for 0.6.0)');
   assert.equal(constants.PLUGIN_VERSION, manifest.version, 'PLUGIN_VERSION must equal package.json version');
   const contract = read('docs/API-CONTRACT.md');
-  assert.match(contract, /frozen for 0\.5\.0/u, 'docs/API-CONTRACT.md must be frozen for 0.5.0');
+  assert.match(contract, /frozen for 0\.6\.0/u, 'docs/API-CONTRACT.md must be frozen for 0.6.0');
   assert.equal(constants.DATA_DIR_NAME, 'better-mcp-manager', 'DATA_DIR_NAME must be the frozen data directory name');
   assert.equal(constants.API_PREFIX, '/better-mcp-manager/api', 'API_PREFIX must match the frozen API base');
-  assert.equal(constants.PANEL_ID, 'mcp-manager', 'PANEL_ID must be the frozen panel id used by both the Settings section and the optional sidebar row');
+  assert.equal(constants.PANEL_ID, 'mcp-manager', 'PANEL_ID must be the frozen panel id used by the optional sidebar row and its main page');
   assert.equal(constants.CLIENT_LOCALE_NS, 'mcpManager', 'CLIENT_LOCALE_NS must be the frozen locale namespace');
 });
 

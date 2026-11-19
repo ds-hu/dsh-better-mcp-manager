@@ -15,15 +15,17 @@ import { sleep, waitFor } from './util.mjs';
 const SIDEBAR_AUTOMATION = '自动化任务';
 const SIDEBAR_MCP = /MCP\s*管理/;
 const SIDEBAR_NAV_LABEL = '全局面板';
-const SETTINGS_TITLE = '设置';
-const SETTINGS_TRIGGER = '设置';
-// The shipped `web` template has no dsh-pocket launcher: ui-settings-account
-// occupies the sidebar-foot `settings.launcher`/`sidebar.settings` seat with an
-// account menu (labelled 账号菜单, showing 更多 while signed out), and 设置 is one
-// of its menu items. A profile with a standalone Settings control still matches
-// the direct button first.
-const ACCOUNT_MENU_LABEL = '账号菜单';
-const ACCOUNT_MENU_TRIGGER = /账号菜单|更多|More|Account/u;
+// 0.6.0: the default entry is DSH's native plugin row settings page. The page
+// lives inside the Plugins manager: sidebar 插件 → bundle card → the bundle's
+// row (`data-plugin-row`) configure control → the row detail
+// (`data-plugin-row-detail="<package>#<row id>"`) that renders our page.
+const PLUGINS_NAV_LABEL = '插件';
+const PLUGIN_BUNDLE_NAME = '@ds-hu/dsh-better-mcp-manager';
+const PLUGIN_ROW_ID = 'dsh-better-mcp-manager';
+const PLUGIN_ROW_CONFIG_KEY = `${PLUGIN_BUNDLE_NAME}#${PLUGIN_ROW_ID}`;
+const PLUGIN_CARD_TITLE = 'MCP 管理';
+const PLUGIN_OPEN_LABEL = `查看 ${PLUGIN_CARD_TITLE}`;
+const PLUGIN_CONFIGURE_LABEL = `配置 ${PLUGIN_CARD_TITLE}`;
 const MODE_BUTTON = /标准模式|极简模式|PTC 模式|创造模式|外部MCP测试/;
 const PRESET_LABELS = {
   standard: '标准模式',
@@ -228,12 +230,7 @@ export async function openMcpPage(page) {
   return list;
 }
 
-// ── DSH Settings dialog (default entry, 0.5.0) ─────────────────────────────
-
-/** The open Settings dialog, matched by its accessible name. */
-export function settingsDialog(page) {
-  return page.getByRole('dialog', { name: SETTINGS_TITLE });
-}
+// ── native plugin row settings page (default entry, 0.6.0) ─────────────────
 
 /** Reload the authenticated page and wait for the shell/composer again. */
 export async function reloadApp(page) {
@@ -242,130 +239,160 @@ export async function reloadApp(page) {
   await dismissFirstRun(page);
 }
 
-/**
- * Evidence for a failed Settings open: every button label plus the start of the
- * body text. A shell change then fails with the DOM it actually rendered.
- */
-async function settingsDiagnostics(page) {
+/** One plugin card in the Plugins manager's installed list, by package name. */
+export function pluginBundleCard(page, bundleName = PLUGIN_BUNDLE_NAME) {
+  return page.locator(`[data-plugin-package="${bundleName}"]`).first();
+}
+
+/** The plugin bundle's detail page (opened from the card). */
+export function pluginBundleDetail(page, bundleName = PLUGIN_BUNDLE_NAME) {
+  return page.locator(`[data-plugin-detail="${bundleName}"]`).first();
+}
+
+/** The row's own settings page: the native page our client registered. */
+export function pluginRowDetail(page) {
+  return page.locator(`[data-plugin-row-detail="${PLUGIN_ROW_CONFIG_KEY}"]`).first();
+}
+
+/** The manager page our client renders inside the row settings page. */
+export function modulePageRoot(page) {
+  return pluginRowDetail(page).locator('[data-testid="mcp-page"]').first();
+}
+
+/** Evidence for a failed native plugin-page navigation: visible button labels and body text. */
+async function pluginPageDiagnostics(page) {
   const buttons = await page
     .locator('button')
     .evaluateAll((elements) => elements.map((element) => (element.getAttribute('aria-label') || element.innerText || '').trim()).filter((label) => label !== ''))
     .catch(() => []);
-  const menuItems = await page
-    .getByRole('menuitem')
-    .evaluateAll((elements) => elements.map((element) => (element.innerText || '').trim()).filter((label) => label !== ''))
-    .catch(() => []);
   const body = await page.locator('body').innerText().catch(() => '');
-  return `buttons: ${JSON.stringify(buttons.slice(0, 40))}; menu items: ${JSON.stringify(menuItems.slice(0, 20))}; body: ${body.replace(/\s+/gu, ' ').slice(0, 2048)}`;
+  return `buttons: ${JSON.stringify(buttons.slice(0, 40))}; body: ${body.replace(/\s+/gu, ' ').slice(0, 2048)}`;
+}
+
+/** Evidence for a failed module-row interaction: row attributes, row-detail keys and the page. */
+async function pluginRowDiagnostics(page) {
+  const rows = await page
+    .locator('[data-plugin-rows] li')
+    .evaluateAll((elements) => elements.map((element) => ({ row: element.getAttribute('data-plugin-row'), text: (element.innerText || '').slice(0, 160) })))
+    .catch(() => []);
+  const details = await page
+    .locator('[data-plugin-row-detail]')
+    .evaluateAll((elements) => elements.map((element) => element.getAttribute('data-plugin-row-detail')))
+    .catch(() => []);
+  return `rows ${JSON.stringify(rows)}; row details ${JSON.stringify(details)}; ${await pluginPageDiagnostics(page)}`;
 }
 
 /**
- * Open the DSH Settings dialog.
+ * Open the Plugins manager page from the sidebar's 插件 row.
  *
- * The direct bottom Settings control is tried first (a profile composing a
- * launcher package has it); otherwise 设置 is selected from the sidebar-foot
- * account menu, which is what the bare `web` template renders.
+ * A package/row detail opened earlier survives a sidebar switch, so this also
+ * walks the detail crumbs back to the installed list when the bundle card is
+ * not on screen.
  */
-export async function openSettings(page) {
-  const dialog = settingsDialog(page);
-  if ((await dialog.count()) > 0) return dialog;
-
-  let openedFromDirectControl = false;
+export async function openPluginsPage(page) {
+  const row = sidebarPanelNav(page).getByRole('button', { name: PLUGINS_NAV_LABEL, exact: true }).first();
+  await row.waitFor({ state: 'visible', timeout: 20_000 });
+  await row.click();
   try {
-    const direct = page.getByRole('button', { name: SETTINGS_TRIGGER, exact: true }).first();
-    await direct.waitFor({ state: 'visible', timeout: 3_000 });
-    await direct.click();
-    openedFromDirectControl = true;
-  } catch {
-    // The bare `web` template has no standalone control; fall through to the
-    // account menu below.
-  }
-
-  if (!openedFromDirectControl) {
-    // The account menu trigger's accessible name is 账号菜单 in every signed
-    // state; the text form 更多 is only a signed-out fallback (and the sidebar's
-    // panel "更多" row shares it, so it must be the last such button).
-    const triggers = [
-      page.getByRole('button', { name: ACCOUNT_MENU_LABEL, exact: true }).first(),
-      page.getByRole('button', { name: ACCOUNT_MENU_TRIGGER }).last(),
-    ];
-    let menuOpened = false;
-    let lastError = null;
-    for (const trigger of triggers) {
-      try {
-        await trigger.waitFor({ state: 'visible', timeout: 5_000 });
-        await trigger.click();
-        menuOpened = true;
-        break;
-      } catch (error) {
-        lastError = error;
-        await page.keyboard.press('Escape').catch(() => {});
-      }
-    }
-    if (!menuOpened) {
-      throw new Error(`could not find the Settings control or the sidebar account menu: ${await settingsDiagnostics(page)}`, { cause: lastError ?? undefined });
-    }
-    const menuItem = page.getByRole('menuitem', { name: SETTINGS_TRIGGER }).first();
-    try {
-      await menuItem.waitFor({ state: 'visible', timeout: 10_000 });
-      await menuItem.click();
-    } catch (error) {
-      // Some menu primitives render the label without the menuitem role.
-      const textItem = page.getByRole('menu').getByText(SETTINGS_TRIGGER, { exact: true }).first();
-      try {
-        await textItem.waitFor({ state: 'visible', timeout: 5_000 });
-        await textItem.click();
-      } catch {
-        throw new Error(`the account menu has no 设置 item: ${await settingsDiagnostics(page)}`, { cause: error });
-      }
-    }
-  }
-
-  try {
-    await dialog.waitFor({ state: 'visible', timeout: 20_000 });
+    await page.locator('[data-plugin-body]').waitFor({ state: 'visible', timeout: 20_000 });
   } catch (error) {
-    throw new Error(`the Settings dialog did not open: ${await settingsDiagnostics(page)}`, { cause: error });
+    throw new Error(`the Plugins page did not open: ${await pluginPageDiagnostics(page)}`, { cause: error });
   }
-  return dialog;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if ((await pluginBundleCard(page).count()) > 0) {
+      await pluginBundleCard(page).waitFor({ state: 'visible', timeout: 20_000 });
+      return;
+    }
+    const crumb = page.locator('[data-plugin-body] button[aria-label^="返回"]').first();
+    if ((await crumb.count()) === 0) break;
+    await crumb.click();
+    await sleep(400);
+  }
+  try {
+    await pluginBundleCard(page).waitFor({ state: 'visible', timeout: 30_000 });
+  } catch (error) {
+    throw new Error(`the plugin manager did not list ${PLUGIN_BUNDLE_NAME}: ${await pluginPageDiagnostics(page)}`, { cause: error });
+  }
 }
 
-/** Select one section cell in the Settings navigation rail and wait for its content. */
-export async function selectSettingsSection(page, name) {
-  const dialog = settingsDialog(page);
-  const cell = dialog.getByRole('button', { name }).first();
-  await cell.waitFor({ state: 'visible', timeout: 20_000 });
-  await cell.click();
-  return dialog;
+/** From the installed list, open our bundle's detail page (rows + metadata). */
+export async function openPluginBundle(page) {
+  await openPluginsPage(page);
+  const card = pluginBundleCard(page);
+  const titleButton = card.getByRole('button', { name: PLUGIN_OPEN_LABEL }).first();
+  if ((await titleButton.count()) > 0) await titleButton.click();
+  else await card.locator('button').first().click();
+  const detail = pluginBundleDetail(page);
+  try {
+    await detail.waitFor({ state: 'visible', timeout: 20_000 });
+    await detail.locator('[data-plugin-rows]').waitFor({ state: 'visible', timeout: 20_000 });
+  } catch (error) {
+    throw new Error(`the bundle detail page for ${PLUGIN_BUNDLE_NAME} did not open: ${await pluginPageDiagnostics(page)}`, { cause: error });
+  }
+  return detail;
 }
 
-/** Open Settings and select the plugin's MCP 管理 section. */
-export async function openMcpSettings(page) {
-  const dialog = await openSettings(page);
-  await selectSettingsSection(page, SIDEBAR_MCP);
-  const root = dialog.locator('[data-testid="mcp-page"]');
-  await root.waitFor({ state: 'visible', timeout: 20_000 });
-  await dialog.locator('[data-testid="mcp-list"]').waitFor({ state: 'visible', timeout: 20_000 });
-  return dialog;
+/**
+ * On the bundle detail page, open the row's native settings page (our module
+ * page).
+ *
+ * The native page sets `data-plugin-row` to `row.entryId ?? row.rowId`, and a
+ * bundle patch `insert:` row carries the Loader entry id (`include:<row id>`),
+ * so the exact row id is not a stable attribute. The row's configure control is
+ * the real contract: its label is `配置 <row title>` and it exists as soon as
+ * the `plugins.row.config` ledger has our key.
+ */
+export async function openPluginRowSettings(page) {
+  const detail = pluginBundleDetail(page);
+  if ((await detail.count()) === 0) await openPluginBundle(page);
+  const rows = pluginBundleDetail(page).locator('[data-plugin-rows]');
+  await rows.waitFor({ state: 'visible', timeout: 20_000 });
+
+  const configure = rows.getByRole('button', { name: PLUGIN_CONFIGURE_LABEL }).first();
+  try {
+    await configure.waitFor({ state: 'visible', timeout: 20_000 });
+    await configure.click();
+  } catch (error) {
+    // Fallbacks: a row whose data-plugin-row mentions our row id, then the row
+    // element itself.
+    const scoped = rows.locator(`[data-plugin-row$="${PLUGIN_ROW_ID}"], [data-plugin-row*="${PLUGIN_ROW_ID}"]`).first();
+    const scopedButton = scoped.getByRole('button', { name: /^配置/u }).first();
+    if ((await scopedButton.count()) > 0) await scopedButton.click();
+    else if ((await scoped.count()) > 0) await scoped.click();
+    else throw new Error(`the bundle detail has no ${PLUGIN_CONFIGURE_LABEL} control: ${await pluginRowDiagnostics(page)}`, { cause: error });
+  }
+
+  const rowDetail = pluginRowDetail(page);
+  try {
+    await rowDetail.waitFor({ state: 'visible', timeout: 20_000 });
+  } catch (error) {
+    throw new Error(`the module row settings page ${PLUGIN_ROW_CONFIG_KEY} did not open: ${await pluginRowDiagnostics(page)}`, { cause: error });
+  }
+  try {
+    await rowDetail.locator('[data-testid="mcp-page"]').waitFor({ state: 'visible', timeout: 20_000 });
+    await rowDetail.locator('[data-testid="mcp-list"]').waitFor({ state: 'visible', timeout: 20_000 });
+  } catch (error) {
+    throw new Error(`the module row settings page ${PLUGIN_ROW_CONFIG_KEY} did not render the manager: ${await pluginRowDiagnostics(page)}`, { cause: error });
+  }
+  return rowDetail.locator('[data-testid="mcp-page"]').first();
 }
 
-/** The management page rendered inside the Settings dialog (never the sidebar copy). */
-export function settingsPageRoot(page) {
-  return settingsDialog(page).locator('[data-testid="mcp-page"]');
+/** Navigate to the default entry: Plugins → our bundle → row settings page. */
+export async function openMcpModulePage(page) {
+  const existing = pluginRowDetail(page);
+  if ((await existing.count()) > 0 && (await existing.locator('[data-testid="mcp-list"]').isVisible().catch(() => false))) {
+    return existing.locator('[data-testid="mcp-page"]').first();
+  }
+  await openPluginBundle(page);
+  return openPluginRowSettings(page);
 }
 
-/** Close Settings with Escape, the documented dismissal path. */
-export async function closeSettings(page) {
-  const dialog = settingsDialog(page);
-  if ((await dialog.count()) === 0) return false;
-  await page.keyboard.press('Escape');
-  await dialog.waitFor({ state: 'detached', timeout: 15_000 });
-  return true;
-}
-
-/** Read the Settings-only sidebar-entry row: presence, switch state and copy. */
+/** Read the module page's sidebar-entry row: presence, switch state and copy. */
 export async function sidebarEntryRowState(page) {
-  const row = settingsPageRoot(page).locator('[data-testid="sidebar-entry-row"]');
-  const toggle = settingsPageRoot(page).locator('[data-testid="sidebar-entry-toggle"]');
+  const root = modulePageRoot(page);
+  await root.locator('[data-testid="sidebar-entry-row"]').waitFor({ state: 'attached', timeout: 20_000 });
+  const row = root.locator('[data-testid="sidebar-entry-row"]');
+  const toggle = root.locator('[data-testid="sidebar-entry-toggle"]');
   return {
     rows: await row.count(),
     toggles: await toggle.count(),
@@ -376,12 +403,12 @@ export async function sidebarEntryRowState(page) {
 }
 
 /**
- * Flip the optional sidebar module through the Settings switch.
+ * Flip the optional sidebar module through the module page switch.
  * Waits for the switch to settle (it is disabled while the PUT is in flight)
  * and for the requested aria-checked state.
  */
 export async function setSidebarEntryEnabled(page, enabled) {
-  const toggle = settingsPageRoot(page).locator('[data-testid="sidebar-entry-toggle"]');
+  const toggle = modulePageRoot(page).locator('[data-testid="sidebar-entry-toggle"]');
   await toggle.waitFor({ state: 'visible', timeout: 20_000 });
   await waitFor(async () => ((await toggle.isDisabled()) === false ? true : undefined), {
     timeoutMs: 20_000,
@@ -402,7 +429,7 @@ export async function setSidebarEntryEnabled(page, enabled) {
 
 /**
  * One server card. `scope` narrows the search to a subtree when the manager is
- * embedded (the Settings dialog) or when both presentations are on screen.
+ * embedded (the plugin row settings page) or when both presentations are on screen.
  */
 export function card(page, name, scope = page) {
   return scope.locator(`[data-testid="server-card"][data-server-name="${name}"]`);
@@ -486,7 +513,7 @@ async function openCardMenu(page, name, itemTestId, scope = page) {
 
 // ── management page: form ───────────────────────────────────────────────────
 
-/** Open the add form inside `scope` (the page, or the Settings-mode manager root). */
+/** Open the add form inside `scope` (the page, or the embedded module page root). */
 export async function openAddForm(page, scope = page) {
   await clearOverlays(page);
   await scope.locator('[data-testid="add-mcp"]').click();
@@ -754,12 +781,11 @@ export async function screenshotViewport(page, path) {
 }
 
 /**
- * Full-viewport screenshot with the Settings dialog open on the MCP section:
- * the primary docs image for 0.5.0 (Settings is the default entry).
+ * Full-viewport screenshot on the native plugin row settings page: the primary
+ * docs image for 0.6.0 (the plugin page is the default entry).
  */
-export async function screenshotSettingsViewport(page, path) {
-  const dialog = settingsDialog(page);
-  await dialog.waitFor({ state: 'visible', timeout: 10_000 });
+export async function screenshotPluginRowViewport(page, path) {
+  await modulePageRoot(page).waitFor({ state: 'visible', timeout: 10_000 });
   return screenshotViewport(page, path);
 }
 

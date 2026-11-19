@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "MCP 管理",
-    "description": "在 DeepSeek Harness 的设置里管理 MCP 服务器：传输方式、请求头、OAuth、分组、实时连接状态与工具数量、按工具的暴露与审批，以及每台服务器的工具暴露给哪些 Agent 预设。侧边栏入口是可选的独立模块，默认关闭。"
+    "description": "在 DeepSeek Harness 原生的「插件」页里管理 MCP：本插件的 MCP 管理模块行会打开这个插件设置页，可管理 MCP 服务器、工具暴露与审批以及预设授权。侧边栏入口是可选的独立模块，默认关闭。"
   }
 }

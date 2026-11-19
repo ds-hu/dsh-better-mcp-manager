@@ -7,7 +7,7 @@ and one of them is a bug.
 
 - [Shape of the plugin](#shape-of-the-plugin)
 - [Architecture](#architecture)
-- [Settings entry and the sidebar module](#settings-entry-and-the-sidebar-module)
+- [Native plugin row settings page and the sidebar module](#native-plugin-row-settings-page-and-the-sidebar-module)
 - [Connection manager](#connection-manager)
 - [Result projection](#result-projection)
 - [Data model](#data-model)
@@ -34,7 +34,7 @@ One npm package ships three things:
 | Piece | Module | Mounted by | Talks to |
 |---|---|---|---|
 | Host | `lib/index.js` (`name = 'dsh-better-mcp-manager'`) | the profile bundle patch, `cordis.patch.yml` | DSH Host services and MCP servers |
-| Client | `lib/client.js` (`window.__ModuleLoader__`, `id = '@ds-hu/dsh-better-mcp-manager'`) | the Web shell, via `package.json` → `dsh.client`; always a Settings section, optionally the sidebar module | the Host over same-origin `/better-mcp-manager/api/*` |
+| Client | `lib/client.js` (`window.__ModuleLoader__`, `id = '@ds-hu/dsh-better-mcp-manager'`) | the Web shell, via `package.json` → `dsh.client`; always the native plugin row settings page, optionally the sidebar module | the Host over same-origin `/better-mcp-manager/api/*` |
 | Cleanup CLI | `bin/mcp-manager.mjs` | the user, after removing the bundle | the data directory only |
 
 The bundle patch inserts exactly one row, and its `id` equals the `name` exported by
@@ -50,8 +50,9 @@ See [ADR 2](adr/0002-own-mcp-connection-manager.md),
 [ADR 5](adr/0005-hand-built-tool-definition.md),
 [ADR 6](adr/0006-server-and-upload-icons.md),
 [ADR 7](adr/0007-tool-enablement-and-approval.md),
-[ADR 8](adr/0008-preset-owned-mcp-management.md) and
-[ADR 9](adr/0009-settings-entry-with-optional-sidebar-module.md).
+[ADR 8](adr/0008-preset-owned-mcp-management.md), and
+[ADR 9](adr/0009-settings-entry-with-optional-sidebar-module.md) (superseded) /
+[ADR 10](adr/0010-native-plugin-row-settings-page.md) for the entry surface.
 
 ## Architecture
 
@@ -102,67 +103,92 @@ and only then is the connection started/restarted/stopped and live agents re-bou
 connection fails still saved and still lists — its status explains the failure. This ordering means
 a bad URL cannot lose the rest of the edit, and a failed connection cannot roll back a save.
 
-## Settings entry and the sidebar module
+## Native plugin row settings page and the sidebar module
 
-Since 0.5.0 the manager has one required surface and one optional one. The decision and the rejected
-alternatives are in [ADR 9](adr/0009-settings-entry-with-optional-sidebar-module.md); it supersedes
-[ADR 1](adr/0001-sidebar-panel-entry.md), which made the sidebar row the only entry.
+Since 0.6.0 the manager has one required surface and one optional one. The decision and the rejected
+alternatives are in [ADR 10](adr/0010-native-plugin-row-settings-page.md), which supersedes
+[ADR 9](adr/0009-settings-entry-with-optional-sidebar-module.md) (the generic Settings section used in
+0.5.0) and [ADR 1](adr/0001-sidebar-panel-entry.md) (the sidebar row as the only entry).
 
-**Always registered — the Settings section.** `lib/client.js` registers two root-scoped slots at
-apply time, unconditionally:
+**Always registered — the native plugin row settings page.** `lib/client.js` registers exactly one
+root-scoped slot at apply time, unconditionally:
 
-- `settings.section` — `id: 'mcp-manager'`, `order: 30`, `locale: 'mcpManager'`,
-  `label: () => t('panel')`. The component receives the shell's `{ close }` owner prop and renders
-  the same `MCPManagerPage` the sidebar page renders, in its embedded presentation: the root keeps
-  `data-testid="mcp-page"`, gains `data-mode="settings"`, and drops the full-page scroll container so
-  the Settings content column scrolls. Initial focus is not grabbed — the shell keeps focus on the
-  section navigation.
-- `settings.section.icon` — the same `id` and `order`, rendering the inline panel glyph. The shell
-  matches it to the `settings.section` contribution by id; an unmatched icon id never renders, and
-  without it the shell keeps its default gear.
+- `plugins.row.config` — `key: '@ds-hu/dsh-better-mcp-manager#dsh-better-mcp-manager'`
+  (`BUNDLE_NAME` + `#` + `ROW_ID` from `cordis.patch.yml`), `locale: 'mcpManager'`, rendering
+  `MCPManagerModulePage`. No `settings.section`/`settings.section.icon` registration exists any more.
+  The key's two halves are constants in the client and are parity-checked against `package.json` and
+  the patch by `test/mount-check.mjs`.
 
-Both registrations live in `ctx.effect`/`ctx.slots.inject` cleanups. The Settings entry is the
-**default entry**: a fresh install with default state has no sidebar row at all.
+The slot is declared by DSH's native Plugins page
+(`@deepseek-ai/dsh-client-ui-plugin-manager`). The page draws the row detail — breadcrumb back to the
+bundle, the plugin icon, the row title and the row description — and the contribution renders only
+the body. The page asks the entry for one of two views:
 
-**Deployment requirement.** The section needs the DSH Settings shell (the
-`@deepseek-ai/dsh-client-ui-settings-general` package that owns the navigation and content column),
-which the shipped Web app composes. A deployment that composes no settings shell gets no navigation
-entry for the section; nothing breaks, the API and the optional sidebar page are unaffected. The
-optional sidebar module, once enabled, still opens the manager on its own page.
+- `view: 'summary'` — a one-liner used when the row has no description
+  (`data-testid="mcp-module-summary"`; copy 管理 MCP 服务器、工具暴露与 Agent 预设授权。 / "Manage MCP
+  servers, tool exposure and agent-preset access.").
+- `view: 'page'` — the body the configure control opens. `MCPManagerModulePage` renders
+  `MCPManagerPage` with `mode: 'module'`: the root keeps `data-testid="mcp-page"` /
+  `data-testid="mcp-list"`, gains `data-mode="module"`, and the embedded presentation neutralises the
+  full-page scroll container (auto height, visible overflow, transparent background) and skips the
+  initial focus grab (the Plugins page keeps focus). The body
+  order is: the sidebar-entry switch card, then the compact section head — `h2` **MCP 服务器** /
+  **MCP servers**, the `共 N 个服务器 · N 个已连接` / `N server(s) · N connected` subtitle with the
+  plugin version tag, and the **添加 MCP** button — then the unchanged page tabs, list, cards, forms,
+  tool settings and 其他 MCP views.
+
+The owner props are `{ view: 'summary' | 'page', form? }`; `form` is supplied only for entries with
+editable configuration fields and this row ignores it. The registration lives in its
+`ctx.slots.inject` cleanup and is released on dispose. The page title, description, icon and
+breadcrumb are drawn by the Plugins page, not by the component.
+
+**Default entry and route.** A fresh install opens the manager through the Plugins page: sidebar
+**插件** → the **MCP 管理** plugin card → the bundle detail page → the **MCP 管理** module row → the
+configure control (**配置 MCP 管理** / *Configure MCP Manager*) or the row name. The card title, row
+title and page title all come from the package's `locale/*.json` metadata; the row id and icon come
+from the Loader row (`cordis.patch.yml`) and the package `icon`.
+
+**Deployment requirement.** The row config page only renders inside DSH's native Plugins page, which
+the shipped Web app composes. A deployment that composes no Plugins page gets no default entry: it
+still serves the HTTP API and the optional sidebar page is unaffected, and the optional module, once
+enabled, still opens the manager on its own page. There is deliberately no generic `settings.section`
+fallback.
 
 **Optional — the sidebar module.** The old sidebar row and its page are now an independent module
 that exists only while the Host preference `sidebarEntry` is `true`:
 
 - `sidebar.panellist` — `id: 'mcp-manager'`, `order: 20`, `locale`, `label: () => t('panel')`.
   自动化任务 registers order 10 and Plugins order 0, so 20 puts the row directly below 自动化任务.
-- `main` — `key: 'mcp-manager'`, rendering the same component without `data-mode="settings"`.
+- `main` — `key: 'mcp-manager'`, rendering the same component with `data-mode="panel"`: the
+  full-page presentation (`h1` title, subtitle, add button) with no switch card.
 
 Both are registered by `mountSidebarEntry()` and unregistered by `unmountSidebarEntry()`; turning the
 switch off disposes both live, so the row disappears and, if its page was open, DSH falls back to the
 Conversation. The module's registrations are also disposed on plugin dispose. Nothing is registered
-while the module is off; that is what makes a fresh install show exactly one entry.
+while the module is off; that is what makes a fresh install show exactly one entry (the Plugins page).
 
 **Preference transport.** The client reads `GET /better-mcp-manager/api/preferences` once at apply
 (one shared in-flight request) and writes changes with `PUT /preferences`. The answer is
 `{ ok, preferences: { sidebarEntry } }`; on a successful write the client applies the answered value,
-not the requested one. A failed read keeps the module off and reports the error in the switch row; a
+not the requested one. A failed read keeps the module off and reports the error in the switch card; a
 failed write leaves the live module on the last applied value and reports the reason — there is no
 optimistic local-only state. The preference is **Host-side**: it lives in `$DSH_HOME/better-mcp-manager/preferences.json`
 via the store, is shared by every browser and every profile under that DSH home, and is deliberately
 not mirrored to `localStorage`/`sessionStorage` or to a profile settings document.
 
-**The switch.** In the Settings-mode presentation only, a row
-`[data-testid="sidebar-entry-row"]` renders between the page header and the tab strip. It contains a
-`role="switch"` button `[data-testid="sidebar-entry-toggle"]` with `aria-checked`, the label
-**在侧边栏显示 MCP 管理入口** / **Show MCP Manager in the sidebar**, a one-line hint that the module
-is off by default and the Settings entry is always available, and an inline alert for load/save
-failures. The switch is disabled while the initial read or a save is in flight. The sidebar page
-never renders the row.
+**The switch.** On the plugin settings page only, a card `[data-testid="sidebar-entry-row"]` renders
+before the section head. It contains a `role="switch"` button
+`[data-testid="sidebar-entry-toggle"]` with `aria-checked`, the label **在侧边栏显示 MCP 管理入口** /
+**Show MCP Manager in the sidebar**, a one-line hint that the module is off by default while the
+plugin settings page entry is always available, and an inline alert for load/save failures. The
+switch is disabled while the initial read or a save is in flight. The sidebar page never renders the
+card.
 
-**One component, two shells.** Both surfaces render `MCPManagerPage`; there is no forked manager.
-Each mount owns its own poll timer, so a Settings section and an open sidebar page can poll
-concurrently; each unmount clears its own timer. Both surfaces share the module-scope preference
-state and the same slot registrations, so toggling the switch updates every mounted view.
+**One component, two shells.** Both surfaces render `MCPManagerPage`; there is no forked manager. The
+plugin page passes `mode: 'module'`, the sidebar page `mode: 'panel'`. Each mount owns its own poll
+timer, so the plugin page and an open sidebar page can poll concurrently; each unmount clears its own
+timer. Both surfaces share the module-scope preference state and the same sidebar registrations, so
+toggling the switch updates every mounted view.
 
 ## Connection manager
 
@@ -753,17 +779,20 @@ outer boundary.
 ## Client half
 
 `lib/client.js` is a browser module loaded by the Web shell. The two surfaces it registers are
-described in [Settings entry and the sidebar module](#settings-entry-and-the-sidebar-module); the
-rest of the component:
+described in
+[Native plugin row settings page and the sidebar module](#native-plugin-row-settings-page-and-the-sidebar-module);
+the rest of the component:
 
-- always registers `settings.section` + `settings.section.icon` (`id: 'mcp-manager'`, `order: 30`,
-  localized label), and — only while the Host preference says so — the `sidebar.panellist` entry
-  (`id: 'mcp-manager'`, `order: 20`) and the `main` slot page (`key: 'mcp-manager'`);
+- always registers one slot, `plugins.row.config` (`key: '@ds-hu/dsh-better-mcp-manager#dsh-better-mcp-manager'`,
+  `locale: 'mcpManager'`) rendering `MCPManagerModulePage`, and — only while the Host preference says
+  so — the `sidebar.panellist` entry (`id: 'mcp-manager'`, `order: 20`) and the `main` slot page
+  (`key: 'mcp-manager'`). There is no `settings.section` registration;
 - polls `GET /servers` every 2.5 s while a manager view is mounted, and immediately after each
   mutation, so a connection that drops updates without a manual refresh;
-- renders the manager in its embedded Settings presentation (`data-mode="settings"`: no full-page
-  scroll container, no initial focus grab, the sidebar-entry switch row between the header and the
-  tabs) or as the full sidebar page, from the same component;
+- renders the manager on the plugin settings page in its embedded presentation
+  (`data-mode="module"`: no full-page scroll container, no initial focus grab, the sidebar-entry
+  switch card before the compact section head) or as the full sidebar page (`data-mode="panel"`),
+  from the same component;
 - renders the main page as two level-1 tabs, **本插件 MCP** (`page-tab-owned`) and **其他 MCP**
   (`page-tab-external`); the owned tab keeps the header, add button, cards and form, while the
   external tab renders the preset-owned surface described in
@@ -786,10 +815,10 @@ rest of the component:
   name, status dot and status line, and the `···` menu (编辑 / 测试连接 / 重新连接 / 启用或停用 /
   删除);
 - shows errors inline with the first two lines of the message and a **详情** dialog with the detail;
-- in Settings mode renders the sidebar-entry row (`sidebar-entry-row`, switch `sidebar-entry-toggle`)
-  and applies `GET`/`PUT /preferences` as described in
-  [Settings entry and the sidebar module](#settings-entry-and-the-sidebar-module); the row is never
-  rendered on the sidebar page;
+- on the plugin settings page renders the sidebar-entry card (`sidebar-entry-row`, switch
+  `sidebar-entry-toggle`) and applies `GET`/`PUT /preferences` as described in
+  [Native plugin row settings page and the sidebar module](#native-plugin-row-settings-page-and-the-sidebar-module);
+  the card is never rendered on the sidebar page;
 - renders the add/edit form as two tabs, **基础设置** and **工具**: the basic tab has the enable
   switch, **服务器图标** preview with **上传图标** / **恢复自动** and color swatches — no emoji
   palette; group, name, transport segmented control, address or command/args/env, OAuth dialog,
@@ -806,13 +835,15 @@ rest of the component:
 
 All copy comes from `ctx.locale.register('mcpManager', { zh, en })` inside `lib/client.js`; the
 dictionaries are checked key-by-key by `test/client-smoke.mjs`. The `locale/en.json` and
-`locale/zh.json` files are the plugin-page metadata (title and description) that the Plugin Manager
-reads without activating the plugin. The Settings-section/sidebar label and page title are
-**MCP 管理** in Chinese and **MCP Manager** in English; the switch label is
-**在侧边栏显示 MCP 管理入口** / **Show MCP Manager in the sidebar**.
+`locale/zh.json` files are the plugin metadata that the Plugins page reads without activating the
+plugin: `meta.title` is the bundle card title, the module row title and the row page title
+(**MCP 管理** in Chinese, **MCP Manager** in English), and `meta.description` is the description under
+both the card and the row. The switch label is **在侧边栏显示 MCP 管理入口** /
+**Show MCP Manager in the sidebar**; the module page's section heading is **MCP 服务器** /
+**MCP servers**.
 
 Sanitized screenshots of the shipped UI live in `docs/screenshots/`: the
-[Settings hero](screenshots/mcp-manager-settings.png), the
+[plugin settings hero](screenshots/mcp-manager-plugin-settings.png), the
 [optional sidebar module](screenshots/mcp-manager-sidebar.png), the
 [mixed-state list](screenshots/mcp-manager-list.png), the
 [preset-exposure form section](screenshots/mcp-manager-form-presets.png), the
@@ -820,10 +851,11 @@ Sanitized screenshots of the shipped UI live in `docs/screenshots/`: the
 [工具 tab](screenshots/mcp-manager-form-tools.png), the
 [其他 MCP compact list](screenshots/mcp-manager-external.png), the
 [per-server external tool view](screenshots/mcp-manager-external-tools.png) and the
-[连接错误 详情 dialog](screenshots/mcp-manager-error-detail.png). The Settings hero is the dialog
-with the MCP 管理 section open; the sidebar shot shows the optional module switched on; the remaining
-manager shots show the same page surface. The README embeds the Settings hero, the optional sidebar
-module, the list, the presets, the icon row, the tools tab and both external views.
+[连接错误 详情 dialog](screenshots/mcp-manager-error-detail.png). The plugin settings hero shows the
+row's page with the switch card and the manager; the sidebar shot shows the optional module switched
+on; the remaining manager shots show the same manager views. The README embeds the plugin settings
+hero, the optional sidebar module, the list, the presets, the icon row, the tools tab and both
+external views.
 
 ## Lifecycle and dispose
 
@@ -850,11 +882,11 @@ restart, exactly like the server records. Deleting a server/resetting its icon a
 tool settings (or deleting `external.json`) are the only things that change that state.
 
 The agent-lifecycle listeners are removed by their own effect disposer, and the client half removes
-its locale namespace, stylesheet, every slot registration (Settings section, Settings icon, and the
-optional sidebar row/page) and every timer on dispose. Disabling the plugin in the Plugin Manager is
-a live operation with HMR enabled: the route disappears, the Settings section and — if it was on —
-the optional sidebar entry disappear in every open window, and connections are closed. After a
-restart without the plugin, nothing of it runs.
+its locale namespace, stylesheet, the `plugins.row.config` registration, the optional sidebar
+row/page registrations and every timer on dispose. Disabling the plugin in the Plugin Manager is a
+live operation with HMR enabled: the route disappears, the plugin's row page (and with it the
+configure control) and — if it was on — the optional sidebar entry disappear in every open window,
+and connections are closed. After a restart without the plugin, nothing of it runs.
 
 ## Uninstall
 
@@ -895,9 +927,10 @@ name.
 
 Two honest caveats:
 
-1. **Open pages keep a dead Settings section and sidebar entry until the browser reloads.** The
-   client unregisters its slots on dispose, but after the bundle is removed its code never loads
-   again, so nothing runs to close a section or entry that a stale page remembers. Reload the page.
+1. **Open pages keep a dead plugin page and sidebar entry until the browser reloads.** The client
+   unregisters its slots on dispose, but after the bundle is removed its code never loads again, so
+   nothing runs to close the plugin's row page or a sidebar entry that a stale page remembers. Reload
+   the page.
 2. **Sessions built with MCP tools keep their history.** Tool calls that already happened remain in
    the transcript; the tools themselves are gone. Deleting and re-adding a server through the page
    allocates a new `key` (and therefore new tool names); restoring a backup of `servers.json` keeps
@@ -924,10 +957,10 @@ npm run e2e         # isolated DSH instance + Playwright (opt-in, see below)
 | `test/index.test.mjs` | Host mount: the prefix route, agent-lifecycle listeners, tool-cache persistence hook, external controller startup and disposal are registered through effects (fake Cordis context) |
 | `test/external.test.mjs` | the preset-owned controller: `external.json` normalisation (versions, caps, unsafe keys, invalid names), load/quarantine/atomic save, live-agent discovery and server/tool grouping, disabled-tool cache retention through a rescan, `restrict({deny})` compute/replace/release, approval `tools/pre-execute` conditions and full-access skip, `hasPresetMcp` placeholders, save/scan coalescing and payload shape |
 | `test/projection.test.mjs` | MCP content projection (text, resource links, unsupported blocks, empty result), canonical output schema and tool-definition shape, `isError` rejection, spec-invalid results, image admission/fallback diagnostics (attachment service, model modality, malformed base64, attachment rejection), `structuredContent`, task-required refusal, approval gating (full access skip, allowed-once, rejected/cancelled/unavailable, missing services) |
-| `test/mount-check.mjs` | patch row id = Host `name`, exports and `bin` resolve, locale metadata and icon present, no `@deepseek-ai/*` import in `lib/`/`bin/`, no profile/absolute-path writes, data-dir resolver, frozen constants (including the external schema version and caps), version `0.5.0` and the contract's "frozen for 0.5.0" line, and structural checks that the client registers `settings.section`/`settings.section.icon` unconditionally and gates `sidebar.panellist`/`main` behind the preference |
-| `test/client-smoke.mjs` | `lib/client.js` runs in a `vm` with a fake `window.__ModuleLoader__` + React: the default registration set is `settings.section` + `settings.section.icon` only (no `main`, no `sidebar.panellist`), a `sidebarEntry: true` answer registers all four, `setSidebarEntryPreference(true/false)` registers/unregisters the sidebar module live and PUTs the right body, the `sidebar-entry-row`/`sidebar-entry-toggle` switch and its copy exist, two page tabs (本插件 MCP / 其他 MCP) with the external compact server list, the per-server tool view hooks/testids and scan/save/badge copy, and no add/edit/delete/test controls, zh/en dictionaries cover the same non-empty keys, no foreign API paths or imports, the edit sheet has two tabs and the tools tab exposes the per-tool switches/save copy, the icon row exposes 上传图标 / 恢复自动 with no emoji palette, one owned `<style>` removed on dispose, every timer cleared |
+| `test/mount-check.mjs` | patch row id = Host `name`, exports and `bin` resolve, locale metadata and icon present, no `@deepseek-ai/*` import in `lib/`/`bin/`, no profile/absolute-path writes, data-dir resolver, frozen constants (including the external schema version and caps), version `0.6.0` and the contract's "frozen for 0.6.0" line, and structural checks that the client registers `plugins.row.config` with a key equal to the package `name` + `#` + the first `cordis.patch.yml` insert row id, that it registers no `settings.section`/`settings.section.icon`, and that `sidebar.panellist`/`main` stay gated behind the preference |
+| `test/client-smoke.mjs` | `lib/client.js` runs in a `vm` with a fake `window.__ModuleLoader__` + React: the default registration set is exactly one `plugins.row.config` entry with the locked key (no `main`, no `sidebar.panellist`, no `settings.section`/`.icon`), a `sidebarEntry: true` answer adds the sidebar module (three registrations), `setSidebarEntryPreference(true/false)` registers/unregisters it live and PUTs the right body, `MCPManagerModulePage` renders the one-line summary for `view: 'summary'` and the manager for `view: 'page'` (`data-mode="module"`, `module-summary`/`sidebar-entry-row`/`sidebar-entry-toggle` testids and new locale keys), the panel mode stays `data-mode="panel"` without the switch row, two page tabs (本插件 MCP / 其他 MCP) with the external compact server list, the per-server tool view hooks/testids and scan/save/badge copy, and no add/edit/delete/test controls, zh/en dictionaries cover the same non-empty keys, no foreign API paths or imports, the edit sheet has two tabs and the tools tab exposes the per-tool switches/save copy, the icon row exposes 上传图标 / 恢复自动 with no emoji palette, one owned `<style>` removed on dispose, every timer cleared |
 | `test/package.mjs` | `npm pack --dry-run` audit: the `files` list covers every runtime artefact (bin/lib/locale/icon/docs/legal incl. the screenshot directory) and excludes tests/dev config; dependency and lifecycle-script rules |
-| `test/e2e/run.mjs` | boot (fresh `web` profile + the real packed tarball in transient systemd scopes, authenticated URL), settings entry (no sidebar MCP 管理 row by default, the Settings dialog offers the MCP 管理 section and renders the manager in its content column without console/page errors, first stdio server created there), optional sidebar module (switch on -> row directly below 自动化任务, `aria-checked=true`, `GET /preferences` and `preferences.json` updated, row survives a reload; switch off -> row gone and page falls back; on again for the rest of the run), CRUD (stdio + HTTP servers, live tool counts, wrong-port 连接失败 + 详情, edit-to-recover, enable round-trip, delete), icons (fixture-declared server icon renders in the card, the form has no emoji palette, an upload changes the card bytes, 恢复自动 returns to the server icon, deleting the server removes the stored file), tools (工具 tab lists live/cached descriptors, disabling removes the tool from a real model request's `tools[]`, re-enabling restores it, card counts change 2/2→1/2, 需要审批 persists then clears to `{}`), approvals (a restricted session shows the 等待审批 composer, the tool has not run while pending, 允许一次 executes it and the result reaches the model; a 完全权限 session runs the same tool with no composer), other MCP (a real preset mounts `foreign` through `@deepseek-ai/dsh-mcp-client`; after one live external-preset session `GET /external` reports the 预设自带 preset and server; the tab first shows a compact server card with the `2/2 个工具已启用` meta and no tool cards/params in the DOM; opening it shows the per-server tool view with both tool cards, descriptions and parameter chips; disabling one tool and saving stays in the view, and back shows the updated `1/2` meta; re-enabling restores it; an approval ask under a restricted preset is approved once and the tool result reaches the model; the same tool runs directly under 完全权限; settings reset to defaults; no add/edit/delete/test controls anywhere; the owned tab still works), scoping (fake OpenAI-compatible provider: `mcp__<key>__echo` present for a standard-preset session and absent for a minimal-preset session, plus a scripted tool-call round-trip), hygiene (cleanup of scopes/processes/files/ports, production MainPID/cgroup untouched) |
+| `test/e2e/run.mjs` | boot (fresh `web` profile + the real packed tarball in transient systemd scopes, authenticated URL), plugins-page entry (no sidebar MCP 管理 row by default, the native **插件** page lists the **MCP 管理** bundle, its module row opens the plugin settings page, the switch card is off by default and the manager renders `data-mode="module"` without console/page errors, first stdio server created there), optional sidebar module (switch on -> row directly below 自动化任务, `aria-checked=true`, `GET /preferences` and `preferences.json` updated, row survives a reload; switch off -> row gone and page falls back; on again for the rest of the run), CRUD (stdio + HTTP servers, live tool counts, wrong-port 连接失败 + 详情, edit-to-recover, enable round-trip, delete), icons (fixture-declared server icon renders in the card, the form has no emoji palette, an upload changes the card bytes, 恢复自动 returns to the server icon, deleting the server removes the stored file), tools (工具 tab lists live/cached descriptors, disabling removes the tool from a real model request's `tools[]`, re-enabling restores it, card counts change 2/2→1/2, 需要审批 persists then clears to `{}`), approvals (a restricted session shows the 等待审批 composer, the tool has not run while pending, 允许一次 executes it and the result reaches the model; a 完全权限 session runs the same tool with no composer), other MCP (a real preset mounts `foreign` through `@deepseek-ai/dsh-mcp-client`; after one live external-preset session `GET /external` reports the 预设自带 preset and server; the tab first shows a compact server card with the `2/2 个工具已启用` meta and no tool cards/params in the DOM; opening it shows the per-server tool view with both tool cards, descriptions and parameter chips; disabling one tool and saving stays in the view, and back shows the updated `1/2` meta; re-enabling restores it; an approval ask under a restricted preset is approved once and the tool result reaches the model; the same tool runs directly under 完全权限; settings reset to defaults; no add/edit/delete/test controls anywhere; the owned tab still works), scoping (fake OpenAI-compatible provider: `mcp__<key>__echo` present for a standard-preset session and absent for a minimal-preset session, plus a scripted tool-call round-trip), hygiene (cleanup of scopes/processes/files/ports, production MainPID/cgroup untouched) |
 
 The unit suites are offline and finish in seconds; they need no Host. `test/e2e/fixture-selftest.mjs`
 is a standalone check (21 checks) that drives the fixture MCP servers with the same
@@ -944,8 +977,9 @@ touches the user's running instance or `/root/.dsh`. The fixture MCP servers dec
 `data:` PNG over stdio, an HTTP URL over Streamable HTTP) and expose separate tools for the per-tool
 checks; the approval scenarios switch a real session's permission preset and wait for the DSH
 approval composer. On success it publishes nine sanitized screenshots to `docs/screenshots/`,
-including `mcp-manager-settings.png` (the Settings hero) and `mcp-manager-sidebar.png` (the optional
-module switched on).
+including `mcp-manager-plugin-settings.png` (the plugin settings hero) and
+`mcp-manager-sidebar.png` (the optional module switched on); the retired
+`mcp-manager-settings.png` is deleted by the run.
 `--keep` leaves the scopes and the run directory for debugging; `--verbose` adds step logging. It is
 opt-in — not part of `npm run check` — and needs Playwright with Chromium plus registry access for
 the profile install. That isolation is a property of the test harness, not of the plugin.
@@ -960,10 +994,10 @@ the profile install. That isolation is a property of the test harness, not of th
 | code `protocol` | endpoint speaks something that is not MCP, protocol version mismatch, SSE handshake failure | retrying; detail has the protocol error |
 | code `invalid-config` | stored record cannot be used as configured (e.g. transport/command mismatch) | no connection attempt until edited |
 | code `closed` | transport closed locally or remotely | retrying; a normal reconnect |
-| No **MCP 管理** row in the sidebar | that row belongs to the optional sidebar module, off by default (fresh install) | open **Settings → MCP 管理** and switch **在侧边栏显示 MCP 管理入口** on; the preference is Host-side |
-| No **MCP 管理** section in Settings | the deployment composes no DSH Settings shell, or the Host half is not mounted | the shipped Web app composes the shell; check the bundle is enabled and `GET /better-mcp-manager/api/health` answers |
+| No **MCP 管理** row in the sidebar | that row belongs to the optional sidebar module, off by default (fresh install) | open the plugin settings page (**插件** → **MCP 管理** card → **MCP 管理** module row → **配置 MCP 管理**) and switch **在侧边栏显示 MCP 管理入口** on; the preference is Host-side |
+| No **MCP 管理** card, row or configure control in the Plugins page | the deployment composes no native Plugins page (`ui-plugin-manager`), the bundle is switched off (a row shows its page only while the bundle is on), or the Host half is not mounted | the shipped Web app composes the Plugins page; enable the bundle and check `GET /better-mcp-manager/api/health` answers. Without the Plugins page there is no default entry — enable the optional sidebar module instead |
 | The sidebar switch is already on in another browser | the preference is Host-side and shared per `$DSH_HOME` | expected; there is no per-browser copy to diverge |
-| Switching the module off while its page is open shows the Conversation | its `main` page registration is disposed live | expected fallback; reopen from **Settings → MCP 管理** |
+| Switching the module off while its page is open shows the Conversation | its `main` page registration is disposed live | expected fallback; reopen from the plugin settings page (or via the optional module once re-enabled) |
 | `PUT /preferences` answers `400 invalid-preferences` | the JSON object has no boolean `sidebarEntry` (missing field or non-boolean) | send `{ "sidebarEntry": true }` or `{ "sidebarEntry": false }`; nothing is written on a rejected body. A non-object body answers `400 invalid-body` and malformed JSON `400 invalid-json` |
 | The sidebar-entry switch shows a load/save error | `GET /preferences` or `PUT /preferences` failed (Host down, network) | the module stays off after a failed read and the live view keeps the last applied value after a failed save; the row reports the reason and retrying is safe |
 | Tool absent in an agent | server disabled/failing, its preset list does not include this agent's preset, the tool is disabled in the **工具** tab, or the agent predates the server and has not been re-bound yet (saving the server again re-binds every live agent) | `GET /agents` lists each live agent's exposed servers and tool names |
@@ -1028,10 +1062,14 @@ than a silent success.
   `$DSH_HOME`; there is no `localStorage` mirror and no per-browser override. A second browser sees
   the same choice, which is deliberate.
 - **A second manager for the sidebar.** Both surfaces render the same component; there is no
-  sidebar-specific page implementation to keep in sync. The Settings section is not optional — only
-  the sidebar module is.
-- **Custom placement of the entries.** The Settings section is order `30` and the optional sidebar
-  row order `20`; neither is user-configurable, exactly like the old sidebar position.
+  sidebar-specific page implementation to keep in sync. The native plugin row settings page is not
+  optional — only the sidebar module is.
+- **A generic Settings fallback.** A deployment that composes no native Plugins page gets no default
+  entry; registering the old `settings.section` alongside `plugins.row.config` was rejected (ADR 10)
+  rather than kept as a fallback, so there is one canonical page per plugin.
+- **Custom placement of the entries.** The plugin page entry is owned by the Plugins page; the
+  optional sidebar row is order `20`. Neither is user-configurable, exactly like the old sidebar
+  position.
 - **Tool-level permission mapping.** The manager adds no sandbox of its own: a tool call is
   dispatched to the connected server, and the Host's own tool-execution and permission path decides
   what is allowed. The one exception is the external **需要审批** ask, which is delegated to the

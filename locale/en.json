@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "MCP Manager",
-    "description": "Manage MCP servers in DeepSeek Harness Settings: transports, headers, OAuth, groups, live status and tool counts, per-tool exposure and approval, and which agent presets each server's tools are exposed to. The sidebar entry is an optional module, off by default."
+    "description": "MCP manager for DeepSeek Harness, opened from the native Plugins page: the MCP Manager module row opens this plugin settings page for MCP servers, tool exposure and approval, and preset access. The sidebar entry is an optional module, off by default."
   }
 }

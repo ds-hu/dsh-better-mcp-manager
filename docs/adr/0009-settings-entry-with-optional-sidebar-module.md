@@ -1,9 +1,16 @@
 # 9. Settings is the default entry; the sidebar page is an optional module
 
 Date: 2026-11-18
-Status: accepted
+Status: superseded by [ADR 10](0010-native-plugin-row-settings-page.md)
 
 Supersedes [ADR 1](0001-sidebar-panel-entry.md).
+
+> **Superseded in 0.6.0.** The generic DSH **Settings** section described here was the wrong surface:
+> it was not a plugin's own configuration page, so it did not follow the plugin from the Plugins page
+> and carried none of the plugin page's identity or lifecycle. The default entry is now DSH's native
+> **plugin row settings page** (`plugins.row.config`), and the generic Settings registration is gone.
+> The optional sidebar module, its Host-side preference and everything else in this ADR remain in
+> force; see [ADR 10](0010-native-plugin-row-settings-page.md).
 
 ## Context
 

@@ -179,23 +179,28 @@ authorization-code flow. Secrets are stored in the data file, never written to l
 
 ### UI surfaces and the sidebar preference
 
-The plugin has two client surfaces built from the same manager component:
+The plugin has one required client surface — the native plugin row settings page — plus one optional
+sidebar module, both built from the same manager component:
 
-- **Settings section** — the default entry, always registered: `settings.section` with id
-  `mcp-manager`, `order: 30` (plus a matching `settings.section.icon`), label `t('panel')`, rendering
-  the manager inside the DSH Settings dialog content column. A fresh install has no sidebar row;
-  this section is where the manager is opened. It needs the DSH Settings shell (standard in the
-  shipped Web app); a deployment that composes no settings shell has no navigation entry for it.
+- **Plugin row settings page** — the default entry, always registered: `plugins.row.config` keyed by
+  `<bundle package name>#<row id>` (`@ds-hu/dsh-better-mcp-manager#dsh-better-mcp-manager`), rendering
+  `MCPManagerModulePage`. The user reaches it from sidebar **插件** → the **MCP 管理** plugin card →
+  the bundle detail page → the **MCP 管理** module row → the configure control (**配置 MCP 管理**) or
+  the row name. The page body is the manager in its embedded presentation
+  (`data-mode="module"`): the sidebar-entry switch card, then the **MCP 服务器** section heading with
+  counts and version, then the unchanged tabs/list/forms. `view: 'summary'` returns the one-liner
+  instead of the page. The page is drawn by DSH's native Plugins page (`ui-plugin-manager`, shipped
+  with the Web app); a deployment that composes no Plugins page has no default entry.
 - **Optional sidebar module** — an independent module, off by default: while the Host preference
   `sidebarEntry` is true it registers `sidebar.panellist` (id `mcp-manager`, `order: 20`, directly
-  below 自动化任务) plus the matching `main` page (key `mcp-manager`), and unregisters both live when
-  the switch goes off, falling back to the Conversation. It is a preference of the plugin, not a
-  second page variant: both surfaces render the same `MCPManagerPage` (the settings one in an
-  embedded presentation, `data-mode="settings"`).
+  below 自动化任务) plus the matching `main` page (key `mcp-manager`, `data-mode="panel"`,
+  full-page `h1` and no switch row), and unregisters both live when the switch goes off, falling back
+  to the Conversation. It is a preference of the plugin, not a second page variant: both surfaces
+  render the same `MCPManagerPage`.
 - **Sidebar-entry preference** — `preferences.json` in the plugin data directory
   (`{ "version": 1, "sidebarEntry": false }`), read and written by the Host through
   `GET`/`PUT /better-mcp-manager/api/preferences`. It is **Host-side and per `$DSH_HOME`**, shared by
-  every browser and profile, never per-browser `localStorage`. The Settings-mode page exposes it as
+  every browser and profile, never per-browser `localStorage`. The plugin settings page exposes it as
   the **在侧边栏显示 MCP 管理入口** / **Show MCP Manager in the sidebar** switch
   (`sidebar-entry-row` / `sidebar-entry-toggle`), disabled while the initial read or a write is in
   flight; a failed read leaves the module off and reports the reason, and the module follows the last
@@ -285,13 +290,15 @@ replaces it. The **clean** CLI deletes the whole directory, including `external.
 17. **`external.json` holds descriptors and deviations only, never credentials.** It stores the last
     discovered tool descriptors plus `enabled:false`/`approval:true` overrides; losing it resets
     choices to defaults, and discovery cannot happen without a live Agent of that preset.
-18. **The Settings section is always registered; the sidebar module is optional and Host-configured.**
-    The client always registers `settings.section` (id `mcp-manager`, order 30) and its
-    `settings.section.icon`; `sidebar.panellist` (id `mcp-manager`, order 20) and the `main` page
-    exist only while the Host preference `sidebarEntry` is true (default false), and switching it
-    off unregisters both immediately. The preference is Host-side, per `$DSH_HOME`, shared by every
-    browser and profile — never per-browser `localStorage` and never stored in a profile settings
-    document.
+18. **The plugin row settings page is always registered; the sidebar module is optional and
+    Host-configured.** The client always registers exactly one slot, `plugins.row.config` keyed
+    `<bundle package name>#<row id>`; it never registers `settings.section`/`settings.section.icon`.
+    The row config key must equal `package.json` `name` + `#` + the first `cordis.patch.yml` insert
+    row id (`test/mount-check.mjs` guards the parity). `sidebar.panellist` (id `mcp-manager`,
+    order 20) and the `main` page exist only while the Host preference `sidebarEntry` is true
+    (default false), and switching it off unregisters both immediately. The preference is Host-side,
+    per `$DSH_HOME`, shared by every browser and profile — never per-browser `localStorage` and never
+    stored in a profile settings document.
 
 ## File map
 
@@ -308,11 +315,11 @@ replaces it. The **clean** CLI deletes the whole directory, including `external.
 | `lib/result-projection.js` | MCP result → ordered text/image/diagnostic tool result; restricted-mode approval seam |
 | `lib/api.js` | HTTP router for `/better-mcp-manager/api/*`, including icon, tool, external and preference endpoints |
 | `lib/http.js` | same-origin JSON guard, 64 KiB body cap (1 MiB for icon uploads), JSON responses |
-| `lib/client.js` | browser half: always-registered `settings.section` + `settings.section.icon`; Host-preference controller; optional live `sidebar.panellist` + `main` module; 本插件 MCP / 其他 MCP tabs, polling, two form tabs, styles, locale dictionaries |
+| `lib/client.js` | browser half: always-registered `plugins.row.config` for the native plugin row settings page (`MCPManagerModulePage`, summary + module page); Host-preference controller; optional live `sidebar.panellist` + `main` module (panel presentation); 本插件 MCP / 其他 MCP tabs, polling, two form tabs, styles, locale dictionaries |
 | `bin/mcp-manager.mjs` | maintenance CLI: `status` (default), `path`, `clean [--yes]` |
-| `locale/en.json`, `locale/zh.json` | plugin-page metadata (title/description, Settings default and optional sidebar entry); the manager's UI copy lives in `lib/client.js` |
-| `icon.svg` | plugin-page metadata icon (the client's sidebar/settings glyphs are inline React SVG) |
-| `cordis.patch.yml` | the bundle's single Host row (`id` = Host `name`) |
+| `locale/en.json`, `locale/zh.json` | plugin metadata: the title shown on the Plugins card and the module row, the description on the plugin page, and whether the sidebar entry is optional; the manager's UI copy lives in `lib/client.js` |
+| `icon.svg` | plugin metadata icon for the Plugins card/row (the client's sidebar glyphs are inline React SVG) |
+| `cordis.patch.yml` | the bundle's single Host row (`id` = Host `name`, and the row id half of the `plugins.row.config` key) |
 | `test/` | unit, structural, client-smoke, packaging and e2e checks |
 | `docs/API-CONTRACT.md` | frozen internal contract; change it before changing either half |
 | `docs/TECHNICAL.md` | architecture, data model, API, security, lifecycle, testing |
@@ -323,13 +330,17 @@ replaces it. The **clean** CLI deletes the whole directory, including `external.
 The plugin is a guest in the Host and uses only public context capabilities:
 
 - **Bundle patch** — `package.json` → `dsh.bundle.patch` → `cordis.patch.yml` inserts the Host row.
-  The row's `id` must equal the Host module's exported `name` (checked by `test/mount-check.mjs`).
+  The row's `id` must equal the Host module's exported `name`, and it is also the row-id half of the
+  client's `plugins.row.config` key (both checked by `test/mount-check.mjs`).
 - **Web client** — `package.json` → `dsh.client` (`platform: web`, `inject` of the shell's sidebar
   and locale services) loads `lib/client.js` as a browser module.
-- **Settings section** — always: `ctx.slots.inject('settings.section')` with `id: 'mcp-manager'`,
-  `order: 30`, `label: () => t('panel')`; plus `settings.section.icon` with the same `id`/`order`.
-  The shell (and so the navigation entry) only exists when the deployment composes the settings
-  shell, which the shipped Web app does.
+- **Plugin row config page** — always: `ctx.slots.inject('plugins.row.config')` with
+  `key: '@ds-hu/dsh-better-mcp-manager#dsh-better-mcp-manager'`, `locale: 'mcpManager'`, rendering
+  `MCPManagerModulePage`. The owner props are `{ view: 'summary' | 'page', form? }`; the page is only
+  rendered inside DSH's native Plugins page, which the shipped Web app composes, and `form` is only
+  supplied for rows with editable configuration fields. No `settings.section`/`.icon` registration
+  exists; a deployment without the Plugins page has no default entry (the optional sidebar module is
+  the only fallback).
 - **Optional sidebar module** — only while the Host preference says so:
   `ctx.slots.inject('sidebar.panellist')` with `id: 'mcp-manager'`, `order: 20`,
   `label: () => t('panel')`, and `ctx.slots.inject('main')` with `key: 'mcp-manager'`. 自动化任务 is
@@ -362,20 +373,23 @@ The plugin is a guest in the Host and uses only public context capabilities:
 - **The production instance is not the test bed.** `http://127.0.0.1:3080` and `/root/.dsh` belong
   to the running user; e2e runs a throwaway `$DSH_HOME` and profile in its own systemd scope. That
   isolation is a test harness property, not a plugin feature.
-- **The default entry is the Settings section, not the sidebar.** Since 0.5.0 the client always
-  registers `settings.section` (+ icon) and the sidebar row/page is an optional module, off by
-  default. Never document or test a fresh install as having a sidebar entry.
+- **The default entry is the native plugin row settings page.** Since 0.6.0 the client always
+  registers exactly one slot, `plugins.row.config`, and the sidebar row/page is an optional module,
+  off by default. The entry is reached through the **插件** page (plugin card → bundle detail →
+  module row → configure control); never document or test a fresh install as having a sidebar entry,
+  and never reintroduce a generic `settings.section` fallback.
 - **The sidebar module is a preference, not a page variant.** `preferences.json` says whether it
   exists; the switch registers/unregisters `sidebar.panellist` + `main` live. It is Host-side and
   per `$DSH_HOME` (shared by every browser and profile), never per-browser `localStorage` and never
   stored in a profile settings document.
-- **The Settings shell is a deployment dependency.** The section has no navigation entry in a
-  deployment that composes no settings shell (the shipped Web app does). Keep that stated as a
-  requirement, not as a bug; the optional sidebar module still opens the manager when enabled.
-- **One manager component, two presentations.** The Settings section renders the same
-  `MCPManagerPage` in its embedded presentation (`data-mode="settings"`, no scroll container, no
-  initial focus grab); the sidebar page is the full-page presentation. Do not fork the manager for
-  the Settings surface.
+- **The native Plugins page is a deployment dependency.** The row config page exists only inside
+  DSH's native Plugins page (`ui-plugin-manager`), which the shipped Web app composes. A deployment
+  that composes no Plugins page has no default entry (the optional sidebar module still opens the
+  manager when enabled). Keep that stated as a requirement, not as a bug.
+- **One manager component, two presentations.** The plugin row settings page renders the same
+  `MCPManagerPage` in its embedded presentation (`data-mode="module"`, no scroll container, no
+  initial focus grab, switch row first); the optional sidebar page is the full-page presentation
+  (`data-mode="panel"`, own `h1`, no switch row). Do not fork the manager for the plugin page.
 - **Status is not stored.** "Connected" is a live claim about a socket; a page reload asks again.
   Never persist status into the JSON store or treat a stale status as truth.
 - **Two agents may share a server.** They share the one connection but not registrations. A tool
@@ -395,7 +409,7 @@ The plugin is a guest in the Host and uses only public context capabilities:
   becomes status, not a rollback. The user can fix the URL while the server is failing.
 - **The mounted manager polls `GET /servers` every 2.5 s** and immediately after every mutation.
   Timers must be cleared on unmount; a leaked timer keeps the browser busy after dispose. The
-  Settings section and the sidebar page are independent mounts, so two views can poll at once.
+  plugin page and the sidebar page are independent mounts, so two views can poll at once.
 - **`GET /servers/:id` returns raw tool names, not schemas.** The detail view is diagnostics; the
   **工具** tab reads `GET /servers/:id/tools` and never edits a tool's schema.
 - **Disabling a tool is not a page filter.** The tool is absent from registration, so no agent sees

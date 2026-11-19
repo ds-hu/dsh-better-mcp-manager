@@ -1,13 +1,19 @@
 # 1. MCP 管理 is a sidebar panel entry with a main page, directly under 自动化任务
 
 Date: 2026-11-16
-Status: superseded by [ADR 9](0009-settings-entry-with-optional-sidebar-module.md)
+Status: superseded by [ADR 9](0009-settings-entry-with-optional-sidebar-module.md), then by
+[ADR 10](0010-native-plugin-row-settings-page.md)
 
-> **Superseded in 0.5.0.** The sidebar entry described here is no longer the only entry. The manager
-> now lives in a DSH **Settings** section by default (always registered), and this sidebar row became
-> an independent optional module, off by default, configured by a Host-side preference. The reasoning
-> below is kept as history; [ADR 9](0009-settings-entry-with-optional-sidebar-module.md) records the
-> decision that replaced it.
+> **Superseded in 0.5.0.** The sidebar entry described here is no longer the only entry. This sidebar
+> row became an independent optional module, off by default, configured by a Host-side preference, and
+> the default entry moved to a DSH **Settings** section (always registered). The reasoning below is
+> kept as history; [ADR 9](0009-settings-entry-with-optional-sidebar-module.md) records the decision
+> that replaced it.
+
+> **Superseded again in 0.6.0.** The generic Settings section from ADR 9 was replaced by DSH's native
+> **plugin row settings page** (`plugins.row.config`), so the default entry is now reached from the
+> Plugins page. The optional sidebar module described here is unchanged and still governed by the
+> Host-side preference; see [ADR 10](0010-native-plugin-row-settings-page.md).
 
 ## Context
 

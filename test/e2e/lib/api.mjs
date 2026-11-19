@@ -107,7 +107,7 @@ export class InstanceApi {
     return (await this.get('/better-mcp-manager/api/agents')).payload;
   }
 
-  /** `GET /preferences` — Host-owned UI preferences (0.5.0: `{ sidebarEntry }`). */
+  /** `GET /preferences` — Host-owned UI preferences (`{ sidebarEntry }`, since 0.5.0). */
   async preferences() {
     return (await this.get('/better-mcp-manager/api/preferences')).payload;
   }
